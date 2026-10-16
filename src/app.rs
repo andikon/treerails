@@ -278,6 +278,7 @@ pub struct App {
     pub temporary_roots: Vec<PathBuf>,
     pub settings: Option<Draft>,
     pub settings_open: bool,
+    pub discovery_warnings: Vec<String>,
     pub recursive: bool,
     pub projects: Vec<Project>,
     pub project_cursor: usize,
@@ -345,6 +346,7 @@ impl App {
             temporary_roots,
             settings: None,
             settings_open: false,
+            discovery_warnings: Vec::new(),
             recursive,
             projects: vec![],
             project_cursor: 0,
@@ -525,6 +527,10 @@ impl App {
                 }
             }
             Ok(Payload::Projects(projects, warnings)) => {
+                self.discovery_warnings = warnings.clone();
+                if let Some(draft) = &mut self.settings {
+                    draft.update_warnings(&warnings);
+                }
                 self.projects = projects;
                 if self.project.as_ref().is_some_and(|current| {
                     !self
@@ -1150,6 +1156,25 @@ impl App {
                 }
             }
         }
+        if let Some(draft) = &mut self.settings {
+            let context = self
+                .project
+                .as_ref()
+                .map(|project| project.path.clone())
+                .or_else(|| {
+                    self.projects
+                        .get(self.project_cursor)
+                        .map(|project| project.path.clone())
+                });
+            draft.project_context = context.map(|path| {
+                draft
+                    .config
+                    .project(&path)
+                    .map(|project| project.path.clone())
+                    .unwrap_or(path)
+            });
+            draft.update_warnings(&self.discovery_warnings);
+        }
         self.settings_open = true;
     }
     fn save_settings(&mut self, resolution: settings::Resolution) {
@@ -1158,7 +1183,12 @@ impl App {
         };
         match draft.save(&self.config_path, resolution) {
             Ok(Some(config)) => {
+                let sources_changed = self.config.project_roots != config.project_roots;
+                let discovery_changed = self.config.recursive != config.recursive;
                 self.config = config;
+                if !sources_changed && !discovery_changed {
+                    return;
+                }
                 self.roots = self
                     .config
                     .project_roots
@@ -1166,7 +1196,9 @@ impl App {
                     .cloned()
                     .chain(self.temporary_roots.clone())
                     .collect();
-                self.recursive = self.config.recursive;
+                if discovery_changed {
+                    self.recursive = self.config.recursive;
+                }
                 self.epoch += 1;
                 self.jobs.retain(|job| !matches!(job, Job::Discover(..)));
                 self.inflight.clear();

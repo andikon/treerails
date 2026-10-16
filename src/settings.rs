@@ -1,11 +1,26 @@
-use crate::{
-    app::{Field, edit},
-    config::{self, Config, same_path},
-    startup::normalize_sources,
-};
+pub mod editor;
+mod merge;
+use crate::config::{self, Config};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use editor::Editor;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Sources,
+    Worktrees,
+    Profiles,
+}
+impl Section {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Sources => "Sources",
+            Self::Worktrees => "Worktrees",
+            Self::Profiles => "Profiles",
+        }
+    }
+}
 
 pub enum Mode {
     Edit,
@@ -26,15 +41,14 @@ pub enum Action {
     Help,
     Quit,
 }
-pub struct SourceInput {
-    pub field: Field,
-    pub index: Option<usize>,
-}
 pub struct Draft {
     pub base: Config,
     pub config: Config,
     pub cursor: usize,
-    pub input: Option<SourceInput>,
+    pub input: Option<Editor>,
+    pub section: Section,
+    pub project_context: Option<PathBuf>,
+    pub unavailable_sources: std::collections::BTreeSet<PathBuf>,
     pub mode: Mode,
     pub message: String,
     pub error: bool,
@@ -47,6 +61,9 @@ impl Draft {
             config,
             cursor: 0,
             input: None,
+            section: Section::Sources,
+            project_context: None,
+            unavailable_sources: Default::default(),
             mode: Mode::Edit,
             message: "Changes apply only after Ctrl+s".into(),
             error: false,
@@ -54,7 +71,8 @@ impl Draft {
         }
     }
     pub fn dirty(&self) -> bool {
-        self.input.is_some() || settings_value(&self.base).ok() != settings_value(&self.config).ok()
+        self.input.is_some()
+            || comparable_settings(&self.base).ok() != comparable_settings(&self.config).ok()
     }
     pub fn key(&mut self, key: KeyEvent, path: &Path, height: usize) -> Action {
         match &self.mode {
@@ -85,16 +103,17 @@ impl Draft {
         if let Some(input) = &mut self.input {
             match key.code {
                 KeyCode::Esc => return Action::Close,
-                KeyCode::Enter => {
-                    if let Err(error) = self.commit_input(path) {
+                _ => {
+                    if input.key(key)
+                        && let Err(error) = self.commit_input(path)
+                    {
                         self.fail(error);
                     }
                 }
-                _ => edit(&mut input.field, key),
             }
             return Action::None;
         }
-        let count = self.config.project_roots.len() + 1;
+        let count = self.rows().len().max(1);
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
@@ -115,14 +134,24 @@ impl Draft {
             self.top_prefix = false;
         }
         match key.code {
+            KeyCode::Char('1') => {
+                self.section = Section::Sources;
+                self.cursor = 0;
+            }
+            KeyCode::Char('2') => {
+                self.section = Section::Worktrees;
+                self.cursor = 0;
+            }
+            KeyCode::Char('3') => {
+                self.section = Section::Profiles;
+                self.cursor = 0;
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => self.switch_section(-1),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => self.switch_section(1),
             KeyCode::Char('?') => return Action::Help,
             KeyCode::Esc | KeyCode::Char('q') => return Action::Close,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
-                self.cursor = (self.cursor + 1).min(count - 1)
-            }
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
-                self.cursor = self.cursor.saturating_sub(1)
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.cursor = (self.cursor + 1).min(count - 1),
+            KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Char('G') | KeyCode::End => self.cursor = count - 1,
             KeyCode::Char('g') => {
                 if self.top_prefix {
@@ -134,69 +163,172 @@ impl Draft {
             }
             KeyCode::Home => self.cursor = 0,
             KeyCode::Char('a') => {
-                self.input = Some(SourceInput {
-                    field: Field::new("New project source", String::new(), false),
-                    index: None,
-                })
+                self.input = Some(match self.section {
+                    Section::Sources => Editor::source(String::new(), None),
+                    Section::Worktrees => Editor::project(&self.config, None),
+                    Section::Profiles => Editor::profile(&self.config, None),
+                });
             }
-            KeyCode::Char('d') if self.cursor < self.config.project_roots.len() => {
+            KeyCode::Char('d')
+                if self.section == Section::Sources
+                    && self.cursor < self.config.project_roots.len() =>
+            {
                 self.config.project_roots.remove(self.cursor);
                 self.cursor = self.cursor.min(self.config.project_roots.len());
             }
-            KeyCode::Char('r') => self.config.recursive = !self.config.recursive,
-            KeyCode::Enter if self.cursor == self.config.project_roots.len() => {
+            KeyCode::Char('r') if self.section == Section::Sources => {
+                self.config.recursive = !self.config.recursive
+            }
+            KeyCode::Enter
+                if self.section == Section::Sources
+                    && self.cursor == self.config.project_roots.len() =>
+            {
                 self.config.recursive = !self.config.recursive
             }
             KeyCode::Enter => {
-                self.input = Some(SourceInput {
-                    field: Field::new(
-                        "Edit project source",
+                self.input = Some(match self.section {
+                    Section::Sources => Editor::source(
                         self.config.project_roots[self.cursor].display().to_string(),
-                        false,
+                        Some(self.cursor),
                     ),
-                    index: Some(self.cursor),
-                })
+                    Section::Worktrees if self.cursor == 0 => Editor::global(&self.config),
+                    Section::Worktrees => Editor::project(
+                        &self.config,
+                        self.worktree_projects().get(self.cursor - 1).cloned(),
+                    ),
+                    Section::Profiles => Editor::profile(
+                        &self.config,
+                        self.config.profiles.keys().nth(self.cursor).cloned(),
+                    ),
+                });
             }
             KeyCode::Char('D') if self.dirty() => self.mode = Mode::Discard { quit: false },
             _ => {}
         }
         Action::None
     }
+    fn switch_section(&mut self, step: i32) {
+        let index = match self.section {
+            Section::Sources => 0,
+            Section::Worktrees => 1,
+            Section::Profiles => 2,
+        };
+        self.section = match (index + step).rem_euclid(3) {
+            0 => Section::Sources,
+            1 => Section::Worktrees,
+            _ => Section::Profiles,
+        };
+        self.cursor = 0;
+    }
+    fn worktree_projects(&self) -> Vec<PathBuf> {
+        let mut projects: Vec<PathBuf> = self.project_context.iter().cloned().collect();
+        for project in &self.config.projects {
+            if !projects.contains(&project.path) {
+                projects.push(project.path.clone());
+            }
+        }
+        projects
+    }
+    pub fn rows(&self) -> Vec<String> {
+        match self.section {
+            Section::Sources => {
+                let mut rows: Vec<String> = self
+                    .config
+                    .project_roots
+                    .iter()
+                    .map(|path| {
+                        format!(
+                            " {}{}",
+                            path.display(),
+                            if self.unavailable_sources.contains(path) {
+                                "  [unavailable; kept]"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect();
+                rows.push(format!(
+                    " Recursive discovery: {}  [r toggles]",
+                    if self.config.recursive { "on" } else { "off" }
+                ));
+                rows
+            }
+            Section::Worktrees => {
+                let mut rows = vec![format!(
+                    " Global defaults · {} · profile {}",
+                    self.config.worktrees.path_template, self.config.default_profile
+                )];
+                rows.extend(self.worktree_projects().iter().map(|path| {
+                    format!(
+                        " {} · base {}",
+                        path.display(),
+                        self.config
+                            .projects
+                            .iter()
+                            .find(|project| project.path == *path)
+                            .and_then(|p| p.base.as_deref())
+                            .unwrap_or("remembered / Git default")
+                    )
+                }));
+                rows
+            }
+            Section::Profiles => self
+                .config
+                .profiles
+                .iter()
+                .map(|(name, profile)| {
+                    format!(
+                        " {name} · {} · terminal {}",
+                        if profile.program.is_empty() {
+                            "plain terminal"
+                        } else {
+                            &profile.program
+                        },
+                        profile.terminal
+                    )
+                })
+                .collect(),
+        }
+    }
+    pub fn update_warnings(&mut self, warnings: &[String]) {
+        self.unavailable_sources = self
+            .config
+            .project_roots
+            .iter()
+            .filter(|path| {
+                warnings
+                    .iter()
+                    .any(|warning| warning.starts_with(&format!("{}:", path.display())))
+            })
+            .cloned()
+            .collect();
+    }
     pub fn paste(&mut self, text: &str) {
-        if let Some(input) = &mut self.input {
-            let text = text.replace(['\r', '\n'], " ");
-            input.field.value.insert_str(input.field.cursor, &text);
-            input.field.cursor += text.len();
+        if let Some(editor) = &mut self.input {
+            editor.paste(text);
         }
     }
     fn commit_input(&mut self, path: &Path) -> Result<()> {
-        let Some(input) = &self.input else {
+        let Some(editor) = &self.input else {
             return Ok(());
         };
-        let value = input.field.value.trim();
-        anyhow::ensure!(!value.is_empty(), "Enter a project source directory");
-        let directory = path.parent().unwrap_or(Path::new("."));
-        let roots = normalize_sources([PathBuf::from(value)], directory)?;
-        let value = roots[0].clone();
-        anyhow::ensure!(
-            value.is_dir() || self.base.project_roots.iter().any(|p| same_path(p, &value)),
-            "Source directory is unavailable: {}",
-            value.display()
-        );
-        if let Some(index) = input.index {
-            self.config.project_roots[index] = value;
-        } else {
-            self.config.project_roots.push(value);
-        }
-        self.config.project_roots =
-            normalize_sources(self.config.project_roots.clone(), directory)?;
+        editor.commit(&mut self.config, &self.base, path)?;
         self.input = None;
         self.error = false;
         self.message = "Unsaved changes · Ctrl+s Save & Apply".into();
         Ok(())
     }
     pub fn save(&mut self, path: &Path, resolution: Resolution) -> Result<Option<Config>> {
-        self.commit_input(path)?;
+        if let Some(editor) = &self.input {
+            let mut candidate = self.config.clone();
+            editor.commit(&mut candidate, &self.base, path)?;
+            candidate.validate()?;
+            self.config = candidate;
+            self.input = None;
+        } else {
+            self.config.validate()?;
+        }
         let base = settings_value(&self.base)?;
         let desired = settings_value(&self.config)?;
         let mut changes = Vec::new();
@@ -204,23 +336,44 @@ impl Draft {
         let mut conflicts = Vec::new();
         config::edit_document(path, |doc| {
             let current = settings_value(&Config::parse(&doc.to_string(), path)?)?;
-            for keys in &changes {
-                if lookup(&current, keys) != lookup(&base, keys)
-                    && lookup(&current, keys) != lookup(&desired, keys)
-                {
+            let conflict_flags: Vec<bool> = changes
+                .iter()
+                .map(|keys| {
+                    merge::deleted_entity(&base, &current, keys)
+                        || (lookup(&current, keys) != lookup(&base, keys)
+                            && lookup(&current, keys) != lookup(&desired, keys))
+                })
+                .collect();
+            for (keys, conflict) in changes.iter().zip(&conflict_flags) {
+                if *conflict {
                     conflicts.push(keys.join("."));
                 }
             }
             if !conflicts.is_empty() && matches!(resolution, Resolution::Ask) {
                 return Ok(());
             }
-            for keys in &changes {
-                if matches!(resolution, Resolution::External) && conflicts.contains(&keys.join("."))
-                {
+            for (keys, conflict) in changes.iter().zip(conflict_flags) {
+                if matches!(resolution, Resolution::External) && conflict {
                     continue;
                 }
-                patch(doc, keys, lookup(&desired, keys))?;
+                if keys.first().is_some_and(|key| key == "projects") {
+                    merge::patch_project(doc, keys, &desired, path)?;
+                } else {
+                    if keys.first().is_some_and(|key| key == "profiles")
+                        && keys.len() > 2
+                        && doc
+                            .get("profiles")
+                            .and_then(|profiles| profiles.get(&keys[1]))
+                            .is_none()
+                    {
+                        let entity = &keys[..2];
+                        let profile = lookup(&current, entity).or_else(|| lookup(&desired, entity));
+                        patch(doc, entity, profile)?;
+                    }
+                    patch(doc, keys, lookup(&desired, keys))?;
+                }
             }
+            Config::parse(&doc.to_string(), path)?.validate()?;
             Ok(())
         })?;
         if !conflicts.is_empty() && matches!(resolution, Resolution::Ask) {
@@ -232,7 +385,7 @@ impl Draft {
         self.config = loaded.clone();
         self.mode = Mode::Edit;
         self.error = false;
-        self.message = "Saved & applied · projects are being rescanned".into();
+        self.message = "Saved & applied".into();
         Ok(Some(loaded))
     }
     pub fn fail(&mut self, error: anyhow::Error) {
@@ -242,6 +395,17 @@ impl Draft {
 }
 
 fn settings_value(config: &Config) -> Result<toml::Value> {
+    let mut value = comparable_settings(config)?;
+    let mut projects = toml::map::Map::new();
+    for project in &config.projects {
+        projects
+            .entry(merge::identity(&project.path))
+            .or_insert(toml::Value::try_from(project)?);
+    }
+    value["projects"] = toml::Value::Table(projects);
+    Ok(value)
+}
+fn comparable_settings(config: &Config) -> Result<toml::Value> {
     let mut value = toml::Value::try_from(config)?;
     value
         .as_table_mut()
@@ -261,6 +425,9 @@ fn changed_fields(
             path.push(key.clone());
             match (base.get(key), desired.get(key)) {
                 (Some(a), Some(b)) => changed_fields(a, b, path, changes),
+                (None, Some(b)) if b.is_table() => {
+                    changed_fields(&toml::Value::Table(Default::default()), b, path, changes)
+                }
                 _ => changes.push(path.clone()),
             }
             path.pop();
@@ -280,8 +447,14 @@ fn patch(
     path: &[String],
     value: Option<&toml::Value>,
 ) -> Result<()> {
+    patch_table(doc.as_table_mut(), path, value)
+}
+fn patch_table(
+    mut table: &mut dyn toml_edit::TableLike,
+    path: &[String],
+    value: Option<&toml::Value>,
+) -> Result<()> {
     let (key, parents) = path.split_last().context("Missing settings field")?;
-    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
     for parent in parents {
         if table.get(parent).is_none() {
             table.insert(parent, toml_edit::Item::Table(toml_edit::Table::new()));

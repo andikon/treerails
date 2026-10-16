@@ -99,8 +99,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         rows[2],
     );
-    let hints = if app.settings_open {
-        " a add · Enter edit · d remove · r recursive · Ctrl+s apply · i output · Esc explorer · D discard "
+    let hints = if app.settings_open
+        && app
+            .settings
+            .as_ref()
+            .is_some_and(|draft| draft.input.is_some())
+    {
+        " Tab next field · Ctrl+u clear · Enter accept · Ctrl+s apply · Esc explorer (keeps draft) "
+    } else if app.settings_open {
+        " 1/2/3 sections · h/l switch · a add · Enter edit · Ctrl+s apply · i output · Esc explorer · D discard "
     } else if app.project.is_none() {
         " j/k navigate   / search   Enter explore   , settings   R reload   i output   ? help   q quit "
     } else {
@@ -134,57 +141,98 @@ fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
     let rows = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(if draft.input.is_some() { 3 } else { 0 }),
         Constraint::Length(3),
     ])
     .split(inner);
+    let introduction = draft
+        .input
+        .as_ref()
+        .map(|editor| format!("{}\nConfig: {}", editor.title, app.config_path.display()))
+        .unwrap_or_else(|| format!("Config: {}", app.config_path.display()));
     frame.render_widget(
-        Paragraph::new(format!("Config: {}", app.config_path.display())).wrap(Wrap { trim: false }),
+        Paragraph::new(introduction).wrap(Wrap { trim: false }),
         rows[0],
     );
-    let mut items: Vec<ListItem> = draft
-        .config
-        .project_roots
-        .iter()
-        .map(|path| {
-            ListItem::new(format!(
-                " {}{}",
-                path.display(),
-                if path.is_dir() {
-                    ""
-                } else {
-                    "  [unavailable; kept]"
-                }
-            ))
-        })
-        .collect();
-    items.push(ListItem::new(format!(
-        " Recursive discovery: {}  [r toggles]",
-        if draft.config.recursive { "on" } else { "off" }
-    )));
-    let mut state = ListState::default().with_selected(Some(draft.cursor));
-    frame.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol("▸ ")
-            .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
+    let sections = [
+        crate::settings::Section::Sources,
+        crate::settings::Section::Worktrees,
+        crate::settings::Section::Profiles,
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            sections
+                .iter()
+                .enumerate()
+                .map(|(index, section)| {
+                    Span::styled(
+                        format!(" {} {} ", index + 1, section.title()),
+                        if *section == draft.section {
+                            Style::default().fg(Color::Black).bg(accent(app))
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
         rows[1],
-        &mut state,
     );
-    if let Some(input) = &draft.input {
-        let block = border(format!(" {} · Enter accept ", input.field.label), true, app);
-        let rect = block.inner(rows[2]);
-        let column = input.field.value[..input.field.cursor].width();
-        let offset = column.saturating_sub(rect.width.saturating_sub(1) as usize);
-        frame.render_widget(
-            Paragraph::new(input.field.value.as_str())
-                .scroll((0, offset.min(u16::MAX as usize) as u16))
-                .block(block),
-            rows[2],
-        );
-        if rect.width > 0 && rect.height > 0 {
-            frame.set_cursor_position((rect.x + (column - offset) as u16, rect.y));
+    if let Some(editor) = &draft.input {
+        let visible = (rows[2].height as usize / 3).max(1);
+        let start = editor.active.saturating_sub(visible - 1);
+        for (position, (index, field)) in editor
+            .fields
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let rect = Rect::new(
+                rows[2].x,
+                rows[2].y + (position * 3) as u16,
+                rows[2].width,
+                3.min(rows[2].height.saturating_sub((position * 3) as u16)),
+            );
+            let active = index == editor.active;
+            let block = border(
+                format!(" {}/{} · {} ", index + 1, editor.fields.len(), field.label),
+                active,
+                app,
+            );
+            let inner = block.inner(rect);
+            let column = field.value[..field.cursor].width();
+            let offset = if active {
+                column.saturating_sub(inner.width.saturating_sub(1) as usize)
+            } else {
+                0
+            };
+            frame.render_widget(
+                Paragraph::new(field.value.as_str())
+                    .scroll((0, offset.min(u16::MAX as usize) as u16))
+                    .block(block),
+                rect,
+            );
+            if active && inner.width > 0 && inner.height > 0 {
+                frame.set_cursor_position((inner.x + (column - offset) as u16, inner.y));
+            }
         }
+    } else {
+        let items = draft
+            .rows()
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(draft.cursor));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
+            rows[2],
+            &mut state,
+        );
     }
     let message = match &draft.mode {
         crate::settings::Mode::Edit => draft.message.clone(),
@@ -470,7 +518,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             let rect = centered(area, 94, 28);
             frame.render_widget(Clear, rect);
             let help = format!(
-                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  i live operation details · j/k scroll · G follow output\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · , settings\n  Settings: a add · Enter edit · d remove · r recursive\n  Ctrl+s apply · Esc explorer (keeps draft) · D discard\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
+                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  i live operation details · j/k scroll · G follow output\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · , settings\n  Settings: 1/2/3 sections · h/l switch · a add · Enter edit\n  Sources: d remove · r recursive · fields: Tab move, Ctrl+u clear\n  Ctrl+s apply · Esc explorer (keeps draft) · D discard\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
                 app.config_path.display()
             );
             frame.render_widget(
