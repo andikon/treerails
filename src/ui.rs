@@ -267,10 +267,36 @@ fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
             "Discard unsaved settings{}? y discard · any other key keep editing",
             if *quit { " and quit" } else { "" }
         ),
-        crate::settings::Mode::Conflict(fields) => format!(
-            "Changed elsewhere: {}\nm use my changes · e keep external changes · Esc continue editing",
-            fields.join(", ")
-        ),
+        crate::settings::Mode::Conflict(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let Some((path, setting)) = field
+                        .strip_prefix("projects.")
+                        .and_then(|field| field.rsplit_once('.'))
+                    else {
+                        return field.clone();
+                    };
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let name = if name.chars().count() > 24 {
+                        format!("{}…", name.chars().take(23).collect::<String>())
+                    } else {
+                        name.into_owned()
+                    };
+                    format!("{setting} ({name})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let choices = if rows[3].width >= 64 {
+                "m use my changes · e keep external changes · Esc continue editing"
+            } else {
+                "m mine · e external · Esc edit"
+            };
+            format!("{choices}\nChanged elsewhere: {fields}")
+        }
     };
     frame.render_widget(
         Paragraph::new(message)
