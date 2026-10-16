@@ -322,3 +322,123 @@ fn independent_settings_drafts_merge_changes_to_different_fields() {
     assert_eq!(saved.project_roots, [temp.path().to_path_buf()]);
     assert!(render(&second, 120, 35).contains("Saved & applied"));
 }
+
+#[test]
+fn saving_after_external_source_removal_keeps_the_settings_selection_usable() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    config::Config::save_roots(
+        &path,
+        &[temp.path().join("first"), temp.path().join("second")],
+    )
+    .unwrap();
+    let (config, state) = config::open(&path, false, None).unwrap();
+    let mut app = App::new(config, state, path.clone(), vec![], false);
+    for c in [',', 'j', 'j', 'r'] {
+        app.key(key(c));
+    }
+    config::Config::save_roots(&path, &[]).unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(render(&app, 120, 35).contains("Saved & applied"));
+    assert!(config::Config::load(&path).unwrap().recursive);
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let saved = config::Config::load(&path).unwrap();
+    assert!(saved.project_roots.is_empty());
+    assert!(!saved.recursive);
+}
+
+#[test]
+fn saving_after_external_list_removal_keeps_worktree_and_profile_editors_usable() {
+    for (section, original, external, expected_editor) in [
+        (
+            '2',
+            "projects = [{path = 'first'}, {path = 'second'}]",
+            "projects = []",
+            "Global worktree defaults",
+        ),
+        ('3', "[profiles.zzz]\nprogram = 'custom'", "", "terminal"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, original).unwrap();
+        let (config, state) = config::open(&path, false, None).unwrap();
+        let mut app = App::new(config, state, path.clone(), vec![], false);
+        for c in [',', section, 'G'] {
+            app.key(key(c));
+        }
+        std::fs::write(&path, external).unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app, 120, 35);
+        assert!(screen.contains(expected_editor), "{screen}");
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste(if section == '2' {
+            "after-shrink/{branch_slug}"
+        } else {
+            "after-shrink"
+        });
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(render(&app, 120, 35).contains("Saved & applied"));
+        let saved = config::Config::load(&path).unwrap();
+        assert!(saved.projects.is_empty());
+        assert!(!saved.profiles.contains_key("zzz"));
+        if section == '2' {
+            assert_eq!(saved.worktrees.path_template, "after-shrink/{branch_slug}");
+        } else {
+            assert_eq!(saved.profiles["terminal"].program, "after-shrink");
+        }
+    }
+}
+
+#[test]
+fn long_project_conflicts_keep_resolution_choices_visible_at_eighty_columns() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.toml");
+    let project = temp
+        .path()
+        .join("ordinary-project-with-a-moderately-long-repository-name");
+    std::fs::create_dir(&project).unwrap();
+    let original = format!(
+        "projects = [{{path = {}, base = 'old', path_template = 'old'}}]\n",
+        toml::Value::String(project.display().to_string())
+    );
+    std::fs::write(&path, &original).unwrap();
+    let (config, state) = config::open(&path, false, None).unwrap();
+    let mut app = App::new(config, state, path.clone(), vec![], false);
+    app.projects.push(treerail::git::Project {
+        path: project,
+        name: "project".into(),
+    });
+    app.open_project();
+    for c in [',', '2', 'j'] {
+        app.key(key(c));
+    }
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.paste("mine");
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.paste("mine");
+    let external = original.replace("'old'", "'external'");
+    std::fs::write(&path, &external).unwrap();
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let screen = render(&app, 80, 24);
+    for choice in [
+        "m use my changes",
+        "e keep external changes",
+        "Esc continue editing",
+    ] {
+        assert!(screen.contains(choice), "Missing {choice}: {screen}");
+    }
+    assert!(screen.contains("base (ordinary-project"), "{screen}");
+    assert!(screen.contains("path_template"), "{screen}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(render(&app, 80, 24).contains("Unsaved draft"));
+    app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    app.key(key('m'));
+    let saved = config::Config::load(&path).unwrap();
+    assert_eq!(saved.projects[0].base.as_deref(), Some("mine"));
+    assert_eq!(saved.projects[0].path_template.as_deref(), Some("mine"));
+}

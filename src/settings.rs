@@ -383,6 +383,7 @@ impl Draft {
         let loaded = Config::load(path)?;
         self.base = loaded.clone();
         self.config = loaded.clone();
+        self.cursor = self.cursor.min(self.rows().len().saturating_sub(1));
         self.mode = Mode::Edit;
         self.error = false;
         self.message = "Saved & applied".into();
