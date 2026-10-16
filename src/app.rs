@@ -258,7 +258,6 @@ pub struct App {
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
-    pub state_path: PathBuf,
     pub roots: Vec<PathBuf>,
     pub recursive: bool,
     pub projects: Vec<Project>,
@@ -302,7 +301,6 @@ impl App {
         config: Config,
         state: State,
         config_path: PathBuf,
-        state_path: PathBuf,
         roots: Vec<PathBuf>,
         recursive: bool,
     ) -> Self {
@@ -310,7 +308,6 @@ impl App {
             config,
             state,
             config_path,
-            state_path,
             roots: roots.clone(),
             recursive,
             projects: vec![],
@@ -1497,9 +1494,9 @@ impl App {
         self.recover_form = Some(recovery);
         self.operation(operation);
     }
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         self.state
-            .save(&self.state_path)
+            .save(&self.config_path)
             .context("Save remembered selections")
     }
 }

@@ -27,8 +27,7 @@ treerail [OPTIONS] [PATHS]...
 
 --paths-file projects.txt    One source folder per line; # comments allowed
 --recursive                 Search beyond immediate children
---config config.toml        Choose a configuration file
---state state.json          Choose a remembered-state file
+--config config.toml        Choose the combined settings and remembered-state file
 --list                      Print discovered projects as JSON without a TUI
 --help                      Show all options
 ```
@@ -85,9 +84,11 @@ Pickers support `j/k`, `gg/G`, arrows, and `Ctrl+n/p`. Press `/` to filter, type
 
 ## Configuration
 
-Copy [examples/config.toml](../examples/config.toml) and pass `--config`, or place it in the platform configuration directory. `?` displays the active path. The `directories` crate chooses the OS application directories; Windows normally uses a `treerail` folder under `%APPDATA%`, Linux uses `$XDG_CONFIG_HOME/treerail` (or `~/.config/treerail`), and macOS uses Application Support.
+Interactive startup automatically creates one combined `config.toml`. On Windows it lives at `%LOCALAPPDATA%\treerails\config.toml`; on Linux and macOS it lives at `~/.config/treerails/config.toml`. The Unix location uses your home directory even when `XDG_CONFIG_HOME` is set. `?` displays the active path. Use `--config` to choose another file, including that file's remembered selections and starting points. You can also start from [examples/config.toml](../examples/config.toml).
 
-TOML is editable configuration; remembered selections/bases live in separate `state.json`. `S` changes only saved roots and preserves existing comments. Invalid settings produce an error rather than silently replacing the file.
+Settings and remembered selections share this document. Session memory is stored under `[state]` and `[state.bases]`. Automatic memory saves preserve comments and unrelated settings, including changes saved by other instances or your editor. The most recently saved selection wins; starting points changed in separate projects are preserved. Writes are atomic and Tree Rail instances coordinate through a small `.lock` sidecar containing no settings or history. `--list` only reads files: it never creates a configuration, imports data to disk, or saves selections. Invalid settings produce an error without replacing the document.
+
+When the new **default** file is missing, Tree Rail imports the former configuration and `state.json` before creating it. Relative saved paths retain their original meaning. The old files remain untouched. Windows legacy settings used `%APPDATA%\treerail\config\config.toml` and memory used `%LOCALAPPDATA%\treerail\data\state.json`; Linux used `$XDG_CONFIG_HOME/treerail/config.toml` (or `~/.config/treerail/config.toml`) and `$XDG_STATE_HOME/treerail/state.json` (or `~/.local/state/treerail/state.json`); macOS used `~/Library/Application Support/treerail/`. An existing new file is authoritative and never reimports old values. If import fails, the original data is preserved and the error names the failed component. Correct it before retrying, or choose a separate file with `--config`. Explicit overrides do not import the default legacy files. The old `--state` option has been removed because settings and memory now belong to the same file.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']
