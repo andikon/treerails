@@ -109,7 +109,7 @@ treerail --paths-file projects.txt
 treerail --recursive 'C:\Code'
 ```
 
-Press **`S`** to save the current roots. Future launches can use just `treerail`. Direct children are scanned by default; folders containing `.worktrees` are excluded from project discovery and appear under their owning repository instead.
+Explicit CLI sources are remembered automatically, so future launches can use just `treerail`. Add `--temporary` for a one-off source, or press **`,`** to manage sources in settings. Direct children are scanned by default; folders containing `.worktrees` are excluded from project discovery and appear under their owning repository instead.
 
 ### Requirements
 
@@ -161,7 +161,7 @@ Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. 
 
 Tree Rail keeps roots, per-project defaults, launch profiles, keybindings, colors, and remembered selections together in **`config.toml`**. Interactive startup creates it automatically at `%LOCALAPPDATA%\treerails\config.toml` on Windows or `~/.config/treerails/config.toml` on Linux and macOS. `--config` selects another combined file.
 
-Explicit project sources are remembered automatically; add `--temporary` for a one-off launch. Press `,` to manage sources and discovery in the TUI, then `Ctrl+s` to Save & Apply. Drafts survive navigation, and conflicting external edits prompt for a choice.
+Explicit project sources are remembered automatically; add `--temporary` for a one-off launch. Press `,` to manage sources, discovery, worktree defaults and launch profiles in the TUI, then `Ctrl+s` to Save & Apply. Drafts survive navigation, and conflicting external edits prompt for a choice.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']

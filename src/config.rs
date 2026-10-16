@@ -120,6 +120,74 @@ impl Default for Config {
     }
 }
 impl Config {
+    pub fn validate(&self) -> Result<()> {
+        let valid_text = |name: &str, value: &str| -> Result<()> {
+            anyhow::ensure!(
+                !value.contains('\0'),
+                "{name} cannot contain a NUL character"
+            );
+            Ok(())
+        };
+        anyhow::ensure!(
+            !self.worktrees.path_template.trim().is_empty(),
+            "Worktree path template cannot be empty"
+        );
+        valid_text("Worktree path template", &self.worktrees.path_template)?;
+        anyhow::ensure!(
+            self.profiles.contains_key(&self.default_profile),
+            "Unknown default_profile '{}'",
+            self.default_profile
+        );
+        for project in &self.projects {
+            if let Some(profile) = &project.default_profile {
+                anyhow::ensure!(
+                    self.profiles.contains_key(profile),
+                    "Unknown profile '{profile}' for {}",
+                    project.path.display()
+                );
+            }
+            if let Some(template) = &project.path_template {
+                anyhow::ensure!(
+                    !template.trim().is_empty(),
+                    "Project worktree path cannot be empty"
+                );
+                valid_text("Project worktree path", template)?;
+            }
+            if let Some(base) = &project.base {
+                anyhow::ensure!(
+                    !base.trim().is_empty(),
+                    "Project starting point cannot be empty"
+                );
+                valid_text("Starting point", base)?;
+            }
+        }
+        for (name, profile) in &self.profiles {
+            anyhow::ensure!(!name.trim().is_empty(), "Profile name cannot be empty");
+            anyhow::ensure!(
+                !profile.cwd.trim().is_empty(),
+                "Working directory for profile '{name}' cannot be empty"
+            );
+            anyhow::ensure!(
+                profile.terminal == "auto" || self.terminals.contains_key(&profile.terminal),
+                "Unknown terminal adapter '{}' for profile '{name}'",
+                profile.terminal
+            );
+            for value in std::iter::once(&profile.program)
+                .chain(&profile.args)
+                .chain(std::iter::once(&profile.cwd))
+            {
+                valid_text("Profile field", value)?;
+            }
+            for (key, value) in &profile.env {
+                anyhow::ensure!(
+                    !key.is_empty() && !key.contains(['=', '\0']),
+                    "Invalid environment variable name '{key}'"
+                );
+                valid_text("Environment value", value)?;
+            }
+        }
+        Ok(())
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let Some(raw) = read_optional(path)? else {
             return Ok(Self::default());

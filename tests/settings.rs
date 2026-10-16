@@ -143,8 +143,8 @@ fn quitting_requires_a_choice_before_discarding_a_settings_draft() {
     assert!(!config::Config::load(&path).unwrap().recursive);
 }
 
-#[test]
-fn unavailable_sources_are_kept_and_removing_sources_does_not_delete_directories() {
+#[tokio::test]
+async fn unavailable_sources_are_kept_and_removing_sources_does_not_delete_directories() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
     let missing = temp.path().join("offline");
@@ -157,6 +157,12 @@ fn unavailable_sources_are_kept_and_removing_sources_does_not_delete_directories
         vec![temp.path().to_path_buf(), missing.clone()],
         false,
     );
+    let result = app.jobs.remove(0).execute().await;
+    app.accept(treerail::app::Completion {
+        epoch: app.epoch,
+        token: "discover".into(),
+        result,
+    });
     app.key(key(','));
     assert!(render(&app, 120, 35).contains("unavailable; kept"));
     app.key(key('d'));
