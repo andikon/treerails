@@ -50,6 +50,10 @@ Parent directories are scanned one level deep by default. Folders containing `.w
 
 A branch already checked out in a worktree selects that worktree. New feature branches deliberately do not inherit the base branch as their upstream: they publish under their own name.
 
+Every Git action keeps a live status above the explorer: its action, original target, current phase and elapsed time. Transfer percentages and rates appear when Git reports them; a spinner continues during silent commands. These percentages describe the reported transfer phase, rather than an invented overall total.
+
+Press `i` to inspect streamed Git and hook output while an operation runs, or its result afterward. Details follow new output by default; `j/k` and `Ctrl+u/d` scroll, `g`/`gg` goes to the beginning, and `G` resumes following the end. `Esc`, `q` or `i` closes details while Git continues. Output retains the latest 64 KiB and shows a notice when older output was discarded. Navigation, searching and refresh notices keep the operation attached to its original target. Only one Git operation runs at a time; cancellation is outside this version.
+
 ## Keyboard controls
 
 | Keys | Action |
@@ -67,6 +71,7 @@ A branch already checked out in a worktree selects that worktree. New feature br
 | `Space`, `s/u` | Mark files; stage/unstage files |
 | `t` | Toggle staged/unstaged diff |
 | `c`, `f`, `p`, `P` | Commit, fetch, push/publish, fast-forward pull |
+| `i` | Inspect live operation output or the latest result |
 | `r`, `v`, `w` | PR picker, PR comparison, open PR in browser |
 | `d` | Confirm worktree removal, while focused on worktrees |
 | `R`, `S` | Refresh; save project sources |
