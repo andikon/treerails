@@ -53,6 +53,8 @@ Every Git action keeps a live status above the explorer: its action, original ta
 
 Press `i` to inspect streamed Git and hook output while an operation runs, or its result afterward. Details follow new output by default; `j/k` and `Ctrl+u/d` scroll, `g`/`gg` goes to the beginning, and `G` resumes following the end. `Esc`, `q` or `i` closes details while Git continues. Output retains the latest 64 KiB and shows a notice when older output was discarded. Navigation, searching and refresh notices keep the operation attached to its original target. Only one Git operation runs at a time; cancellation is outside this version.
 
+Press `H` for recent Git operations from this session. The list shows each action, original project/worktree and outcome; use `j/k`, `gg/G` or `/` to find a result, then `Enter` for its details. An older result stays selected while a newer operation's live status remains visible above it. `H` returns to history from details. Up to 20 operations are retained, including the current one; an inspected result is kept while the oldest other results are discarded. The list reports how many were discarded. History and output are never saved to `config.toml` and start empty next launch.
+
 ## Keyboard controls
 
 | Keys | Action |
@@ -71,6 +73,7 @@ Press `i` to inspect streamed Git and hook output while an operation runs, or it
 | `t` | Toggle staged/unstaged diff |
 | `c`, `f`, `p`, `P` | Commit, fetch, push/publish, fast-forward pull |
 | `i` | Inspect live operation output or the latest result |
+| `H` | Open this session's recent Git operation history |
 | `r`, `v`, `w` | PR picker, PR comparison, open PR in browser |
 | `d` | Confirm worktree removal, while focused on worktrees |
 | `R`, `S` | Refresh; save project sources |
