@@ -138,7 +138,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let result:Result<()>=async{
         while !app.quit{
-            for job in app.jobs.drain(..).collect::<Vec<_>>(){
+            for job in std::mem::take(&mut app.jobs){
                 let sender=tx.clone();let limiter=semaphore.clone();let epoch=app.epoch;let token=job.token();
                 tokio::spawn(async move{let _permit=limiter.acquire_owned().await;let result=job.execute().await;let _=sender.send(Completion{epoch,token,result}).await;});
             }

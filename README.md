@@ -54,6 +54,29 @@ A roughly **24-second walkthrough**: select a project → create a worktree from
 
 ## Quick start
 
+### Download a prebuilt binary
+
+**[Get the latest release →](https://github.com/andikon/treerails/releases/latest)** No Rust installation or build tools required.
+
+| Your machine | Download |
+| --- | --- |
+| **Windows · Intel/AMD 64-bit** | [Standalone EXE](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.exe) · [ZIP with documentation](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.zip) |
+| **Linux · Intel/AMD 64-bit** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-linux-x86_64.tar.gz) |
+| **macOS · Apple Silicon** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-macos-aarch64.tar.gz) |
+| **macOS · Intel** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-macos-x86_64.tar.gz) |
+
+On Windows, download the EXE, rename it to `treerail.exe`, and put it in a folder such as `C:\Tools\TreeRail`. Open a terminal in that folder and run:
+
+```powershell
+.\treerail.exe 'C:\Code'
+```
+
+Add the folder to your user `PATH` to run `treerail` from anywhere. Alternatively, extract the ZIP; it already contains `treerail.exe`, the usage guide, and an example configuration.
+
+On macOS or Linux, extract the archive and run `./treerail ~/code`. Move the executable to a directory on `PATH` for convenient access. Linux downloads are static musl builds. The release includes `SHA256SUMS`; compare a download with `Get-FileHash -Algorithm SHA256` on Windows or `shasum -a 256` on macOS/Linux. Binaries are currently unsigned and macOS builds are not notarized.
+
+Git must be installed on the machine. See the optional tool requirements below.
+
 ### Install from a local checkout
 
 With a stable Rust toolchain and Git installed:
@@ -172,7 +195,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Tests cover real disposable repositories and local remotes, worktree creation from non-HEAD bases, staging and commits, upstream publication, safe cleanup, input modes, and responsive terminal layouts. The included CI workflow checks and builds Windows, Linux, and macOS artifacts.
+Tests cover real disposable repositories and local remotes, worktree creation from non-HEAD bases, staging and commits, upstream publication, safe cleanup, input modes, and responsive terminal layouts. CI checks and builds Windows, Linux, and macOS artifacts. Pushing a matching version tag automatically publishes prebuilt downloads to GitHub Releases after every platform passes. **[Release instructions →](docs/releasing.md)**
 
 **Validation status:** Windows builds and terminal smoke checks have run locally. macOS/Linux terminal adapters and live authenticated GitHub/Copilot workflows still need environment-specific validation.
 

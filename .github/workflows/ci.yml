@@ -10,13 +10,19 @@ jobs:
         include:
           - os: windows-latest
             binary: target/release/treerail.exe
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             binary: target/release/treerail
           - os: macos-latest
             binary: target/release/treerail
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s scripts -p 'test_*.py' -v
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,7 +30,7 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: treerail-${{ runner.os }}-${{ runner.arch }}
           path: ${{ matrix.binary }}
