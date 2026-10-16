@@ -1,4 +1,4 @@
-use crate::app::{App, Modal};
+use crate::app::{App, Modal, PickerKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,7 +23,7 @@ fn border<'a>(title: impl Into<Line<'a>>, active: bool, app: &App) -> Block<'a> 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if app.latest_operation.is_some() { 4 } else { 2 }),
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -51,7 +51,48 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])),
         rows[0],
     );
-    if app.project.is_none() {
+    if let Some(record) = &app.latest_operation {
+        let path = record.target.display().to_string();
+        let length = rows[0].width.saturating_sub(2) as usize;
+        let path = if path.chars().count() > length {
+            format!(
+                "…{}",
+                path.chars()
+                    .rev()
+                    .take(length.saturating_sub(1))
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            )
+        } else {
+            path
+        };
+        let summary = format!("{}\n{}", record.headline(), path);
+        let status = if record.progress.is_empty() {
+            summary
+        } else {
+            format!("{}\n{}", summary, record.progress)
+        };
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(
+                if record.result.as_ref().is_some_and(Result::is_err) {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                },
+            )),
+            Rect::new(
+                rows[0].x,
+                rows[0].y.saturating_add(1),
+                rows[0].width,
+                rows[0].height.saturating_sub(1),
+            ),
+        );
+    }
+    if app.settings_open {
+        settings_view(frame, app, rows[1]);
+    } else if app.project.is_none() {
         projects(frame, app, rows[1]);
     } else {
         workspace(frame, app, rows[1]);
@@ -73,18 +114,200 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         rows[2],
     );
-    let hints = if app.project.is_none() {
-        " j/k navigate   / search   Enter explore   S save sources   R reload   ? help   q quit "
+    let hints = if app.settings_open
+        && app
+            .settings
+            .as_ref()
+            .is_some_and(|draft| draft.input.is_some())
+    {
+        " Tab next field · Ctrl+u clear · Enter accept · Ctrl+s apply · Esc explorer (keeps draft) "
+    } else if app.settings_open {
+        " 1/2/3 sections · h/l switch · a add · Enter edit · Ctrl+s apply · i output · H history · Esc explorer · D discard "
+    } else if app.project.is_none() {
+        " j/k navigate   / search   Enter explore   , settings   R reload   i output · H history   ? help   q quit "
     } else {
-        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  t staged  ? help "
+        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
         rows[3],
     );
     if let Some(modal) = &app.modal {
+        let history =
+            matches!(modal, Modal::Picker(picker) if matches!(picker.kind, PickerKind::Operations));
+        let area = if history || matches!(modal, Modal::OperationDetails) {
+            Rect::new(
+                area.x,
+                rows[0].bottom(),
+                area.width,
+                area.bottom().saturating_sub(rows[0].bottom()),
+            )
+        } else {
+            area
+        };
         modal_view(frame, app, modal, area);
     }
+}
+fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(draft) = &app.settings else {
+        return;
+    };
+    let block = border(
+        format!(
+            " Settings · {} ",
+            if draft.dirty() {
+                "Unsaved draft"
+            } else {
+                "Saved"
+            }
+        ),
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    let introduction = draft
+        .input
+        .as_ref()
+        .map(|editor| format!("{}\nConfig: {}", editor.title, app.config_path.display()))
+        .unwrap_or_else(|| format!("Config: {}", app.config_path.display()));
+    frame.render_widget(
+        Paragraph::new(introduction).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    let sections = [
+        crate::settings::Section::Sources,
+        crate::settings::Section::Worktrees,
+        crate::settings::Section::Profiles,
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            sections
+                .iter()
+                .enumerate()
+                .map(|(index, section)| {
+                    Span::styled(
+                        format!(" {} {} ", index + 1, section.title()),
+                        if *section == draft.section {
+                            Style::default().fg(Color::Black).bg(accent(app))
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )),
+        rows[1],
+    );
+    if let Some(editor) = &draft.input {
+        let visible = (rows[2].height as usize / 3).max(1);
+        let start = editor.active.saturating_sub(visible - 1);
+        for (position, (index, field)) in editor
+            .fields
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let rect = Rect::new(
+                rows[2].x,
+                rows[2].y + (position * 3) as u16,
+                rows[2].width,
+                3.min(rows[2].height.saturating_sub((position * 3) as u16)),
+            );
+            let active = index == editor.active;
+            let block = border(
+                format!(" {}/{} · {} ", index + 1, editor.fields.len(), field.label),
+                active,
+                app,
+            );
+            let inner = block.inner(rect);
+            let column = field.value[..field.cursor].width();
+            let offset = if active {
+                column.saturating_sub(inner.width.saturating_sub(1) as usize)
+            } else {
+                0
+            };
+            frame.render_widget(
+                Paragraph::new(field.value.as_str())
+                    .scroll((0, offset.min(u16::MAX as usize) as u16))
+                    .block(block),
+                rect,
+            );
+            if active && inner.width > 0 && inner.height > 0 {
+                frame.set_cursor_position((inner.x + (column - offset) as u16, inner.y));
+            }
+        }
+    } else {
+        let items = draft
+            .rows()
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(draft.cursor));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
+            rows[2],
+            &mut state,
+        );
+    }
+    let message = match &draft.mode {
+        crate::settings::Mode::Edit => draft.message.clone(),
+        crate::settings::Mode::Discard { quit } => format!(
+            "Discard unsaved settings{}? y discard · any other key keep editing",
+            if *quit { " and quit" } else { "" }
+        ),
+        crate::settings::Mode::Conflict(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let Some((path, setting)) = field
+                        .strip_prefix("projects.")
+                        .and_then(|field| field.rsplit_once('.'))
+                    else {
+                        return field.clone();
+                    };
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let name = if name.chars().count() > 24 {
+                        format!("{}…", name.chars().take(23).collect::<String>())
+                    } else {
+                        name.into_owned()
+                    };
+                    format!("{setting} ({name})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let choices = if rows[3].width >= 64 {
+                "m use my changes · e keep external changes · Esc continue editing"
+            } else {
+                "m mine · e external · Esc edit"
+            };
+            format!("{choices}\nChanged elsewhere: {fields}")
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if draft.error {
+                Color::Red
+            } else {
+                Color::Yellow
+            })),
+        rows[3],
+    );
 }
 fn projects(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
@@ -301,11 +524,59 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     match modal {
+        Modal::OperationDetails => {
+            let Some(record) = app.inspected_operation() else {
+                return;
+            };
+            let rect = centered(area, 112, area.height);
+            frame.render_widget(Clear, rect);
+            let block = border(
+                format!(
+                    " Operation #{} · j/k scroll · g/G first/last · Esc close ",
+                    record.id
+                ),
+                true,
+                app,
+            );
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(inner);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{}\nProject: {} · Target: {}\n{}",
+                    record.headline(),
+                    record
+                        .project
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    record
+                        .target
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    if record.truncated {
+                        "Earlier output discarded (64 KiB limit)."
+                    } else {
+                        "H history · g full paths/result · session only"
+                    }
+                )),
+                rows[0],
+            );
+            let visible = rows[1].height as usize;
+            let lines = record.details_lines(rows[1].width as usize);
+            let count = lines.len();
+            let start = app.operation_scroll.min(count.saturating_sub(visible));
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>().join("\n")),
+                rows[1],
+            );
+        }
         Modal::Help => {
-            let rect = centered(area, 94, 27);
+            let rect = centered(area, 94, 28);
             frame.render_widget(Clear, rect);
             let help = format!(
-                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · S save roots\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
+                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  i live details · H session history · j/k scroll · G follow\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · , settings\n  Settings: 1/2/3 sections · h/l switch · a add · Enter edit\n  Sources: d remove · r recursive · fields: Tab move, Ctrl+u clear\n  Ctrl+s apply · Esc explorer (keeps draft) · D discard\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
                 app.config_path.display()
             );
             frame.render_widget(
@@ -328,24 +599,37 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
         Modal::Picker(picker) => {
-            let rect = centered(area, 100, 24);
+            let history = matches!(picker.kind, PickerKind::Operations);
+            let rect = centered(area, 100, if history { area.height } else { 24 });
             frame.render_widget(Clear, rect);
             let block = border(format!(" {} ", picker.title), true, app);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let rows = Layout::vertical([
-                Constraint::Length(2),
+                Constraint::Length(if history { 4 } else { 2 }),
                 Constraint::Min(1),
                 Constraint::Length(1),
             ])
             .split(inner);
+            let mut prompt = format!(
+                " /{}  [{}]",
+                picker.query,
+                if picker.editing { "filter" } else { "navigate" }
+            );
+            if history {
+                prompt.push_str(&format!(
+                    "\n Session only · {} retained · {} older discarded\n {}",
+                    app.operation_records().len(),
+                    app.history_evicted,
+                    if app.latest_operation.is_none() {
+                        "No Git operations yet. Run an action to see its result here."
+                    } else {
+                        "Up to 20 results; the inspected result stays available."
+                    }
+                ));
+            }
             frame.render_widget(
-                Paragraph::new(format!(
-                    " /{}  [{}]",
-                    picker.query,
-                    if picker.editing { "filter" } else { "navigate" }
-                ))
-                .style(Style::default().fg(accent(app))),
+                Paragraph::new(prompt).style(Style::default().fg(accent(app))),
                 rows[0],
             );
             let items: Vec<ListItem> = picker

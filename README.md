@@ -109,7 +109,7 @@ treerail --paths-file projects.txt
 treerail --recursive 'C:\Code'
 ```
 
-Press **`S`** to save the current roots. Future launches can use just `treerail`. Direct children are scanned by default; folders containing `.worktrees` are excluded from project discovery and appear under their owning repository instead.
+Explicit CLI sources are remembered automatically, so future launches can use just `treerail`. Add `--temporary` for a one-off source, or press **`,`** to manage sources in settings. Direct children are scanned by default; folders containing `.worktrees` are excluded from project discovery and appear under their owning repository instead.
 
 ### Requirements
 
@@ -152,14 +152,16 @@ Pulls use **fast-forward only**. Worktree removal refuses uncommitted changes an
 | `Space` · `s/u` · `t` | Mark files, stage/unstage, toggle staged/unstaged diffs |
 | `c` · `f` · `p/P` | Commit, fetch, push/publish, pull |
 | `r` · `v` · `w` | Choose a PR, view its comparison, open it in a browser |
-| `d` · `R` · `S` | Remove a worktree, refresh, save project roots |
+| `d` · `R` · `,` | Remove a worktree, refresh, open settings |
 | `?` · `Esc` · `q` | Help, close/back, back/quit |
 
 Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. Pickers support Vim navigation and `/` to enter a filter. **[Complete keyboard reference →](docs/usage.md#keyboard-controls)**
 
 ## Make it yours
 
-Tree Rail uses readable **TOML configuration** for roots, per-project defaults, launch profiles, keybindings, and colors. Remembered selections and starting points live in a separate `state.json`.
+Tree Rail keeps roots, per-project defaults, launch profiles, keybindings, colors, and remembered selections together in **`config.toml`**. Interactive startup creates it automatically at `%LOCALAPPDATA%\treerails\config.toml` on Windows or `~/.config/treerails/config.toml` on Linux and macOS. `--config` selects another combined file.
+
+Explicit project sources are remembered automatically; add `--temporary` for a one-off launch. Press `,` to manage sources, discovery, worktree defaults and launch profiles in the TUI, then `Ctrl+s` to Save & Apply. Drafts survive navigation, and conflicting external edits prompt for a choice.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']
@@ -184,7 +186,7 @@ Copy-Item '.\examples\config.toml' '.\treerail.toml'
 treerail --config '.\treerail.toml'
 ```
 
-Press `?` to see the active configuration path. Custom profiles can run another agent, editor, shell, or terminal layout. **[Profiles, terminal adapters, themes, and key overrides →](docs/usage.md#configuration)**
+Press `?` to see the active configuration path. On first use of the new default location, Tree Rail imports legacy settings and `state.json` without changing the originals. Custom profiles can run another agent, editor, shell, or terminal layout. **[Configuration, upgrades, profiles, and key overrides →](docs/usage.md#configuration)**
 
 ## Development
 

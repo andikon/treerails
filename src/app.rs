@@ -1,13 +1,15 @@
 use crate::{
     config::{Config, State, same_path},
     discover,
+    feedback::{self, Event, HISTORY_LIMIT, Record, Reporter},
     git::{self, Branch, ChangedFile, Project, PullRequest, Snapshot, Worktree},
     launch,
+    settings::{self, Draft},
 };
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -43,6 +45,7 @@ pub enum Job {
     Prs(PathBuf),
     ReviewDiff(PathBuf, String),
     Operation {
+        id: u64,
         project: PathBuf,
         path: PathBuf,
         op: Operation,
@@ -73,7 +76,17 @@ impl Job {
             Self::Branches(p) => format!("branches:{}", p.display()),
             Self::Prs(p) => format!("prs:{}", p.display()),
             Self::Discover(..) => "discover".into(),
-            Self::Operation { .. } => "operation".into(),
+            Self::Operation { id, .. } => format!("operation:{id}"),
+        }
+    }
+    pub async fn execute_with_feedback(
+        self,
+        sender: tokio::sync::mpsc::Sender<Event>,
+    ) -> Result<Payload> {
+        if let Self::Operation { id, .. } = &self {
+            feedback::scope(Reporter { id: *id, sender }, self.execute()).await
+        } else {
+            self.execute().await
         }
     }
     pub async fn execute(self) -> Result<Payload> {
@@ -107,7 +120,9 @@ impl Job {
                 let key = format!("review:{}", path.display());
                 Ok(Payload::Diff(key, git::review_diff(&path, &branch).await?))
             }
-            Self::Operation { project, path, op } => {
+            Self::Operation {
+                project, path, op, ..
+            } => {
                 let (mut selected, mut message) = (None, "Completed".to_owned());
                 match op {
                     Operation::Stage(files, undo) => {
@@ -123,10 +138,10 @@ impl Job {
                         message = git::commit(&path, &s, &b).await?;
                     }
                     Operation::Fetch => {
-                        git::run(&path, ["fetch", "--all", "--prune"]).await?;
+                        git::run(&path, ["fetch", "--progress", "--all", "--prune"]).await?;
                     }
                     Operation::Pull => {
-                        git::run(&path, ["pull", "--ff-only"]).await?;
+                        git::run(&path, ["pull", "--progress", "--ff-only"]).await?;
                     }
                     Operation::Push => {
                         git::push(&path).await?;
@@ -202,7 +217,7 @@ pub struct Field {
     pub readonly: bool,
 }
 impl Field {
-    fn new(label: &str, value: String, multiline: bool) -> Self {
+    pub(crate) fn new(label: &str, value: String, multiline: bool) -> Self {
         let cursor = value.len();
         Self {
             label: label.into(),
@@ -223,6 +238,7 @@ pub struct Form {
 }
 #[derive(Debug, Clone)]
 pub enum PickerKind {
+    Operations,
     Branches,
     Base(Form),
     Profiles,
@@ -248,6 +264,7 @@ impl Picker {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
+    OperationDetails,
     Form(Form),
     Picker(Picker),
     Confirm(String, Operation),
@@ -258,8 +275,11 @@ pub struct App {
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
-    pub state_path: PathBuf,
     pub roots: Vec<PathBuf>,
+    pub temporary_roots: Vec<PathBuf>,
+    pub settings: Option<Draft>,
+    pub settings_open: bool,
+    pub discovery_warnings: Vec<String>,
     pub recursive: bool,
     pub projects: Vec<Project>,
     pub project_cursor: usize,
@@ -283,6 +303,12 @@ pub struct App {
     pub prs: Vec<PullRequest>,
     pub default_base: String,
     pub busy: bool,
+    pub latest_operation: Option<Record>,
+    pub operation_history: VecDeque<Record>,
+    pub inspected_operation_id: Option<u64>,
+    pub history_evicted: u64,
+    pub next_operation_id: u64,
+    pub operation_scroll: usize,
     pub notice: String,
     pub error: bool,
     pub quit: bool,
@@ -295,23 +321,37 @@ pub struct App {
     pub desired_tree: Option<PathBuf>,
     pub waiting_prs: bool,
     pub recover_form: Option<Form>,
+    pub deferred_commit: Option<Form>,
     pub viewport_height: usize,
+    pub viewport_width: usize,
 }
 impl App {
     pub fn new(
         config: Config,
         state: State,
         config_path: PathBuf,
-        state_path: PathBuf,
         roots: Vec<PathBuf>,
         recursive: bool,
     ) -> Self {
+        let temporary_roots = roots
+            .iter()
+            .filter(|root| {
+                !config
+                    .project_roots
+                    .iter()
+                    .any(|saved| same_path(root, saved))
+            })
+            .cloned()
+            .collect();
         Self {
             config,
             state,
             config_path,
-            state_path,
             roots: roots.clone(),
+            temporary_roots,
+            settings: None,
+            settings_open: false,
+            discovery_warnings: Vec::new(),
             recursive,
             projects: vec![],
             project_cursor: 0,
@@ -335,6 +375,12 @@ impl App {
             prs: vec![],
             default_base: "HEAD".into(),
             busy: false,
+            latest_operation: None,
+            operation_history: VecDeque::new(),
+            inspected_operation_id: None,
+            history_evicted: 0,
+            next_operation_id: 1,
+            operation_scroll: usize::MAX,
             notice: "Discovering projects…".into(),
             error: false,
             quit: false,
@@ -347,7 +393,9 @@ impl App {
             desired_tree: None,
             waiting_prs: false,
             recover_form: None,
+            deferred_commit: None,
             viewport_height: 24,
+            viewport_width: 120,
         }
     }
     pub fn say(&mut self, message: impl Into<String>, error: bool) {
@@ -417,16 +465,178 @@ impl App {
             .unwrap_or(project.path.clone());
         self.busy = true;
         self.epoch += 1;
+        let id = self.next_operation_id;
+        self.next_operation_id += 1;
+        let action = match &op {
+            Operation::Stage(_, true) => "Unstage".into(),
+            Operation::Stage(_, false) => "Stage".into(),
+            Operation::Commit(..) => "Commit".into(),
+            Operation::Fetch => "Fetch".into(),
+            Operation::Pull => "Pull".into(),
+            Operation::Push => "Push".into(),
+            Operation::Publish(remote, branch) => format!("Publish → {remote}/{branch}"),
+            Operation::Create { branch, .. } => format!("Create worktree {branch}"),
+            Operation::Branch(branch, _) => format!("Create branch {branch}"),
+            Operation::DeleteBranch(branch) => format!("Delete branch {branch}"),
+            Operation::Remove(_) => "Remove worktree".into(),
+            Operation::Review(number, _) => format!("Prepare PR review {number}"),
+            Operation::OpenPr(_) => "Open pull request".into(),
+        };
+        let target = match &op {
+            Operation::Remove(target) => target.clone(),
+            Operation::Create { destination, .. } | Operation::Review(_, destination) => {
+                destination.clone()
+            }
+            _ => path.clone(),
+        };
+        let selected = if matches!(self.modal, Some(Modal::OperationDetails)) {
+            self.inspected_operation_id
+        } else {
+            None
+        };
+        if let Some(previous) = self.latest_operation.take() {
+            self.operation_history.push_back(previous);
+        }
+        while self.operation_history.len() >= HISTORY_LIMIT {
+            let oldest = self
+                .operation_history
+                .iter()
+                .position(|record| Some(record.id) != selected)
+                .unwrap_or(0);
+            self.operation_history.remove(oldest);
+            self.history_evicted = self.history_evicted.saturating_add(1);
+        }
+        self.latest_operation = Some(Record::new(id, action, project.path.clone(), target));
+        if selected.is_none() {
+            self.operation_scroll = usize::MAX;
+        }
+        self.refresh_operation_picker();
         self.say("Running Git operation…", false);
         self.jobs.push(Job::Operation {
+            id,
             project: project.path,
             path,
             op,
         });
     }
+    pub fn accept_feedback(&mut self, event: Event) {
+        if let Some(record) = &mut self.latest_operation
+            && record.id == event.id
+            && record.running()
+        {
+            record.apply(event.update);
+        }
+        self.refresh_operation_picker();
+    }
+    pub fn operation_records(&self) -> Vec<&Record> {
+        self.latest_operation
+            .iter()
+            .chain(self.operation_history.iter().rev())
+            .collect()
+    }
+    pub fn inspected_operation(&self) -> Option<&Record> {
+        let id = self.inspected_operation_id?;
+        self.operation_records()
+            .into_iter()
+            .find(|record| record.id == id)
+    }
+    fn operation_entries(&self) -> Vec<(String, String)> {
+        self.operation_records()
+            .into_iter()
+            .map(|record| {
+                let outcome = match &record.result {
+                    Some(Ok(message)) => message
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(120)
+                        .collect::<String>(),
+                    Some(Err(message)) => message
+                        .lines()
+                        .rev()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("")
+                        .chars()
+                        .take(120)
+                        .collect::<String>(),
+                    None => record.phase.clone(),
+                };
+                (
+                    format!(
+                        "#{} {} · {}: {}\nProject: {} · {}\nTarget: {} · {}",
+                        record.id,
+                        record.action_label(),
+                        record.phase,
+                        outcome,
+                        record
+                            .project
+                            .file_name()
+                            .unwrap_or(record.project.as_os_str())
+                            .to_string_lossy(),
+                        record.project.display(),
+                        record
+                            .target
+                            .file_name()
+                            .unwrap_or(record.target.as_os_str())
+                            .to_string_lossy(),
+                        record.target.display()
+                    ),
+                    record.id.to_string(),
+                )
+            })
+            .collect()
+    }
+    fn refresh_operation_picker(&mut self) {
+        if !matches!(&self.modal, Some(Modal::Picker(picker)) if matches!(picker.kind, PickerKind::Operations))
+        {
+            return;
+        }
+        let entries = self.operation_entries();
+        if let Some(Modal::Picker(picker)) = &mut self.modal {
+            let selected = picker
+                .visible()
+                .get(picker.selected)
+                .map(|entry| entry.1.clone());
+            picker.entries = entries;
+            picker.selected = selected
+                .and_then(|selected| {
+                    picker
+                        .visible()
+                        .iter()
+                        .position(|entry| entry.1 == selected)
+                })
+                .unwrap_or(
+                    picker
+                        .selected
+                        .min(picker.visible().len().saturating_sub(1)),
+                );
+        }
+    }
+    fn show_operation_history(&mut self) {
+        self.picker(
+            "Recent Git operations",
+            PickerKind::Operations,
+            self.operation_entries(),
+        );
+    }
     pub fn accept(&mut self, done: Completion) {
         self.inflight.remove(&done.token);
-        if done.token == "operation" {
+        let operation = done.token.starts_with("operation:");
+        if operation {
+            let Some(record) = &mut self.latest_operation else {
+                return;
+            };
+            if record.token() != done.token || !record.running() {
+                return;
+            }
+            let result = match &done.result {
+                Ok(Payload::Done(_, _, message)) => Ok(message.clone()),
+                Err(error) => Err(format!("{error:#}")),
+                _ => return,
+            };
+            record.finish(result);
+            self.refresh_operation_picker();
             self.busy = false;
             self.epoch += 1;
         } else if done.epoch != self.epoch {
@@ -435,14 +645,33 @@ impl App {
         match done.result {
             Err(error) => {
                 self.say(format!("{error:#}"), true);
-                if done.token == "operation"
-                    && let Some(form) = self.recover_form.take()
-                {
-                    self.modal = Some(Modal::Form(form));
+                if operation && let Some(form) = self.recover_form.take() {
+                    if self.modal.is_none() {
+                        self.modal = Some(Modal::Form(form));
+                    } else if matches!(form.kind, FormKind::Commit) {
+                        // A result being inspected keeps focus. Offer the failed
+                        // commit draft the next time its form is opened.
+                        self.deferred_commit = Some(form);
+                    }
                 }
             }
             Ok(Payload::Projects(projects, warnings)) => {
+                self.discovery_warnings = warnings.clone();
+                if let Some(draft) = &mut self.settings {
+                    draft.update_warnings(&warnings);
+                }
                 self.projects = projects;
+                if self.project.as_ref().is_some_and(|current| {
+                    !self
+                        .projects
+                        .iter()
+                        .any(|project| same_path(&current.path, &project.path))
+                }) {
+                    self.project = None;
+                    self.trees.clear();
+                    self.snapshots.clear();
+                    self.diff.clear();
+                }
                 self.project_cursor = self
                     .state
                     .last_project
@@ -559,6 +788,7 @@ impl App {
         {
             self.epoch += 1;
             self.recover_form = None;
+            self.deferred_commit = None;
             self.project = Some(project.clone());
             self.state.last_project = Some(project.path.clone());
             self.trees.clear();
@@ -575,6 +805,8 @@ impl App {
         }
     }
     pub fn selection_changed(&mut self) {
+        self.recover_form = None;
+        self.deferred_commit = None;
         self.file = 0;
         self.marked.clear();
         self.pr_diff = false;
@@ -757,6 +989,64 @@ impl App {
             return;
         }
         let repeating = key.kind == KeyEventKind::Repeat;
+        if self.settings_open && self.modal.is_none() {
+            if !repeating
+                && matches!(key.code, KeyCode::Char('i' | 'H'))
+                && key.modifiers == KeyModifiers::NONE
+                && self.settings.as_ref().is_some_and(|draft| {
+                    draft.input.is_none() && matches!(draft.mode, settings::Mode::Edit)
+                })
+            {
+                self.action(if key.code == KeyCode::Char('H') {
+                    "operation_history"
+                } else {
+                    "operation_details"
+                });
+                return;
+            }
+            if repeating
+                && self
+                    .settings
+                    .as_ref()
+                    .is_some_and(|draft| draft.input.is_none())
+                && !matches!(
+                    key.code,
+                    KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
+                )
+            {
+                return;
+            }
+            let Some(draft) = self.settings.as_mut() else {
+                self.settings_open = false;
+                return;
+            };
+            match draft.key(key, &self.config_path, self.viewport_height) {
+                settings::Action::None => {}
+                settings::Action::Close => self.settings_open = false,
+                settings::Action::Save(resolution) => self.save_settings(resolution),
+                settings::Action::Help => self.modal = Some(Modal::Help),
+                settings::Action::Quit => {
+                    if !self.busy {
+                        self.request_quit();
+                    }
+                }
+                settings::Action::Discard(quit) => match Config::load(&self.config_path) {
+                    Ok(config) => {
+                        self.settings = Some(Draft::new(config));
+                        if quit {
+                            self.quit = true;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(draft) = &mut self.settings {
+                            draft.fail(error);
+                            draft.mode = settings::Mode::Edit;
+                        }
+                    }
+                },
+            }
+            return;
+        }
         if self.modal.is_some() {
             if !repeating
                 || matches!(
@@ -811,7 +1101,7 @@ impl App {
                 KeyCode::Char('w') if !repeating => self.prefix = Some(('w', Instant::now())),
                 KeyCode::Char('d') => self.move_by(self.half_page()),
                 KeyCode::Char('u') => self.move_by(-self.half_page()),
-                KeyCode::Char('c') if !self.busy => self.quit = true,
+                KeyCode::Char('c') if !self.busy => self.request_quit(),
                 _ => {}
             }
             return;
@@ -974,15 +1264,92 @@ impl App {
             self.epoch += 1;
             self.project = None;
             self.recover_form = None;
+            self.deferred_commit = None;
             self.filter.clear();
             self.modal = None;
         } else if self.busy {
             self.say("Wait for the running Git operation before quitting", true);
         } else {
+            self.request_quit();
+        }
+    }
+    fn request_quit(&mut self) {
+        if let Some(draft) = &mut self.settings
+            && draft.dirty()
+        {
+            draft.mode = settings::Mode::Discard { quit: true };
+            self.settings_open = true;
+        } else {
             self.quit = true;
         }
     }
+    fn open_settings(&mut self) {
+        if self.settings.is_none() {
+            match Config::load(&self.config_path) {
+                Ok(config) => self.settings = Some(Draft::new(config)),
+                Err(error) => {
+                    self.say(format!("{error:#}"), true);
+                    return;
+                }
+            }
+        }
+        if let Some(draft) = &mut self.settings {
+            let context = self
+                .project
+                .as_ref()
+                .map(|project| project.path.clone())
+                .or_else(|| {
+                    self.projects
+                        .get(self.project_cursor)
+                        .map(|project| project.path.clone())
+                });
+            draft.project_context = context.map(|path| {
+                draft
+                    .config
+                    .project(&path)
+                    .map(|project| project.path.clone())
+                    .unwrap_or(path)
+            });
+            draft.update_warnings(&self.discovery_warnings);
+        }
+        self.settings_open = true;
+    }
+    fn save_settings(&mut self, resolution: settings::Resolution) {
+        let Some(draft) = &mut self.settings else {
+            return;
+        };
+        match draft.save(&self.config_path, resolution) {
+            Ok(Some(config)) => {
+                let sources_changed = self.config.project_roots != config.project_roots;
+                let discovery_changed = self.config.recursive != config.recursive;
+                self.config = config;
+                if !sources_changed && !discovery_changed {
+                    return;
+                }
+                self.roots = self
+                    .config
+                    .project_roots
+                    .iter()
+                    .cloned()
+                    .chain(self.temporary_roots.clone())
+                    .collect();
+                if discovery_changed {
+                    self.recursive = self.config.recursive;
+                }
+                self.epoch += 1;
+                self.jobs.retain(|job| !matches!(job, Job::Discover(..)));
+                self.inflight.clear();
+                self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+            }
+            Ok(None) => {}
+            Err(error) => draft.fail(error),
+        }
+    }
     pub fn action(&mut self, action: &str) {
+        if action == "," || action == "settings" {
+            self.open_settings();
+            return;
+        }
         match action {
             "down" => {
                 self.move_by(1);
@@ -1019,18 +1386,24 @@ impl App {
             self.modal = Some(Modal::Help);
             return;
         }
+        if action == "i" || action == "operation_details" {
+            if let Some(record) = &self.latest_operation {
+                self.inspected_operation_id = Some(record.id);
+                self.operation_scroll = usize::MAX;
+                self.modal = Some(Modal::OperationDetails);
+            }
+            return;
+        }
+        if action == "H" || action == "operation_history" {
+            self.show_operation_history();
+            return;
+        }
         if action == "q" || action == "back" {
             self.back();
             return;
         }
         if action == "S" || action == "save_roots" {
-            match Config::save_roots(&self.config_path, &self.roots) {
-                Ok(()) => self.say(
-                    format!("Sources saved to {}", self.config_path.display()),
-                    false,
-                ),
-                Err(e) => self.say(format!("{e:#}"), true),
-            }
+            self.open_settings();
             return;
         }
         if action == "R" || action == "refresh" {
@@ -1122,6 +1495,10 @@ impl App {
                 }
             }
             "c" | "commit" => {
+                if let Some(form) = self.deferred_commit.take() {
+                    self.modal = Some(Modal::Form(form));
+                    return;
+                }
                 self.modal = Some(Modal::Form(Form {
                     title: "Commit staged changes · Ctrl+s commit".into(),
                     kind: FormKind::Commit,
@@ -1208,6 +1585,9 @@ impl App {
             return;
         };
         if key.code == KeyCode::Esc {
+            if matches!(modal, Modal::OperationDetails) {
+                self.inspected_operation_id = None;
+            }
             if let Modal::Picker(mut picker) = modal
                 && picker.editing
             {
@@ -1217,6 +1597,44 @@ impl App {
             return;
         }
         match modal {
+            Modal::OperationDetails => {
+                let count = self
+                    .inspected_operation()
+                    .map(|r| {
+                        r.details_lines(self.viewport_width.min(112).saturating_sub(2))
+                            .len()
+                    })
+                    .unwrap_or(0);
+                let last = count.saturating_sub(self.viewport_height.saturating_sub(9));
+                let current = self.operation_scroll.min(last);
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('i') => {
+                        self.inspected_operation_id = None;
+                        return;
+                    }
+                    KeyCode::Char('H') => {
+                        self.show_operation_history();
+                        return;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.operation_scroll = current.saturating_add(1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.operation_scroll = current.saturating_sub(1)
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.operation_scroll =
+                            current.saturating_add(self.half_page() as usize).min(last)
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.operation_scroll = current.saturating_sub(self.half_page() as usize)
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => self.operation_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => self.operation_scroll = usize::MAX,
+                    _ => {}
+                }
+                self.modal = Some(Modal::OperationDetails);
+            }
             Modal::Help => {
                 if !matches!(
                     key.code,
@@ -1375,6 +1793,12 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.settings_open {
+            if let Some(draft) = &mut self.settings {
+                draft.paste(text);
+            }
+            return;
+        }
         if let Some(Modal::Form(form)) = &mut self.modal {
             let field = &mut form.fields[form.active];
             if field.readonly {
@@ -1410,6 +1834,13 @@ impl App {
     }
     fn choose(&mut self, kind: PickerKind, value: String) {
         match kind {
+            PickerKind::Operations => {
+                if let Ok(id) = value.parse() {
+                    self.inspected_operation_id = Some(id);
+                    self.operation_scroll = usize::MAX;
+                    self.modal = Some(Modal::OperationDetails);
+                }
+            }
             PickerKind::Profiles => self.launch_profile(&value),
             PickerKind::Prs => self.review_form(value),
             PickerKind::Base(mut form) => {
@@ -1497,9 +1928,9 @@ impl App {
         self.recover_form = Some(recovery);
         self.operation(operation);
     }
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
         self.state
-            .save(&self.state_path)
+            .save(&self.config_path)
             .context("Save remembered selections")
     }
 }
@@ -1527,7 +1958,7 @@ pub fn key_name(key: KeyEvent) -> String {
         }
     )
 }
-fn edit(field: &mut Field, key: KeyEvent) {
+pub(crate) fn edit(field: &mut Field, key: KeyEvent) {
     if field.readonly {
         return;
     }

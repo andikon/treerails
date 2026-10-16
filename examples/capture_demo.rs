@@ -327,7 +327,6 @@ async fn main() -> Result<()> {
         Config::default(),
         State::default(),
         PathBuf::from(r"C:\Code\treerail.toml"),
-        root.join("state.json"),
         vec![root.into()],
         false,
     );
