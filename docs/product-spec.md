@@ -1,6 +1,6 @@
 # Tree Rail
 
-Status: approved version-one scope. The initial Rust/Ratatui implementation is in `src/`, with usage and validation notes in [the README](../README.md). Cross-platform CI is configured; local validation is on Windows.
+Status: approved scope, updated by [spec #1](https://github.com/andikon/treerails/issues/1) for live Git feedback and unified configuration. The Rust/Ratatui implementation is in `src/`, with usage and validation notes in [the README](../README.md). Cross-platform CI is configured; local validation is on Windows.
 
 Tree Rail is a terminal project explorer and Git worktree manager for development with coding agents. Its command is `treerail`. It runs on Windows, macOS, and Linux, with Windows as the primary development and validation environment.
 
@@ -42,7 +42,8 @@ Tree Rail is a terminal project explorer and Git worktree manager for developmen
 
 - Accept one or several directory arguments. A directory can be a repository itself or the direct parent of repositories.
 - Support a file containing a list of paths and a configuration file containing saved sources.
-- Combine saved sources with temporary sources supplied for the current launch; remove duplicate project entries.
+- Remember explicit CLI sources, including paths-file entries, during interactive launches. Combine them with saved sources and remove duplicate project entries. Provide an explicit temporary-source option; an inferred current-directory fallback remains temporary. Noninteractive listing is read-only.
+- Retain temporarily unavailable saved sources and show a warning rather than removing them.
 - Scan immediate children of parent directories by default. Recursive discovery must be explicitly requested.
 - Exclude directories whose names contain `.worktrees` from project discovery and do not descend into them.
 - Discover a project's worktrees using Git's registered worktree list, including worktrees created by other tools or stored outside Tree Rail's default directory.
@@ -102,7 +103,10 @@ C:\Code\my-project.worktrees\review-pr-123
 - With no upstream, offer **Publish branch**. Default to `origin` and the same name as the local branch, allow changing the destination, and establish the upstream on successful publication.
 - For example, publishing `feature/test-123` suggests `origin/feature/test-123`.
 - If `origin` does not exist, require choosing an available destination rather than inventing one.
-- Present operation progress and useful Git errors without blocking navigation unnecessarily.
+- Keep compact live feedback identifying the original action and project/worktree, known phase, elapsed time, and Git-reported progress. Use an indeterminate indicator when progress is unavailable; never invent an overall percentage or a reason for a silent wait.
+- Stream both output streams into expandable details, handling carriage-return progress updates and fragmented output. Preserve clear success/failure results and a bounded history for the current session only.
+- Keep navigation responsive and feedback attributed to its original operation through selection changes, refreshes, and unrelated notices. Include composite worktree/review preparation steps under one outcome.
+- Preserve the existing single-mutation limit. Cancellation, rollback, additional authentication interfaces, and persistent output logs are outside this scope.
 - Leave interactive rebase, conflict resolution, history editing, and force-push outside version one.
 
 ### Worktree cleanup
@@ -127,13 +131,16 @@ C:\Code\my-project.worktrees\review-pr-123
 
 ### Configuration
 
-- Begin with a readable **`config.toml`** rather than a settings screen. TOML is a product choice for comments, tables, argument arrays, and literal Windows path strings; Ratatui does not require a particular configuration format.
+- Use one readable **`config.toml`**, with a TUI settings page for common options. TOML is a product choice for comments, tables, argument arrays, and literal Windows path strings; Ratatui does not require a particular configuration format.
 - Store saved sources, discovery options, configured per-project starting points and worktree directories, terminal choices, launch profiles, theme options, and keybindings in that file.
-- Store remembered selections and last-used starting points separately in application-owned **`state.json`**, serialized with Serde. JSON also remains appropriate for structured GitHub CLI output.
-- Resolve configuration and state directories using operating-system conventions. Where a distinct state directory is unavailable, use the application's local data directory. Offer an explicit `--config` path override.
+- Store remembered selections and last-used starting points in this same document, distinct from user settings. Automatic memory saves patch only remembered state, preserve intervening settings/comments, and use the most recently saved selection.
+- Use `%LOCALAPPDATA%\treerails\config.toml` on Windows and `~/.config/treerails/config.toml` on Unix, including macOS. Create the directory/document for interactive use. An explicit `--config` selects the whole document, including remembered state.
+- If the new default document is missing, import legacy configuration and remembered state once, before writing defaults. Leave originals untouched. An existing new document is authoritative; import/read/save failures must surface useful errors and preserve data.
 - Give explicit CLI options precedence over configured values, and per-project settings precedence over global defaults. Project-source arguments still extend saved sources as described above.
-- Allow temporary CLI arguments without automatically rewriting saved settings.
-- Preserve configuration comments when saving explicitly edited settings; use comment-preserving TOML editing and replace saved files atomically. Report malformed configuration with its location and useful context.
+- Remember explicit sources by default, with an option for temporary sources. Listing and inferred current-directory discovery do not save sources.
+- Edit sources/discovery, global/per-project worktree defaults, and launch profiles as a settings draft. Validate and Save & Apply with `Ctrl+s`; rescan source/discovery changes while retaining valid selections. Preserve drafts through navigation and ask before discarding them.
+- Preserve existing profile capabilities and global/per-project precedence. Keep advanced keybindings and themes editable in the document.
+- Preserve configuration comments and unrelated changes made by other instances or an editor; surface conflicting manual settings edits while retaining the draft. Use atomic replacement and report malformed configuration with useful context.
 
 ## Operational defaults
 
@@ -150,7 +157,7 @@ treerail --config "C:\Configs\treerail.toml" "C:\Code"
 treerail
 ```
 
-The paths file contains one directory per line. A launch without arguments restores saved sources; when there are none, it uses the current directory as a repository or parent directory. Explicit sources are temporary unless saved intentionally.
+The paths file contains one directory per line. A launch without arguments restores saved sources; when there are none, it uses the current directory as a temporary repository or parent source. Interactive explicit sources are saved unless the temporary-source option is used. `--list` never creates or rewrites configuration.
 
 ### Vim controls
 
