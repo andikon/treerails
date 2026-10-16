@@ -57,13 +57,21 @@ async fn explorer(temp: &TempDir, path: &Path) -> App {
     app.projects.push(git::project(path).await.unwrap());
     app.open_project();
     app.trees = git::worktrees(path).await.unwrap();
+    // Git reports registered paths canonically (including /private on macOS
+    // and long-path aliases on Windows); status belongs to that selected path.
+    let selected = app.selected_tree().unwrap().path.clone();
     app.snapshots
-        .insert(path.into(), git::status(path).await.unwrap());
+        .insert(selected.clone(), git::status(&selected).await.unwrap());
     app
 }
 async fn finish(app: &mut App) {
     let job = app.jobs.pop().expect("Operation scheduled");
     let token = job.token();
+    assert!(
+        token.starts_with("operation:"),
+        "Expected a requested operation, got {token}: {}",
+        rendered(app)
+    );
     let (tx, mut rx) = mpsc::channel(128);
     let task = tokio::spawn(job.execute_with_feedback(tx));
     while let Some(event) = rx.recv().await {
@@ -170,6 +178,8 @@ async fn publish_up_to_date_and_composite_worktree_failures_have_attributed_resu
     );
     app.operation(Operation::Push);
     finish(&mut app).await;
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     let text = rendered(&app);
     assert!(text.contains("Succeeded: Everything up-to-date"), "{text}");
     let tree = temp.path().join("project.worktrees/feature");
@@ -244,13 +254,15 @@ async fn rejected_push_and_protected_cleanup_keep_useful_failure_details() {
     finish(&mut app).await;
     app.action("operation_details");
     let text = rendered(&app);
-    assert!(text.contains("Push → origin/main"));
-    assert!(text.contains("Failed"));
-    assert!(text.contains("Server policy rejected this push"));
+    assert!(text.contains("Push → origin/main"), "{text}");
+    assert!(text.contains("Failed"), "{text}");
+    assert!(text.contains("Server policy rejected this push"), "{text}");
     assert!(!app.busy);
     assert_eq!(git::status(&path).await.unwrap().ahead, 1);
     app.operation(Operation::Remove(path.clone()));
     finish(&mut app).await;
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     let text = rendered(&app);
     assert!(
         text.contains("original checkout cannot be removed"),

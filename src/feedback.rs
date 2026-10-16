@@ -8,6 +8,14 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
+pub const HISTORY_LIMIT: usize = 20;
+
+fn readable_output(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub enum Update {
@@ -92,11 +100,31 @@ impl Record {
         self.result.is_none()
     }
     pub fn display_lines(&self, width: usize) -> Vec<String> {
+        Self::wrap_lines(&self.output, width)
+    }
+    pub fn details_lines(&self, width: usize) -> Vec<String> {
+        let outcome = match &self.result {
+            Some(Ok(message)) => format!("Succeeded: {message}"),
+            Some(Err(message)) => format!("Failed: {message}"),
+            None => "Running".into(),
+        };
+        Self::wrap_lines(
+            &format!(
+                "Project: {}\nTarget: {}\n{}\n\n{}",
+                self.project.display(),
+                self.target.display(),
+                outcome,
+                self.output
+            ),
+            width,
+        )
+    }
+    fn wrap_lines(text: &str, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
         if width == 0 {
             return lines;
         }
-        for line in self.output.lines() {
+        for line in text.lines() {
             let mut row = String::new();
             let mut columns = 0;
             for character in line.chars() {
@@ -125,11 +153,7 @@ impl Record {
             Update::Output { stderr, text } => {
                 // Carriage returns are Git's normal progress line delimiters.
                 // Retain those updates as readable lines, including partial output.
-                let text: String = text
-                    .chars()
-                    .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-                    .map(|c| if c == '\r' { '\n' } else { c })
-                    .collect();
+                let text = readable_output(&text);
                 self.append(&text);
                 let pending = if stderr {
                     &mut self.pending_stderr
@@ -194,6 +218,7 @@ impl Record {
         let message = match &mut result {
             Ok(message) | Err(message) => message,
         };
+        *message = readable_output(message);
         if message.len() > 8192 {
             let mut start = message.len() - 8192;
             while !message.is_char_boundary(start) {
@@ -216,7 +241,7 @@ impl Record {
         ));
         self.result = Some(result);
     }
-    pub fn summary(&self) -> String {
+    pub fn headline(&self) -> String {
         let indicator = if self.running() {
             ["◐", "◓", "◑", "◒"][(self.started.elapsed().as_millis() / 150 % 4) as usize]
         } else if self.result.as_ref().is_some_and(Result::is_ok) {
@@ -224,17 +249,22 @@ impl Record {
         } else {
             "!"
         };
+        format!(
+            "{indicator} {} · {} · {}s · i details",
+            self.action_label(),
+            self.phase,
+            self.duration().as_secs()
+        )
+    }
+    pub fn action_label(&self) -> String {
         let destination = self
             .destination
             .as_ref()
             .map(|d| format!(" → {d}"))
             .unwrap_or_default();
-        format!(
-            "{indicator} {}{destination} · {} · {} · {}s · i details",
-            self.action,
-            self.target.display(),
-            self.phase,
-            self.duration().as_secs()
-        )
+        format!("{}{destination}", self.action)
+    }
+    pub fn summary(&self) -> String {
+        format!("{}\n{}", self.headline(), self.target.display())
     }
 }
