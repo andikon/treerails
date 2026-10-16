@@ -16,8 +16,7 @@ use std::{
 use tokio::sync::{Semaphore, mpsc};
 use treerail::{
     app::{App, Completion},
-    config::{self, Config, State},
-    discover, ui,
+    config, discover, ui,
 };
 
 #[derive(Parser, Debug)]
@@ -31,12 +30,9 @@ struct Args {
     /// Discover repositories recursively (excluding .worktrees folders)
     #[arg(long)]
     recursive: bool,
-    /// Configuration file; defaults to the OS application configuration directory
+    /// Combined settings and remembered selections file
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Override remembered-state file
-    #[arg(long)]
-    state: Option<PathBuf>,
     /// Print discovered projects as JSON without opening the TUI
     #[arg(long)]
     list: bool,
@@ -44,10 +40,17 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (default_config, default_state) = config::paths()?;
-    let config_path = args.config.unwrap_or(default_config);
-    let state_path = args.state.unwrap_or(default_state);
-    let config = Config::load(&config_path)?;
+    let legacy = if args.config.is_none() {
+        Some(config::legacy_paths()?)
+    } else {
+        None
+    };
+    let config_path = match args.config {
+        Some(path) => path,
+        None => config::default_path()?,
+    };
+    // Listing may read an upgrade candidate, but never creates a file or lock.
+    let (config, _) = config::open(&config_path, false, legacy.clone())?;
     let recursive = args.recursive || config.recursive;
     let mut roots = config.project_roots.clone();
     roots.extend(args.paths);
@@ -88,8 +91,9 @@ async fn main() -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "Tree Rail requires an interactive terminal. Use --list for noninteractive discovery."
     );
-    let state = State::load(&state_path)?;
-    let mut app = App::new(config, state, config_path, state_path, roots, recursive);
+    // Import before the first startup save, and only after requiring a real TUI.
+    let (config, state) = config::open(&config_path, true, legacy)?;
+    let mut app = App::new(config, state, config_path, roots, recursive);
     let mut terminal = ratatui::init();
     let guard = TerminalGuard;
     execute!(io::stdout(), EnableBracketedPaste)?;

@@ -159,7 +159,7 @@ Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. 
 
 ## Make it yours
 
-Tree Rail uses readable **TOML configuration** for roots, per-project defaults, launch profiles, keybindings, and colors. Remembered selections and starting points live in a separate `state.json`.
+Tree Rail keeps roots, per-project defaults, launch profiles, keybindings, colors, and remembered selections together in **`config.toml`**. Interactive startup creates it automatically at `%LOCALAPPDATA%\treerails\config.toml` on Windows or `~/.config/treerails/config.toml` on Linux and macOS. `--config` selects another combined file.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']
@@ -184,7 +184,7 @@ Copy-Item '.\examples\config.toml' '.\treerail.toml'
 treerail --config '.\treerail.toml'
 ```
 
-Press `?` to see the active configuration path. Custom profiles can run another agent, editor, shell, or terminal layout. **[Profiles, terminal adapters, themes, and key overrides →](docs/usage.md#configuration)**
+Press `?` to see the active configuration path. On first use of the new default location, Tree Rail imports legacy settings and `state.json` without changing the originals. Custom profiles can run another agent, editor, shell, or terminal layout. **[Configuration, upgrades, profiles, and key overrides →](docs/usage.md#configuration)**
 
 ## Development
 

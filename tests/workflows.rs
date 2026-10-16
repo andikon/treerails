@@ -250,7 +250,7 @@ async fn fast_forward_pull_refuses_divergence() {
     );
 }
 #[test]
-fn configuration_preserves_comments_and_uses_separate_state() {
+fn configuration_preserves_comments_and_remembers_selections_in_one_document() {
     let temp = TempDir::new().unwrap();
     let config = temp.path().join("config.toml");
     fs::write(&config,"# My settings\nproject_roots = [] # sources\n\n[profiles.editor]\nprogram = 'nvim'\nargs = ['.']\n").unwrap();
@@ -259,23 +259,29 @@ fn configuration_preserves_comments_and_uses_separate_state() {
     let raw = fs::read_to_string(&config).unwrap();
     assert!(raw.contains("# My settings"));
     assert!(raw.contains("# sources"));
-    let config = Config::load(&config).unwrap();
-    assert_eq!(config.project_roots[0], project_root);
-    assert!(config.profiles.contains_key("copilot"));
-    let state_path = temp.path().join("state.json");
+    let loaded = Config::load(&config).unwrap();
+    assert_eq!(loaded.project_roots[0], project_root);
+    assert!(loaded.profiles.contains_key("copilot"));
     let mut state = State::default();
     state
         .bases
         .insert("project".into(), "origin/develop".into());
-    state.save(&state_path).unwrap();
+    state.save(&config).unwrap();
     assert_eq!(
-        State::load(&state_path).unwrap().bases["project"],
+        State::load(&config).unwrap().bases["project"],
         "origin/develop"
     );
     assert!(
-        config
+        loaded
             .worktree_path(Path::new("/code/app"), "feature/login")
             .ends_with("app.worktrees/feature-login")
+    );
+    let raw = fs::read_to_string(&config).unwrap();
+    assert!(raw.contains("# My settings"));
+    assert!(raw.contains("# sources"));
+    assert_eq!(
+        Config::load(&config).unwrap().project_roots[0],
+        project_root
     );
 }
 #[test]

@@ -15,7 +15,6 @@ fn app() -> App {
         Config::default(),
         State::default(),
         "config.toml".into(),
-        "state.json".into(),
         vec![],
         false,
     );

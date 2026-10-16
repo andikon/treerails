@@ -1,5 +1,7 @@
 # Tree Rail: paths may be repositories or their direct parent folders.
 # Single-quoted TOML strings preserve Windows backslashes.
+# Settings and remembered selections share this document. Tree Rail manages
+# [state] and [state.bases] automatically when saving the current session.
 project_roots = []
 recursive = false
 default_profile = 'copilot'
