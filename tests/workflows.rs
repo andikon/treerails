@@ -253,15 +253,13 @@ fn configuration_preserves_comments_and_uses_separate_state() {
     let temp = TempDir::new().unwrap();
     let config = temp.path().join("config.toml");
     fs::write(&config,"# My settings\nproject_roots = [] # sources\n\n[profiles.editor]\nprogram = 'nvim'\nargs = ['.']\n").unwrap();
-    Config::save_roots(&config, &[PathBuf::from(r"C:\Code\my project")]).unwrap();
+    let project_root = temp.path().join("Code").join("my project");
+    Config::save_roots(&config, std::slice::from_ref(&project_root)).unwrap();
     let raw = fs::read_to_string(&config).unwrap();
     assert!(raw.contains("# My settings"));
     assert!(raw.contains("# sources"));
     let config = Config::load(&config).unwrap();
-    assert_eq!(
-        config.project_roots[0],
-        PathBuf::from(r"C:\Code\my project")
-    );
+    assert_eq!(config.project_roots[0], project_root);
     assert!(config.profiles.contains_key("copilot"));
     let state_path = temp.path().join("state.json");
     let mut state = State::default();

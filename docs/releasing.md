@@ -32,7 +32,7 @@ No extra secret is needed: only the publishing job receives `contents: write` on
 
 Asset names remain constant across releases, so README download links always point to the latest stable version. Each tagged release keeps its own downloads. GitHub's automatic source ZIP/TAR files contain source code; choose one of the explicitly named builds above to run Tree Rail without Rust.
 
-Builds run formatting, Clippy, Rust tests, and release-packaging tests on native Windows, Linux, Apple Silicon, and Intel Mac runners. The downloaded Linux binary uses musl to avoid depending on a particular glibc version. Each archive is extracted on its runner and its executable is checked with `--version` and `--help` before upload. These checks do not exercise interactive terminal launchers or authenticated external tools.
+Builds run formatting, Clippy, Rust tests, and release-packaging tests on native Windows, Linux, Apple Silicon, and Intel Mac runners. Windows releases statically link the C runtime so the EXE needs no separate Visual C++ runtime installation. The Linux binary uses static musl to avoid depending on a particular glibc version. These use Rust's [static C runtime support](https://doc.rust-lang.org/stable/reference/linkage.html#static-and-dynamic-c-runtimes). Each archive is extracted on its runner and its executable is checked with `--version` and `--help` before upload. These checks do not exercise interactive terminal launchers or authenticated external tools.
 
 ## Retry and diagnose
 
