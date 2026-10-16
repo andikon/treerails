@@ -23,7 +23,7 @@ fn border<'a>(title: impl Into<Line<'a>>, active: bool, app: &App) -> Block<'a> 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if app.latest_operation.is_some() { 4 } else { 2 }),
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -51,6 +51,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])),
         rows[0],
     );
+    if let Some(record) = &app.latest_operation {
+        let status = if record.progress.is_empty() {
+            record.summary()
+        } else {
+            format!("{}\n{}", record.summary(), record.progress)
+        };
+        frame.render_widget(
+            Paragraph::new(status)
+                .style(
+                    Style::default().fg(if record.result.as_ref().is_some_and(Result::is_err) {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    }),
+                )
+                .wrap(Wrap { trim: false }),
+            Rect::new(
+                rows[0].x,
+                rows[0].y.saturating_add(1),
+                rows[0].width,
+                rows[0].height.saturating_sub(1),
+            ),
+        );
+    }
     if app.project.is_none() {
         projects(frame, app, rows[1]);
     } else {
@@ -74,9 +98,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         rows[2],
     );
     let hints = if app.project.is_none() {
-        " j/k navigate   / search   Enter explore   S save sources   R reload   ? help   q quit "
+        " j/k navigate   / search   Enter explore   S save sources   R reload   i output   ? help   q quit "
     } else {
-        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  t staged  ? help "
+        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  i output  t staged  ? help "
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
@@ -301,11 +325,54 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     match modal {
+        Modal::OperationDetails => {
+            let Some(record) = &app.latest_operation else {
+                return;
+            };
+            let rect = centered(area, 112, area.height.saturating_sub(2).max(3));
+            frame.render_widget(Clear, rect);
+            let block = border(
+                " Operation details · j/k scroll · g/G first/last · Esc close ",
+                true,
+                app,
+            );
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let rows = Layout::vertical([Constraint::Length(5), Constraint::Min(1)]).split(inner);
+            let outcome = match &record.result {
+                Some(Ok(message)) => format!("Succeeded: {message}"),
+                Some(Err(message)) => format!("Failed: {message}"),
+                None => "Running · i/Esc closes details; the operation continues".into(),
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{}\nProject: {}\n{}\n{}",
+                    record.summary(),
+                    record.project.display(),
+                    outcome,
+                    if record.truncated {
+                        "Earlier output discarded (64 KiB limit)."
+                    } else {
+                        "Output from Git and hooks:"
+                    }
+                ))
+                .wrap(Wrap { trim: false }),
+                rows[0],
+            );
+            let visible = rows[1].height as usize;
+            let lines = record.display_lines(rows[1].width as usize);
+            let count = lines.len();
+            let start = app.operation_scroll.min(count.saturating_sub(visible));
+            frame.render_widget(
+                Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>().join("\n")),
+                rows[1],
+            );
+        }
         Modal::Help => {
-            let rect = centered(area, 94, 27);
+            let rect = centered(area, 94, 28);
             frame.render_widget(Clear, rect);
             let help = format!(
-                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · S save roots\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
+                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n  i live operation details · j/k scroll · G follow output\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · S save roots\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
                 app.config_path.display()
             );
             frame.render_widget(

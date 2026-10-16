@@ -1,3 +1,4 @@
+use crate::feedback::{self, Update};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -5,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Project {
@@ -94,27 +98,146 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let args: Vec<OsString> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
     let mut cmd = command("git", cwd);
     cmd.arg("--literal-pathspecs")
-        .args(args)
+        .args(&args)
         .env("GIT_OPTIONAL_LOCKS", "0");
-    let output = cmd
-        .output()
-        .await
-        .context("Cannot start Git; install Git and add it to PATH")?;
+    let output = if feedback::active() {
+        let words: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
+        let first = words.first().map(|s| s.as_ref()).unwrap_or("Git");
+        let phase = match first {
+            "fetch" if words.iter().any(|s| s.contains("refs/pull/")) => "Fetching PR head",
+            "fetch" if words.iter().any(|s| s.contains("/base")) => "Fetching PR base",
+            "fetch" => "Fetching remotes",
+            "pull" => "Pulling (fast-forward only)",
+            "push" => "Pushing to remote",
+            "worktree" if words.get(1).is_some_and(|s| s == "add") => "Creating worktree",
+            "worktree" if words.get(1).is_some_and(|s| s == "remove") => "Removing worktree",
+            "branch" if words.iter().any(|s| s == "-d") => "Deleting branch",
+            "branch" => "Creating branch",
+            "add" => "Staging files",
+            "restore" | "rm" => "Unstaging files",
+            "check-ref-format" => "Checking branch name",
+            "status" => "Checking worktree status",
+            _ => "Checking repository",
+        };
+        feedback::report(Update::Phase(phase.into())).await;
+        let visible = matches!(
+            first,
+            "fetch" | "pull" | "push" | "branch" | "add" | "restore" | "rm"
+        ) || first == "worktree"
+            && words.get(1).is_some_and(|s| s == "add" || s == "remove");
+        capture(&mut cmd, None, visible).await?
+    } else {
+        cmd.output()
+            .await
+            .context("Cannot start Git; install Git and add it to PATH")?
+    };
     if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "{}",
-            if message.trim().is_empty() {
-                stdout.trim()
-            } else {
-                message.trim()
-            }
-        );
+        bail!("{}", failure_message(&output));
     }
     Ok(output.stdout)
+}
+fn failure_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stderr.trim().is_empty() {
+        stderr.trim().into()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim().into()
+    } else {
+        format!("Command failed ({}) without output", output.status)
+    }
+}
+
+// Drain both pipes together: hooks, remote helpers and signing programs can write
+// to either stream. A slow consumer applies backpressure instead of growing a queue.
+async fn capture(
+    cmd: &mut Command,
+    input: Option<Vec<u8>>,
+    visible: bool,
+) -> Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd
+        .spawn()
+        .context("Cannot start command; check Git/GitHub CLI availability")?;
+    let stdout = child.stdout.take().context("Command stdout unavailable")?;
+    let stderr = child.stderr.take().context("Command stderr unavailable")?;
+    let stdin = child.stdin.take();
+    let write = async move {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            stdin.write_all(&input).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let (stdout, stderr, written) = tokio::join!(
+        read_pipe(stdout, false, visible, visible),
+        read_pipe(stderr, true, true, true),
+        write
+    );
+    let status = child.wait().await?;
+    // An early Git failure can close stdin before a long commit message is
+    // delivered. Preserve Git's actual failure output instead of masking it
+    // with a secondary broken-pipe error.
+    if status.success() {
+        written?;
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+async fn read_pipe(
+    mut pipe: impl AsyncRead + Unpin,
+    stderr: bool,
+    visible: bool,
+    bounded: bool,
+) -> Result<Vec<u8>> {
+    const CAPTURE_LIMIT: usize = 1024 * 1024;
+    let mut retained = Vec::new();
+    let mut pending = Vec::new();
+    let mut bytes = [0; 2048];
+    loop {
+        let count = pipe.read(&mut bytes).await?;
+        if count == 0 {
+            break;
+        }
+        retained.extend_from_slice(&bytes[..count]);
+        if bounded && retained.len() > CAPTURE_LIMIT {
+            retained.drain(..retained.len() - CAPTURE_LIMIT);
+        }
+        if visible {
+            pending.extend_from_slice(&bytes[..count]);
+            // Keep an incomplete UTF-8 character until the next read. Invalid
+            // bytes are rendered with replacement characters, never escape codes.
+            let length = match std::str::from_utf8(&pending) {
+                Ok(_) => pending.len(),
+                Err(error) if error.error_len().is_none() => error.valid_up_to(),
+                Err(_) => pending.len(),
+            };
+            if length > 0 {
+                feedback::report(Update::Output {
+                    stderr,
+                    text: String::from_utf8_lossy(&pending[..length]).into_owned(),
+                })
+                .await;
+                pending.drain(..length);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        feedback::report(Update::Output {
+            stderr,
+            text: String::from_utf8_lossy(&pending).into_owned(),
+        })
+        .await;
+    }
+    Ok(retained)
 }
 pub async fn text(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&run(cwd, args).await?)
@@ -378,7 +501,7 @@ pub async fn create_worktree(
         destination.display()
     );
     if fetch {
-        run(project, ["fetch", "--all", "--prune"]).await?;
+        run(project, ["fetch", "--progress", "--all", "--prune"]).await?;
     }
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
@@ -395,7 +518,10 @@ pub async fn create_worktree(
 }
 pub async fn stage(path: &Path, files: &[ChangedFile], unstage: bool) -> Result<()> {
     let mut args: Vec<OsString> = if unstage {
-        if run(path, ["rev-parse", "--verify", "HEAD"]).await.is_ok() {
+        if run(path, ["rev-parse", "--verify", "--quiet", "HEAD"])
+            .await
+            .is_ok()
+        {
             vec!["restore".into(), "--staged".into()]
         } else {
             vec!["rm".into(), "--cached".into(), "--ignore-unmatch".into()]
@@ -417,22 +543,16 @@ pub async fn stage(path: &Path, files: &[ChangedFile], unstage: bool) -> Result<
 }
 pub async fn commit(path: &Path, subject: &str, body: &str) -> Result<String> {
     anyhow::ensure!(!subject.trim().is_empty(), "A commit subject is required");
-    let mut child = command("git", path)
-        .args(["commit", "--file=-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    feedback::report(Update::Phase(
+        "Committing (hooks and signing enabled)".into(),
+    ))
+    .await;
+    let mut cmd = command("git", path);
+    cmd.args(["commit", "--file=-"]);
     let message = format!("{}\n\n{}\n", subject.trim(), body);
-    child
-        .stdin
-        .take()
-        .context("Commit stdin unavailable")?
-        .write_all(message.as_bytes())
-        .await?;
-    let output = child.wait_with_output().await?;
+    let output = capture(&mut cmd, Some(message.into_bytes()), true).await?;
     if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!("{}", failure_message(&output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().into())
 }
@@ -480,6 +600,7 @@ pub async fn publish(path: &Path, remote: &str, branch: &str) -> Result<()> {
         path,
         [
             "push",
+            "--progress",
             "--set-upstream",
             "--",
             remote,
@@ -506,15 +627,35 @@ pub async fn push(path: &Path) -> Result<()> {
     .await
     .context("No upstream branch; publish this branch first")?;
     anyhow::ensure!(merge.starts_with("refs/heads/"), "Upstream is not a branch");
-    run(path, ["push", "--", &remote, &format!("HEAD:{merge}")]).await?;
+    feedback::report(Update::Destination(format!(
+        "{remote}/{}",
+        merge.trim_start_matches("refs/heads/")
+    )))
+    .await;
+    run(
+        path,
+        [
+            "push",
+            "--progress",
+            "--",
+            &remote,
+            &format!("HEAD:{merge}"),
+        ],
+    )
+    .await?;
     Ok(())
 }
 async fn gh(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = command("gh", path)
-        .args(args)
-        .output()
-        .await
-        .context("GitHub CLI unavailable; install gh and authenticate with gh auth login")?;
+    let mut cmd = command("gh", path);
+    cmd.args(args);
+    let output = if feedback::active() {
+        feedback::report(Update::Phase("Reading pull request information".into())).await;
+        capture(&mut cmd, None, false).await?
+    } else {
+        cmd.output()
+            .await
+            .context("GitHub CLI unavailable; install gh and authenticate with gh auth login")?
+    };
     anyhow::ensure!(
         output.status.success(),
         "{}",
@@ -585,13 +726,26 @@ pub async fn review(project: &Path, number: &str, destination: &Path) -> Result<
     // Fetch GitHub's pull ref through the configured base-repository remote, including fork PRs.
     let reference = format!("refs/treerail/pr/{}/head", pr.number);
     let fetch_head = format!("+refs/pull/{}/head:{reference}", pr.number);
-    run(project, ["fetch", "--", &transport, &fetch_head]).await?;
+    run(
+        project,
+        ["fetch", "--progress", "--", &transport, &fetch_head],
+    )
+    .await?;
     let base_ref = format!("refs/treerail/pr/{}/base", pr.number);
     let fetch_base = format!("+refs/heads/{}:{base_ref}", pr.base_ref_name);
-    run(project, ["fetch", "--", &transport, &fetch_base]).await?;
+    run(
+        project,
+        ["fetch", "--progress", "--", &transport, &fetch_base],
+    )
+    .await?;
     if run(
         project,
-        ["show-ref", "--verify", &format!("refs/heads/{branch}")],
+        [
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )
     .await
     .is_ok()

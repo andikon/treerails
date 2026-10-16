@@ -1,6 +1,7 @@
 use crate::{
     config::{Config, State, same_path},
     discover,
+    feedback::{self, Event, Record, Reporter},
     git::{self, Branch, ChangedFile, Project, PullRequest, Snapshot, Worktree},
     launch,
 };
@@ -43,6 +44,7 @@ pub enum Job {
     Prs(PathBuf),
     ReviewDiff(PathBuf, String),
     Operation {
+        id: u64,
         project: PathBuf,
         path: PathBuf,
         op: Operation,
@@ -73,7 +75,17 @@ impl Job {
             Self::Branches(p) => format!("branches:{}", p.display()),
             Self::Prs(p) => format!("prs:{}", p.display()),
             Self::Discover(..) => "discover".into(),
-            Self::Operation { .. } => "operation".into(),
+            Self::Operation { id, .. } => format!("operation:{id}"),
+        }
+    }
+    pub async fn execute_with_feedback(
+        self,
+        sender: tokio::sync::mpsc::Sender<Event>,
+    ) -> Result<Payload> {
+        if let Self::Operation { id, .. } = &self {
+            feedback::scope(Reporter { id: *id, sender }, self.execute()).await
+        } else {
+            self.execute().await
         }
     }
     pub async fn execute(self) -> Result<Payload> {
@@ -107,7 +119,9 @@ impl Job {
                 let key = format!("review:{}", path.display());
                 Ok(Payload::Diff(key, git::review_diff(&path, &branch).await?))
             }
-            Self::Operation { project, path, op } => {
+            Self::Operation {
+                project, path, op, ..
+            } => {
                 let (mut selected, mut message) = (None, "Completed".to_owned());
                 match op {
                     Operation::Stage(files, undo) => {
@@ -123,10 +137,10 @@ impl Job {
                         message = git::commit(&path, &s, &b).await?;
                     }
                     Operation::Fetch => {
-                        git::run(&path, ["fetch", "--all", "--prune"]).await?;
+                        git::run(&path, ["fetch", "--progress", "--all", "--prune"]).await?;
                     }
                     Operation::Pull => {
-                        git::run(&path, ["pull", "--ff-only"]).await?;
+                        git::run(&path, ["pull", "--progress", "--ff-only"]).await?;
                     }
                     Operation::Push => {
                         git::push(&path).await?;
@@ -248,6 +262,7 @@ impl Picker {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
+    OperationDetails,
     Form(Form),
     Picker(Picker),
     Confirm(String, Operation),
@@ -282,6 +297,9 @@ pub struct App {
     pub prs: Vec<PullRequest>,
     pub default_base: String,
     pub busy: bool,
+    pub latest_operation: Option<Record>,
+    pub next_operation_id: u64,
+    pub operation_scroll: usize,
     pub notice: String,
     pub error: bool,
     pub quit: bool,
@@ -295,6 +313,7 @@ pub struct App {
     pub waiting_prs: bool,
     pub recover_form: Option<Form>,
     pub viewport_height: usize,
+    pub viewport_width: usize,
 }
 impl App {
     pub fn new(
@@ -332,6 +351,9 @@ impl App {
             prs: vec![],
             default_base: "HEAD".into(),
             busy: false,
+            latest_operation: None,
+            next_operation_id: 1,
+            operation_scroll: usize::MAX,
             notice: "Discovering projects…".into(),
             error: false,
             quit: false,
@@ -345,6 +367,7 @@ impl App {
             waiting_prs: false,
             recover_form: None,
             viewport_height: 24,
+            viewport_width: 120,
         }
     }
     pub fn say(&mut self, message: impl Into<String>, error: bool) {
@@ -414,16 +437,64 @@ impl App {
             .unwrap_or(project.path.clone());
         self.busy = true;
         self.epoch += 1;
+        let id = self.next_operation_id;
+        self.next_operation_id += 1;
+        let action = match &op {
+            Operation::Stage(_, true) => "Unstage".into(),
+            Operation::Stage(_, false) => "Stage".into(),
+            Operation::Commit(..) => "Commit".into(),
+            Operation::Fetch => "Fetch".into(),
+            Operation::Pull => "Pull (fast-forward only)".into(),
+            Operation::Push => "Push".into(),
+            Operation::Publish(remote, branch) => format!("Publish → {remote}/{branch}"),
+            Operation::Create { branch, .. } => format!("Create worktree {branch}"),
+            Operation::Branch(branch, _) => format!("Create branch {branch}"),
+            Operation::DeleteBranch(branch) => format!("Delete branch {branch}"),
+            Operation::Remove(_) => "Remove worktree".into(),
+            Operation::Review(number, _) => format!("Prepare PR review {number}"),
+            Operation::OpenPr(_) => "Open pull request".into(),
+        };
+        let target = match &op {
+            Operation::Remove(target) => target.clone(),
+            Operation::Create { destination, .. } | Operation::Review(_, destination) => {
+                destination.clone()
+            }
+            _ => path.clone(),
+        };
+        self.latest_operation = Some(Record::new(id, action, project.path.clone(), target));
+        self.operation_scroll = usize::MAX;
         self.say("Running Git operation…", false);
         self.jobs.push(Job::Operation {
+            id,
             project: project.path,
             path,
             op,
         });
     }
+    pub fn accept_feedback(&mut self, event: Event) {
+        if let Some(record) = &mut self.latest_operation
+            && record.id == event.id
+            && record.running()
+        {
+            record.apply(event.update);
+        }
+    }
     pub fn accept(&mut self, done: Completion) {
         self.inflight.remove(&done.token);
-        if done.token == "operation" {
+        let operation = done.token.starts_with("operation:");
+        if operation {
+            let Some(record) = &mut self.latest_operation else {
+                return;
+            };
+            if record.token() != done.token || !record.running() {
+                return;
+            }
+            let result = match &done.result {
+                Ok(Payload::Done(_, _, message)) => Ok(message.clone()),
+                Err(error) => Err(format!("{error:#}")),
+                _ => return,
+            };
+            record.finish(result);
             self.busy = false;
             self.epoch += 1;
         } else if done.epoch != self.epoch {
@@ -432,9 +503,7 @@ impl App {
         match done.result {
             Err(error) => {
                 self.say(format!("{error:#}"), true);
-                if done.token == "operation"
-                    && let Some(form) = self.recover_form.take()
-                {
+                if operation && let Some(form) = self.recover_form.take() {
                     self.modal = Some(Modal::Form(form));
                 }
             }
@@ -1016,6 +1085,12 @@ impl App {
             self.modal = Some(Modal::Help);
             return;
         }
+        if action == "i" || action == "operation_details" {
+            if self.latest_operation.is_some() {
+                self.modal = Some(Modal::OperationDetails);
+            }
+            return;
+        }
         if action == "q" || action == "back" {
             self.back();
             return;
@@ -1214,6 +1289,38 @@ impl App {
             return;
         }
         match modal {
+            Modal::OperationDetails => {
+                let count = self
+                    .latest_operation
+                    .as_ref()
+                    .map(|r| {
+                        r.display_lines(self.viewport_width.min(112).saturating_sub(2))
+                            .len()
+                    })
+                    .unwrap_or(0);
+                let last = count.saturating_sub(self.viewport_height.saturating_sub(9));
+                let current = self.operation_scroll.min(last);
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('i') => return,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.operation_scroll = current.saturating_add(1).min(last)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.operation_scroll = current.saturating_sub(1)
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.operation_scroll =
+                            current.saturating_add(self.half_page() as usize).min(last)
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.operation_scroll = current.saturating_sub(self.half_page() as usize)
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => self.operation_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => self.operation_scroll = usize::MAX,
+                    _ => {}
+                }
+                self.modal = Some(Modal::OperationDetails);
+            }
             Modal::Help => {
                 if !matches!(
                     key.code,

@@ -203,9 +203,10 @@ fn failed_commit_keeps_the_message_but_navigation_discards_recovery() {
     }
     app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(app.busy);
+    let token = app.jobs.last().unwrap().token();
     app.accept(Completion {
         epoch: app.epoch,
-        token: "operation".into(),
+        token,
         result: Err(anyhow::anyhow!("Hook rejected commit")),
     });
     let Some(Modal::Form(form)) = &app.modal else {
@@ -216,10 +217,11 @@ fn failed_commit_keeps_the_message_but_navigation_discards_recovery() {
     app.action("commit");
     app.key(key('x'));
     app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let token = app.jobs.last().unwrap().token();
     app.action("back");
     app.accept(Completion {
         epoch: app.epoch,
-        token: "operation".into(),
+        token,
         result: Err(anyhow::anyhow!("Hook rejected commit")),
     });
     assert!(app.modal.is_none());
@@ -240,4 +242,193 @@ fn a_slow_pr_query_does_not_replace_a_form_being_edited() {
         panic!()
     };
     assert_eq!(form.fields[0].value, "x");
+}
+
+#[test]
+fn operation_feedback_stays_attributed_during_navigation_and_search() {
+    let mut app = app();
+    app.action("fetch");
+    let token = app.jobs.last().unwrap().token();
+    app.action("back");
+    app.action("search");
+    app.key(key('x'));
+    app.say("Unrelated refresh notice", false);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("Fetch"), "{text}");
+    assert!(text.contains("/code/app"), "{text}");
+    app.accept(Completion {
+        epoch: 0,
+        token: token.clone(),
+        result: Err(anyhow::anyhow!("Connection refused")),
+    });
+    assert!(!app.busy);
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    app.action("operation_details");
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("Connection refused"));
+    app.accept(Completion {
+        epoch: 0,
+        token,
+        result: Ok(Payload::Done(
+            "/code/app".into(),
+            None,
+            "stale success".into(),
+        )),
+    });
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("Connection refused"));
+    assert!(!text.contains("stale success"));
+}
+
+#[test]
+fn progress_belongs_to_current_phase_and_stale_events_cannot_change_a_new_operation() {
+    use treerail::feedback::{Event, Update};
+    let mut app = app();
+    app.action("fetch");
+    let token = app.jobs.last().unwrap().token();
+    let id = token.strip_prefix("operation:").unwrap().parse().unwrap();
+    for update in [
+        Update::Phase("Fetching remotes".into()),
+        Update::Output {
+            stderr: true,
+            text: "Receiving objects: 10% (1/10)\\rReceiving objects: ".replace("\\r", "\r"),
+        },
+        Update::Output {
+            stderr: true,
+            text: "100% (10/10), 24 KiB | 2 MiB/s, done.\r".into(),
+        },
+    ] {
+        app.accept_feedback(Event { id, update });
+    }
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("100% (10/10), 24 KiB"));
+    app.accept_feedback(Event {
+        id,
+        update: Update::Phase("Creating worktree".into()),
+    });
+    app.accept_feedback(Event {
+        id,
+        update: Update::Output {
+            stderr: true,
+            text: "Preparing worktree\n".into(),
+        },
+    });
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(
+        !text.contains("100%"),
+        "A completed fetch percentage must not describe worktree creation"
+    );
+    app.accept(Completion {
+        epoch: 0,
+        token: token.clone(),
+        result: Ok(Payload::Done("/code/app".into(), None, "Fetched".into())),
+    });
+    app.action("fetch");
+    app.accept_feedback(Event {
+        id,
+        update: Update::Output {
+            stderr: true,
+            text: "stale output".into(),
+        },
+    });
+    app.accept(Completion {
+        epoch: 0,
+        token,
+        result: Err(anyhow::anyhow!("stale failure")),
+    });
+    assert!(app.busy);
+    app.action("operation_details");
+    terminal.draw(|f| ui::draw(f, &app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(!text.contains("stale output"));
+    assert!(!text.contains("stale failure"));
+}
+
+#[test]
+fn details_bound_long_output_and_keep_navigation_usable_at_supported_sizes() {
+    use treerail::feedback::{Event, Update};
+    let mut app = app();
+    app.action("fetch");
+    let token = app.jobs.last().unwrap().token();
+    let id = token.strip_prefix("operation:").unwrap().parse().unwrap();
+    app.accept_feedback(Event {
+        id,
+        update: Update::Output {
+            stderr: true,
+            text: format!(
+                "discarded beginning\n{}\nlatest output",
+                "line of output\n".repeat(6000)
+            ),
+        },
+    });
+    app.action("pull");
+    assert_eq!(
+        app.jobs.last().unwrap().token(),
+        token,
+        "Only one mutation can be scheduled"
+    );
+    app.action("operation_details");
+    app.key(key('G'));
+    for (width, height) in [(140, 40), (80, 24), (30, 10), (8, 3)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::draw(f, &app)).unwrap();
+        if width >= 80 {
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("latest output"));
+            assert!(text.contains("Earlier output discarded"));
+            assert!(!text.contains("discarded beginning"));
+        }
+    }
+    app.key(key('q'));
+    assert!(app.modal.is_none());
+    assert!(app.busy, "Closing details does not cancel Git");
 }

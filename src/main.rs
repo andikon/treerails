@@ -113,6 +113,7 @@ impl Drop for TerminalGuard {
 }
 async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<Completion>(64);
+    let (feedback_tx, mut feedback_rx) = mpsc::channel(128);
     let (event_tx, mut event_rx) = mpsc::channel::<Result<Event>>(64);
     let running = Arc::new(AtomicBool::new(true));
     let input_running = running.clone();
@@ -143,14 +144,16 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
     let result:Result<()>=async{
         while !app.quit{
             for job in std::mem::take(&mut app.jobs){
-                let sender=tx.clone();let limiter=semaphore.clone();let epoch=app.epoch;let token=job.token();
-                tokio::spawn(async move{let _permit=limiter.acquire_owned().await;let result=job.execute().await;let _=sender.send(Completion{epoch,token,result}).await;});
+                let sender=tx.clone();let limiter=semaphore.clone();let epoch=app.epoch;let token=job.token();let feedback=feedback_tx.clone();
+                tokio::spawn(async move{let _permit=limiter.acquire_owned().await;let result=job.execute_with_feedback(feedback).await;let _=sender.send(Completion{epoch,token,result}).await;});
             }
             app.viewport_height=terminal.size()?.height as usize;
+            app.viewport_width=terminal.size()?.width as usize;
             terminal.draw(|frame|ui::draw(frame,app))?;
             tokio::select!{
                 Some(event)=event_rx.recv()=>match event?{Event::Key(key)=>app.key(key),Event::Paste(text)=>app.paste(&text),_=>{}},
-                Some(done)=rx.recv()=>app.accept(done),
+                Some(done)=rx.recv()=>{while let Ok(event)=feedback_rx.try_recv(){app.accept_feedback(event);}app.accept(done)},
+                Some(event)=feedback_rx.recv()=>app.accept_feedback(event),
                 _=ticker.tick()=>app.tick(),
             }
         }
