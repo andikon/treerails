@@ -51,7 +51,6 @@ async fn explorer(temp: &TempDir, path: &Path) -> App {
         Config::default(),
         State::default(),
         temp.path().join("config.toml"),
-        temp.path().join("state.json"),
         vec![path.into()],
         false,
     );
@@ -91,7 +90,6 @@ async fn commit_hook_output_is_visible_before_exit_and_commit_stdin_is_preserved
         Config::default(),
         State::default(),
         temp.path().join("config.toml"),
-        temp.path().join("state.json"),
         vec![path.clone()],
         false,
     );
