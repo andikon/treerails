@@ -126,7 +126,7 @@ impl Config {
         };
         Self::parse(&raw, path)
     }
-    fn parse(raw: &str, path: &Path) -> Result<Self> {
+    pub(crate) fn parse(raw: &str, path: &Path) -> Result<Self> {
         let mut config: Self = toml::from_str(raw)
             .with_context(|| format!("Invalid configuration {}", path.display()))?;
         let directory = path.parent().unwrap_or(Path::new("."));
@@ -393,7 +393,9 @@ pub fn edit_document<T>(
     let result = edit(&mut doc)?;
     let updated = doc.to_string();
     Config::parse(&updated, path).context("Refusing to save invalid configuration")?;
-    atomic_write(path, updated.as_bytes())?;
+    if updated != source {
+        atomic_write(path, updated.as_bytes())?;
+    }
     Ok(result)
 }
 

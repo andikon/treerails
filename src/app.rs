@@ -4,6 +4,7 @@ use crate::{
     feedback::{self, Event, Record, Reporter},
     git::{self, Branch, ChangedFile, Project, PullRequest, Snapshot, Worktree},
     launch,
+    settings::{self, Draft},
 };
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -216,7 +217,7 @@ pub struct Field {
     pub readonly: bool,
 }
 impl Field {
-    fn new(label: &str, value: String, multiline: bool) -> Self {
+    pub(crate) fn new(label: &str, value: String, multiline: bool) -> Self {
         let cursor = value.len();
         Self {
             label: label.into(),
@@ -274,6 +275,9 @@ pub struct App {
     pub state: State,
     pub config_path: PathBuf,
     pub roots: Vec<PathBuf>,
+    pub temporary_roots: Vec<PathBuf>,
+    pub settings: Option<Draft>,
+    pub settings_open: bool,
     pub recursive: bool,
     pub projects: Vec<Project>,
     pub project_cursor: usize,
@@ -323,11 +327,24 @@ impl App {
         roots: Vec<PathBuf>,
         recursive: bool,
     ) -> Self {
+        let temporary_roots = roots
+            .iter()
+            .filter(|root| {
+                !config
+                    .project_roots
+                    .iter()
+                    .any(|saved| same_path(root, saved))
+            })
+            .cloned()
+            .collect();
         Self {
             config,
             state,
             config_path,
             roots: roots.clone(),
+            temporary_roots,
+            settings: None,
+            settings_open: false,
             recursive,
             projects: vec![],
             project_cursor: 0,
@@ -509,6 +526,17 @@ impl App {
             }
             Ok(Payload::Projects(projects, warnings)) => {
                 self.projects = projects;
+                if self.project.as_ref().is_some_and(|current| {
+                    !self
+                        .projects
+                        .iter()
+                        .any(|project| same_path(&current.path, &project.path))
+                }) {
+                    self.project = None;
+                    self.trees.clear();
+                    self.snapshots.clear();
+                    self.diff.clear();
+                }
                 self.project_cursor = self
                     .state
                     .last_project
@@ -823,6 +851,60 @@ impl App {
             return;
         }
         let repeating = key.kind == KeyEventKind::Repeat;
+        if self.settings_open && self.modal.is_none() {
+            if !repeating
+                && key.code == KeyCode::Char('i')
+                && key.modifiers == KeyModifiers::NONE
+                && self.settings.as_ref().is_some_and(|draft| {
+                    draft.input.is_none() && matches!(draft.mode, settings::Mode::Edit)
+                })
+            {
+                self.action("operation_details");
+                return;
+            }
+            if repeating
+                && self
+                    .settings
+                    .as_ref()
+                    .is_some_and(|draft| draft.input.is_none())
+                && !matches!(
+                    key.code,
+                    KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
+                )
+            {
+                return;
+            }
+            let Some(draft) = self.settings.as_mut() else {
+                self.settings_open = false;
+                return;
+            };
+            match draft.key(key, &self.config_path, self.viewport_height) {
+                settings::Action::None => {}
+                settings::Action::Close => self.settings_open = false,
+                settings::Action::Save(resolution) => self.save_settings(resolution),
+                settings::Action::Help => self.modal = Some(Modal::Help),
+                settings::Action::Quit => {
+                    if !self.busy {
+                        self.request_quit();
+                    }
+                }
+                settings::Action::Discard(quit) => match Config::load(&self.config_path) {
+                    Ok(config) => {
+                        self.settings = Some(Draft::new(config));
+                        if quit {
+                            self.quit = true;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(draft) = &mut self.settings {
+                            draft.fail(error);
+                            draft.mode = settings::Mode::Edit;
+                        }
+                    }
+                },
+            }
+            return;
+        }
         if self.modal.is_some() {
             if !repeating
                 || matches!(
@@ -877,7 +959,7 @@ impl App {
                 KeyCode::Char('w') if !repeating => self.prefix = Some(('w', Instant::now())),
                 KeyCode::Char('d') => self.move_by(self.half_page()),
                 KeyCode::Char('u') => self.move_by(-self.half_page()),
-                KeyCode::Char('c') if !self.busy => self.quit = true,
+                KeyCode::Char('c') if !self.busy => self.request_quit(),
                 _ => {}
             }
             return;
@@ -1045,10 +1127,60 @@ impl App {
         } else if self.busy {
             self.say("Wait for the running Git operation before quitting", true);
         } else {
+            self.request_quit();
+        }
+    }
+    fn request_quit(&mut self) {
+        if let Some(draft) = &mut self.settings
+            && draft.dirty()
+        {
+            draft.mode = settings::Mode::Discard { quit: true };
+            self.settings_open = true;
+        } else {
             self.quit = true;
         }
     }
+    fn open_settings(&mut self) {
+        if self.settings.is_none() {
+            match Config::load(&self.config_path) {
+                Ok(config) => self.settings = Some(Draft::new(config)),
+                Err(error) => {
+                    self.say(format!("{error:#}"), true);
+                    return;
+                }
+            }
+        }
+        self.settings_open = true;
+    }
+    fn save_settings(&mut self, resolution: settings::Resolution) {
+        let Some(draft) = &mut self.settings else {
+            return;
+        };
+        match draft.save(&self.config_path, resolution) {
+            Ok(Some(config)) => {
+                self.config = config;
+                self.roots = self
+                    .config
+                    .project_roots
+                    .iter()
+                    .cloned()
+                    .chain(self.temporary_roots.clone())
+                    .collect();
+                self.recursive = self.config.recursive;
+                self.epoch += 1;
+                self.jobs.retain(|job| !matches!(job, Job::Discover(..)));
+                self.inflight.clear();
+                self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+            }
+            Ok(None) => {}
+            Err(error) => draft.fail(error),
+        }
+    }
     pub fn action(&mut self, action: &str) {
+        if action == "," || action == "settings" {
+            self.open_settings();
+            return;
+        }
         match action {
             "down" => {
                 self.move_by(1);
@@ -1096,13 +1228,7 @@ impl App {
             return;
         }
         if action == "S" || action == "save_roots" {
-            match Config::save_roots(&self.config_path, &self.roots) {
-                Ok(()) => self.say(
-                    format!("Sources saved to {}", self.config_path.display()),
-                    false,
-                ),
-                Err(e) => self.say(format!("{e:#}"), true),
-            }
+            self.open_settings();
             return;
         }
         if action == "R" || action == "refresh" {
@@ -1479,6 +1605,12 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.settings_open {
+            if let Some(draft) = &mut self.settings {
+                draft.paste(text);
+            }
+            return;
+        }
         if let Some(Modal::Form(form)) = &mut self.modal {
             let field = &mut form.fields[form.active];
             if field.readonly {
@@ -1631,7 +1763,7 @@ pub fn key_name(key: KeyEvent) -> String {
         }
     )
 }
-fn edit(field: &mut Field, key: KeyEvent) {
+pub(crate) fn edit(field: &mut Field, key: KeyEvent) {
     if field.readonly {
         return;
     }

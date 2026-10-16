@@ -152,7 +152,7 @@ Pulls use **fast-forward only**. Worktree removal refuses uncommitted changes an
 | `Space` · `s/u` · `t` | Mark files, stage/unstage, toggle staged/unstaged diffs |
 | `c` · `f` · `p/P` | Commit, fetch, push/publish, pull |
 | `r` · `v` · `w` | Choose a PR, view its comparison, open it in a browser |
-| `d` · `R` · `S` | Remove a worktree, refresh, save project roots |
+| `d` · `R` · `,` | Remove a worktree, refresh, open settings |
 | `?` · `Esc` · `q` | Help, close/back, back/quit |
 
 Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. Pickers support Vim navigation and `/` to enter a filter. **[Complete keyboard reference →](docs/usage.md#keyboard-controls)**
@@ -160,6 +160,8 @@ Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. 
 ## Make it yours
 
 Tree Rail keeps roots, per-project defaults, launch profiles, keybindings, colors, and remembered selections together in **`config.toml`**. Interactive startup creates it automatically at `%LOCALAPPDATA%\treerails\config.toml` on Windows or `~/.config/treerails/config.toml` on Linux and macOS. `--config` selects another combined file.
+
+Explicit project sources are remembered automatically; add `--temporary` for a one-off launch. Press `,` to manage sources and discovery in the TUI, then `Ctrl+s` to Save & Apply. Drafts survive navigation, and conflicting external edits prompt for a choice.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']

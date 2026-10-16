@@ -432,3 +432,40 @@ fn details_bound_long_output_and_keep_navigation_usable_at_supported_sizes() {
     assert!(app.modal.is_none());
     assert!(app.busy, "Closing details does not cancel Git");
 }
+
+#[test]
+fn running_feedback_and_details_remain_accessible_while_editing_settings() {
+    use treerail::feedback::{Event, Update};
+    let mut app = app();
+    app.action("fetch");
+    let id = app
+        .jobs
+        .last()
+        .unwrap()
+        .token()
+        .strip_prefix("operation:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    app.action("settings");
+    app.accept_feedback(Event {
+        id,
+        update: Update::Phase("Fetching remote objects".into()),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Fetching remote objects"));
+    assert!(text.contains("Settings"));
+    app.key(key('i'));
+    assert!(matches!(app.modal, Some(Modal::OperationDetails)));
+    app.key(key('q'));
+    assert!(app.settings_open);
+    assert!(app.busy);
+}

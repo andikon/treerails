@@ -75,7 +75,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
             ),
         );
     }
-    if app.project.is_none() {
+    if app.settings_open {
+        settings_view(frame, app, rows[1]);
+    } else if app.project.is_none() {
         projects(frame, app, rows[1]);
     } else {
         workspace(frame, app, rows[1]);
@@ -97,10 +99,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         rows[2],
     );
-    let hints = if app.project.is_none() {
-        " j/k navigate   / search   Enter explore   S save sources   R reload   i output   ? help   q quit "
+    let hints = if app.settings_open {
+        " a add · Enter edit · d remove · r recursive · Ctrl+s apply · i output · Esc explorer · D discard "
+    } else if app.project.is_none() {
+        " j/k navigate   / search   Enter explore   , settings   R reload   i output   ? help   q quit "
     } else {
-        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  i output  t staged  ? help "
+        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output  ? help "
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
@@ -109,6 +113,100 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(modal) = &app.modal {
         modal_view(frame, app, modal, area);
     }
+}
+fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(draft) = &app.settings else {
+        return;
+    };
+    let block = border(
+        format!(
+            " Settings · {} ",
+            if draft.dirty() {
+                "Unsaved draft"
+            } else {
+                "Saved"
+            }
+        ),
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(if draft.input.is_some() { 3 } else { 0 }),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("Config: {}", app.config_path.display())).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    let mut items: Vec<ListItem> = draft
+        .config
+        .project_roots
+        .iter()
+        .map(|path| {
+            ListItem::new(format!(
+                " {}{}",
+                path.display(),
+                if path.is_dir() {
+                    ""
+                } else {
+                    "  [unavailable; kept]"
+                }
+            ))
+        })
+        .collect();
+    items.push(ListItem::new(format!(
+        " Recursive discovery: {}  [r toggles]",
+        if draft.config.recursive { "on" } else { "off" }
+    )));
+    let mut state = ListState::default().with_selected(Some(draft.cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
+        rows[1],
+        &mut state,
+    );
+    if let Some(input) = &draft.input {
+        let block = border(format!(" {} · Enter accept ", input.field.label), true, app);
+        let rect = block.inner(rows[2]);
+        let column = input.field.value[..input.field.cursor].width();
+        let offset = column.saturating_sub(rect.width.saturating_sub(1) as usize);
+        frame.render_widget(
+            Paragraph::new(input.field.value.as_str())
+                .scroll((0, offset.min(u16::MAX as usize) as u16))
+                .block(block),
+            rows[2],
+        );
+        if rect.width > 0 && rect.height > 0 {
+            frame.set_cursor_position((rect.x + (column - offset) as u16, rect.y));
+        }
+    }
+    let message = match &draft.mode {
+        crate::settings::Mode::Edit => draft.message.clone(),
+        crate::settings::Mode::Discard { quit } => format!(
+            "Discard unsaved settings{}? y discard · any other key keep editing",
+            if *quit { " and quit" } else { "" }
+        ),
+        crate::settings::Mode::Conflict(fields) => format!(
+            "Changed elsewhere: {}\nm use my changes · e keep external changes · Esc continue editing",
+            fields.join(", ")
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(if draft.error {
+                Color::Red
+            } else {
+                Color::Yellow
+            })),
+        rows[3],
+    );
 }
 fn projects(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
@@ -372,7 +470,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             let rect = centered(area, 94, 28);
             frame.render_widget(Clear, rect);
             let help = format!(
-                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n  i live operation details · j/k scroll · G follow output\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · S save roots\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
+                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  i live operation details · j/k scroll · G follow output\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · , settings\n  Settings: a add · Enter edit · d remove · r recursive\n  Ctrl+s apply · Esc explorer (keeps draft) · D discard\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
                 app.config_path.display()
             );
             frame.render_widget(

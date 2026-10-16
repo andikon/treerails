@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
@@ -6,7 +6,6 @@ use crossterm::{
 };
 use std::{
     io::{self, IsTerminal},
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,84 +15,37 @@ use std::{
 use tokio::sync::{Semaphore, mpsc};
 use treerail::{
     app::{App, Completion},
-    config, discover, ui,
+    discover,
+    startup::Options,
+    ui,
 };
 
-#[derive(Parser, Debug)]
-#[command(version, about = "A keyboard-first project and Git worktree explorer")]
-struct Args {
-    /// Repositories or parent folders to explore (combined with saved roots)
-    paths: Vec<PathBuf>,
-    /// File containing one project source directory per line
-    #[arg(long)]
-    paths_file: Option<PathBuf>,
-    /// Discover repositories recursively (excluding .worktrees folders)
-    #[arg(long)]
-    recursive: bool,
-    /// Combined settings and remembered selections file
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Print discovered projects as JSON without opening the TUI
-    #[arg(long)]
-    list: bool,
-}
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let legacy = if args.config.is_none() {
-        Some(config::legacy_paths()?)
-    } else {
-        None
-    };
-    let config_path = match args.config {
-        Some(path) => path,
-        None => config::default_path()?,
-    };
-    // Listing may read an upgrade candidate, but never creates a file or lock.
-    let (config, _) = config::open(&config_path, false, legacy.clone())?;
-    let recursive = args.recursive || config.recursive;
-    let mut roots = config.project_roots.clone();
-    roots.extend(args.paths);
-    if let Some(path) = args.paths_file {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Read paths file {}", path.display()))?;
-        let parent = path.parent().unwrap_or(std::path::Path::new("."));
-        roots.extend(
-            content
-                .trim_start_matches('\u{feff}')
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && !s.starts_with('#'))
-                .map(|s| {
-                    let p = PathBuf::from(s);
-                    if p.is_absolute() { p } else { parent.join(p) }
-                }),
+    let options = Options::parse();
+    let listing = options.list;
+    if !listing {
+        anyhow::ensure!(
+            io::stdin().is_terminal() && io::stdout().is_terminal(),
+            "Tree Rail requires an interactive terminal. Use --list for noninteractive discovery."
         );
     }
-    if roots.is_empty() {
-        roots.push(std::env::current_dir()?);
-    }
-    let cwd = std::env::current_dir()?;
-    for root in &mut roots {
-        if root.is_relative() {
-            *root = cwd.join(&*root);
-        }
-    }
-    if args.list {
-        let (projects, warnings) = discover::discover(roots, recursive).await?;
+    let session = options.prepare()?;
+    if listing {
+        let (projects, warnings) = discover::discover(session.roots, session.recursive).await?;
         println!("{}", serde_json::to_string_pretty(&projects)?);
         for warning in warnings {
             eprintln!("{warning}");
         }
         return Ok(());
     }
-    anyhow::ensure!(
-        io::stdin().is_terminal() && io::stdout().is_terminal(),
-        "Tree Rail requires an interactive terminal. Use --list for noninteractive discovery."
+    let mut app = App::new(
+        session.config,
+        session.state,
+        session.config_path,
+        session.roots,
+        session.recursive,
     );
-    // Import before the first startup save, and only after requiring a real TUI.
-    let (config, state) = config::open(&config_path, true, legacy)?;
-    let mut app = App::new(config, state, config_path, roots, recursive);
     let mut terminal = ratatui::init();
     let guard = TerminalGuard;
     execute!(io::stdout(), EnableBracketedPaste)?;
