@@ -27,12 +27,13 @@ treerail [OPTIONS] [PATHS]...
 
 --paths-file projects.txt    One source folder per line; # comments allowed
 --recursive                 Search beyond immediate children
+--temporary                 Do not remember explicitly supplied sources
 --config config.toml        Choose the combined settings and remembered-state file
 --list                      Print discovered projects as JSON without a TUI
 --help                      Show all options
 ```
 
-Paths in a paths file are relative to that file. Saved roots are relative to their configuration file; CLI directory arguments are relative to the current directory. Without sources, Tree Rail uses the current directory. Saved and temporary sources are combined. Press `S` to save the current sources explicitly.
+Paths in a paths file are relative to that file. Saved roots are relative to their configuration file; CLI directory arguments are relative to the current directory. Explicit paths and path-list entries are remembered automatically after interactive startup. Use `--temporary` for a one-off set of additional sources. Without any sources, Tree Rail uses the current directory for that session and does not remember it. Saved and temporary sources are combined, normalized to absolute paths, and deduplicated. `--list` never writes sources or creates configuration files.
 
 Parent directories are scanned one level deep by default. Folders containing `.worktrees` in their name are excluded from discovery. Registered linked worktrees still appear under their owning project, including those made by other tools.
 
@@ -68,7 +69,8 @@ A branch already checked out in a worktree selects that worktree. New feature br
 | `c`, `f`, `p`, `P` | Commit, fetch, push/publish, fast-forward pull |
 | `r`, `v`, `w` | PR picker, PR comparison, open PR in browser |
 | `d` | Confirm worktree removal, while focused on worktrees |
-| `R`, `S` | Refresh; save project sources |
+| `,`, `S` | Open settings (also available with an empty explorer) |
+| `R` | Refresh |
 | `Esc`, `q` | Close/back; quit from projects |
 | `?` | Keyboard help |
 
@@ -89,6 +91,14 @@ Interactive startup automatically creates one combined `config.toml`. On Windows
 Settings and remembered selections share this document. Session memory is stored under `[state]` and `[state.bases]`. Automatic memory saves preserve comments and unrelated settings, including changes saved by other instances or your editor. The most recently saved selection wins; starting points changed in separate projects are preserved. Writes are atomic and Tree Rail instances coordinate through a small `.lock` sidecar containing no settings or history. `--list` only reads files: it never creates a configuration, imports data to disk, or saves selections. Invalid settings produce an error without replacing the document.
 
 When the new **default** file is missing, Tree Rail imports the former configuration and `state.json` before creating it. Relative saved paths retain their original meaning. The old files remain untouched. Windows legacy settings used `%APPDATA%\treerail\config\config.toml` and memory used `%LOCALAPPDATA%\treerail\data\state.json`; Linux used `$XDG_CONFIG_HOME/treerail/config.toml` (or `~/.config/treerail/config.toml`) and `$XDG_STATE_HOME/treerail/state.json` (or `~/.local/state/treerail/state.json`); macOS used `~/Library/Application Support/treerail/`. An existing new file is authoritative and never reimports old values. If import fails, the original data is preserved and the error names the failed component. Correct it before retrying, or choose a separate file with `--config`. Explicit overrides do not import the default legacy files. The old `--state` option has been removed because settings and memory now belong to the same file.
+
+### Settings in the TUI
+
+Press `,` from project or worktree navigation to open settings. The page shows the active configuration path and a draft of saved project sources and recursive discovery. Use `j/k`, arrows, `gg/G`, or `Ctrl+u/d` to navigate; `a` adds a source, `Enter` edits one, `d` removes one from the draft, and `r` toggles recursive discovery. Source entry accepts ordinary text, including Vim letters; relative paths resolve beside the configuration file. New sources must be available directories. Existing sources that become unavailable remain saved and are marked with a warning.
+
+`Ctrl+s` validates, saves and applies the draft, rescanning projects while retaining valid project/worktree selections. Sources can be repositories or parent directories. Removing a source only changes discovery; it never deletes directories, repositories or worktrees. `Esc` returns to the explorer while retaining your draft, including unfinished input. Reopen settings to continue. `D` asks before discarding a draft, and quitting the application also asks before dropping unsaved settings.
+
+If another instance or your editor changes an unrelated setting, Save & Apply keeps that change. If the same field changed in both places, settings presents the conflict without writing anything: `m` applies your changes to conflicting fields, `e` keeps their external values while saving your nonconflicting edits, and `Esc` leaves the draft editable. Comments, advanced settings and remembered state are preserved. `S` remains an alias for opening settings; it no longer saves temporary sources implicitly.
 
 ```toml
 project_roots = ['C:\Code', 'D:\Projects']
@@ -142,7 +152,7 @@ modified = '#fde68a'
 'ctrl+n' = 'down'
 ```
 
-Key overrides apply in navigation contexts. Action names include `down`, `up`, `first`, `last`, `focus_left`, `focus_right`, `search`, `help`, `back`, `refresh`, `save_roots`, `create_worktree`, `branches`, `launch`, `profiles`, `stage`, `unstage`, `commit`, `fetch`, `pull`, `push`, `remove_worktree`, `prs`, `review_diff`, `open_pr`, and `toggle_staged`.
+Key overrides apply in navigation contexts. Action names include `down`, `up`, `first`, `last`, `focus_left`, `focus_right`, `search`, `help`, `back`, `refresh`, `settings`, `save_roots` (settings alias), `create_worktree`, `branches`, `launch`, `profiles`, `stage`, `unstage`, `commit`, `fetch`, `pull`, `push`, `remove_worktree`, `prs`, `review_diff`, `open_pr`, and `toggle_staged`.
 
 ## Development and validation
 
