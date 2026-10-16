@@ -110,7 +110,8 @@ async fn non_head_base_status_commit_and_safe_cleanup() {
     )
     .await
     .unwrap();
-    assert_eq!(reused, tree);
+    // Git resolves macOS symlinks and Windows short paths when reporting worktrees.
+    assert_eq!(reused.canonicalize().unwrap(), tree.canonicalize().unwrap());
     fs::write(tree.join("a file with spaces.txt"), "hello\n").unwrap();
     let snapshot = git::status(&tree).await.unwrap();
     assert_eq!(snapshot.files.len(), 1);
