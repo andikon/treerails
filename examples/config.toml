@@ -1,0 +1,50 @@
+# Tree Rail: paths may be repositories or their direct parent folders.
+# Single-quoted TOML strings preserve Windows backslashes.
+project_roots = []
+recursive = false
+default_profile = 'copilot'
+
+[worktrees]
+path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
+
+[profiles.copilot]
+program = 'copilot'
+args = []
+cwd = '{worktree}'
+terminal = 'auto'
+
+[profiles.editor]
+program = 'nvim'
+args = ['.']
+cwd = '{worktree}'
+terminal = 'auto'
+
+[profiles.terminal]
+program = ''
+args = []
+cwd = '{worktree}'
+terminal = 'auto'
+
+[theme]
+accent = '#7dd3fc'
+added = '#86efac'
+deleted = '#fda4af'
+modified = '#fde68a'
+
+[keys]
+# Navigation-context key overrides. Examples:
+# 'alt+o' = 'profiles'
+# 'ctrl+n' = 'down'
+
+# Project settings take precedence over global defaults and remembered bases.
+# [[projects]]
+# path = 'C:\Code\my-project'
+# base = 'origin/develop'
+# default_profile = 'editor'
+# path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
+
+# Custom terminals receive arguments individually. {command} inserts the tool
+# program and its argument array. {cwd} is the resolved profile directory.
+# [terminals.custom]
+# program = 'my-terminal'
+# args = ['--cwd', '{cwd}', '--', '{command}']

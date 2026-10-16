@@ -1,0 +1,159 @@
+# Tree Rail usage guide
+
+A keyboard-first project explorer and Git worktree manager, built in Rust with Ratatui. Jump into a project, create a worktree from the right branch, and launch Copilot or your editor in a new terminal while the explorer stays open.
+
+## Run
+
+Git must be on `PATH`. The default agent profile also needs `copilot`; PR features need an authenticated GitHub CLI (`gh`). Local Git features work independently of those optional tools.
+
+From this directory:
+
+```powershell
+cargo run --release -- 'C:\Code'
+cargo run --release -- 'C:\Code\my-project' 'D:\OtherProjects'
+```
+
+Or build once and launch the executable:
+
+```powershell
+cargo build --release --locked
+.\target\release\treerail.exe 'C:\Code'
+```
+
+On Linux/macOS, the executable is `target/release/treerail`. Building needs a stable Rust toolchain (tested with Rust 1.95.0). Windows builds use the MSVC toolchain and Visual C++ build tools. End users do not need Rust installed.
+
+```text
+treerail [OPTIONS] [PATHS]...
+
+--paths-file projects.txt    One source folder per line; # comments allowed
+--recursive                 Search beyond immediate children
+--config config.toml        Choose a configuration file
+--state state.json          Choose a remembered-state file
+--list                      Print discovered projects as JSON without a TUI
+--help                      Show all options
+```
+
+Paths in a paths file are relative to that file. Saved roots are relative to their configuration file; CLI directory arguments are relative to the current directory. Without sources, Tree Rail uses the current directory. Saved and temporary sources are combined. Press `S` to save the current sources explicitly.
+
+Parent directories are scanned one level deep by default. Folders containing `.worktrees` in their name are excluded from discovery. Registered linked worktrees still appear under their owning project, including those made by other tools.
+
+## Everyday workflow
+
+1. Select a project with `j/k` and `Enter`.
+2. Press `a` for a new branch/worktree, or `b` to select a local or remote branch. The default directory is a sibling such as `my-project.worktrees/feature-login`.
+3. Set the starting point, such as `origin/develop`. `Ctrl+b` opens its picker. Check the destination, optionally choose a fetch, and press `Ctrl+s` to create.
+4. Press `o` to open a new terminal running Copilot in the selected worktree. `O` selects another profile, including plain terminal and Neovim.
+5. Inspect live file changes, mark files with `Space`, and stage/unstage using `s/u`. Press `t` to switch staged/unstaged diffs.
+6. Press `c` to enter a commit subject/body; `Ctrl+s` commits staged changes. Hooks and signing use your normal Git configuration.
+7. Press `p` to push. With no upstream, the publish form suggests `origin` and the current branch name and establishes its upstream. `P` pulls using fast-forward only.
+8. Once finished, focus the worktree list and press `d`. Removal keeps the branch and refuses dirty, locked, missing, or original worktrees. Branch deletion is a separate action in `b`, with Git's normal merge protections.
+
+A branch already checked out in a worktree selects that worktree. New feature branches deliberately do not inherit the base branch as their upstream: they publish under their own name.
+
+## Keyboard controls
+
+| Keys | Action |
+| --- | --- |
+| `j/k`, arrows | Move selection; scroll in the diff pane |
+| `gg`, `G` | First/last item |
+| `Ctrl+u/d` | Move half a page, adapting to terminal height |
+| `h/l`, `Tab`, `Shift+Tab` | Focus adjacent panes |
+| `Ctrl+w`, then `h/j/k/l` | Focus adjacent panes using a Vim-style prefix |
+| `/` | Filter the current list or search the diff |
+| `n/N` | Next/previous filtered result or diff match |
+| `Enter` | Explore a project or focus the next pane |
+| `a`, `b` | Create worktree; open branch picker |
+| `o`, `O` | Launch default profile; choose profile |
+| `Space`, `s/u` | Mark files; stage/unstage files |
+| `t` | Toggle staged/unstaged diff |
+| `c`, `f`, `p`, `P` | Commit, fetch, push/publish, fast-forward pull |
+| `r`, `v`, `w` | PR picker, PR comparison, open PR in browser |
+| `d` | Confirm worktree removal, while focused on worktrees |
+| `R`, `S` | Refresh; save project sources |
+| `Esc`, `q` | Close/back; quit from projects |
+| `?` | Keyboard help |
+
+Forms accept ordinary text: `j`, `k`, and `q` never act as navigation while typing. Use `Tab`/`Shift+Tab` to change fields, arrows/Home/End to edit, and `Ctrl+s` to submit. Commit bodies support newlines and bracketed paste. `Enter` advances a single-line field and submits the last one.
+
+Pickers support `j/k`, `gg/G`, arrows, and `Ctrl+n/p`. Press `/` to filter, type the query, and `Enter` to select. `Esc` leaves filter entry, then closes the picker on another press. In navigation mode, `a` creates a branch in the branch picker, and `d` offers safe local branch deletion. In the PR picker, `a` lets you enter a PR number or URL directly.
+
+## Pull requests
+
+`r` lists up to 100 open PRs for the selected project. Select one or enter its number/URL. Tree Rail fetches the GitHub pull ref, including fork PRs, into its own local refs and prepares `review/pr-123` in `my-project.worktrees/review-pr-123`. It never force-resets an existing review branch.
+
+`v` shows the review branch's merge-base diff against the fetched PR base; `t` returns to local staged/unstaged changes. `w` opens the PR in a browser. Existing review worktrees are selected as-is; updating them is an explicit Git operation. Posting reviews is outside this version.
+
+## Configuration
+
+Copy [examples/config.toml](../examples/config.toml) and pass `--config`, or place it in the platform configuration directory. `?` displays the active path. The `directories` crate chooses the OS application directories; Windows normally uses a `treerail` folder under `%APPDATA%`, Linux uses `$XDG_CONFIG_HOME/treerail` (or `~/.config/treerail`), and macOS uses Application Support.
+
+TOML is editable configuration; remembered selections/bases live in separate `state.json`. `S` changes only saved roots and preserves existing comments. Invalid settings produce an error rather than silently replacing the file.
+
+```toml
+project_roots = ['C:\Code', 'D:\Projects']
+default_profile = 'copilot'
+
+[profiles.editor]
+program = 'nvim'
+args = ['.']
+cwd = '{worktree}'
+terminal = 'auto'
+
+[[projects]]
+path = 'C:\Code\my-project'
+base = 'origin/develop'
+default_profile = 'editor'
+```
+
+Built-in `copilot`, `editor`, and `terminal` profiles are always available unless overridden. A profile describes a tool, argument array, working directory, optional environment map, and terminal adapter. Relative profile working directories resolve inside the worktree.
+
+The automatic adapter uses Windows Terminal in a new window on Windows, Terminal.app on macOS, and `$TERMINAL` or a detected terminal on Linux. Custom adapters can target another emulator or create a combined layout. Each `{command}` entry expands to the profile's program and its individual arguments; other arguments remain separate.
+
+```toml
+[terminals.my-terminal]
+program = 'my-terminal'
+args = ['--working-directory', '{cwd}', '--', '{command}']
+
+[profiles.custom]
+program = 'my-agent'
+args = ['--project', '{worktree}']
+cwd = '{worktree}'
+terminal = 'my-terminal'
+env = { WORK_BRANCH = '{branch}' }
+```
+
+`{worktree}` and `{branch}` refer to the selection; terminal adapters also accept `{cwd}` for the profile's resolved working directory. Select a shell explicitly as the profile program when you want shell syntax. Tool availability is checked before launch. A successful terminal spawn is reported separately from whatever the tool does afterward.
+
+Worktree paths support `{project_parent}`, `{project_name}`, and `{branch_slug}`. Relative templates resolve against the project. Slashes in a branch name become dashes in its folder name; occupied destinations are refused instead of overwritten.
+
+```toml
+[worktrees]
+path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
+
+[theme]
+accent = '#7dd3fc'
+added = '#86efac'
+deleted = '#fda4af'
+modified = '#fde68a'
+
+[keys]
+'alt+o' = 'profiles'
+'ctrl+n' = 'down'
+```
+
+Key overrides apply in navigation contexts. Action names include `down`, `up`, `first`, `last`, `focus_left`, `focus_right`, `search`, `help`, `back`, `refresh`, `save_roots`, `create_worktree`, `branches`, `launch`, `profiles`, `stage`, `unstage`, `commit`, `fetch`, `pull`, `push`, `remove_worktree`, `prs`, `review_diff`, `open_pr`, and `toggle_staged`.
+
+## Development and validation
+
+```text
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
+
+Integration tests use disposable real Git repositories and local bare remotes; they do not push to your projects. They cover non-HEAD worktree bases, publication/upstream setup, staging, rename handling, commits, fast-forward divergence, discovery, cleanup, configuration, input contexts, and rendering at multiple sizes.
+
+The CI workflow runs checks and builds native artifacts on Windows, Linux, and macOS. Local validation has been performed on Windows; live GitHub/Copilot authentication and other OS terminal emulators require testing in their respective environments. Tree Rail serializes mutations while allowing navigation, and reads status/diffs in background workers. File diffs display up to 20,000 lines.
+
+Product scope: [docs/product-spec.md](product-spec.md). Framework research: [docs/research/tui-frameworks.md](research/tui-frameworks.md).

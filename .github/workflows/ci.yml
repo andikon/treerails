@@ -1,0 +1,31 @@
+name: Validate and build
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            binary: target/release/treerail.exe
+          - os: ubuntu-latest
+            binary: target/release/treerail
+          - os: macos-latest
+            binary: target/release/treerail
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: treerail-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
