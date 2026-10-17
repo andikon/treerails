@@ -79,6 +79,7 @@ pub struct TerminalSnapshot {
 pub enum Response {
     Pong {
         version: u32,
+        instance: String,
     },
     Started {
         session: String,
@@ -93,6 +94,48 @@ pub struct Client {
     endpoint: String,
 }
 impl Client {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    pub fn for_config(config: &Path) -> Result<Self> {
+        Ok(Self::new(super::discovery::endpoint_for_config(config)?))
+    }
+    pub fn connect_or_launch(executable: &Path, config: &Path) -> Result<Self> {
+        let client = Self::for_config(config)?;
+        let _startup = super::discovery::startup_lock(&client.endpoint)?;
+        match client.execute(HostCommand::Ping) {
+            Ok(Response::Pong { version, .. }) => {
+                handshake(version)?;
+                return Ok(client);
+            }
+            Ok(_) => anyhow::bail!("Unexpected session host handshake"),
+            Err(error) if !format!("{error:#}").contains("Connect to local session host") => {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+        let mut child = Self::launch(executable, &client.endpoint)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match client.execute(HostCommand::Ping) {
+                Ok(Response::Pong { version, .. }) => {
+                    handshake(version)?;
+                    return Ok(client);
+                }
+                Ok(_) => anyhow::bail!("Unexpected session host handshake"),
+                Err(error) => {
+                    if let Some(status) = child.try_wait()? {
+                        anyhow::bail!("Session host exited during startup ({status}): {error:#}");
+                    }
+                    ensure!(
+                        std::time::Instant::now() < deadline,
+                        "Session host did not start: {error:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -170,13 +213,14 @@ impl Session {
 struct Host {
     sessions: BTreeMap<String, Session>,
     starts: BTreeMap<String, (String, Option<u32>)>,
-    next_id: u64,
+    instance: String,
 }
 impl Host {
     async fn execute(&mut self, command: HostCommand) -> Result<Response> {
         match command {
             HostCommand::Ping => Ok(Response::Pong {
                 version: PROTOCOL_VERSION,
+                instance: self.instance.clone(),
             }),
             HostCommand::Start {
                 request_id,
@@ -248,11 +292,7 @@ impl Host {
                         }
                     }
                 });
-                self.next_id = self
-                    .next_id
-                    .checked_add(1)
-                    .context("Host session identity exhausted")?;
-                let id = format!("session-{}", self.next_id);
+                let id = format!("session-{}", uuid::Uuid::new_v4());
                 let process_id = child.process_id();
                 self.sessions.insert(
                     id.clone(),
@@ -372,7 +412,11 @@ fn validate_size(rows: u16, cols: u16) -> Result<()> {
 
 /// Serve one bounded request per connection. Screen readers never depend on clients.
 pub async fn serve(endpoint: &str) -> Result<()> {
-    let mut host = Host::default();
+    let _lifetime = super::discovery::host_lock(endpoint)?;
+    let mut host = Host {
+        instance: uuid::Uuid::new_v4().to_string(),
+        ..Host::default()
+    };
     loop {
         let listener = ipc::Listener::bind(endpoint)?;
         let mut pipe = listener.accept()?;

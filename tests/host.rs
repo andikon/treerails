@@ -230,3 +230,103 @@ fn actual_host_retains_terminal_across_client_exit_and_enforces_takeover() {
         std::thread::yield_now();
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn concurrent_discovery_keeps_one_host_and_incompatible_clients_cannot_replace_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    let executable = Path::new(env!("CARGO_BIN_EXE_treerail-session-host"));
+    let results = std::thread::scope(|scope| {
+        let first = scope.spawn(|| Client::connect_or_launch(executable, &config).unwrap());
+        let second = scope.spawn(|| Client::connect_or_launch(executable, &config).unwrap());
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_eq!(results.0.endpoint(), results.1.endpoint());
+    let mut pipe = treerail::host::ipc::connect(results.0.endpoint()).unwrap();
+    write_frame(
+        &mut pipe,
+        &treerail::host::runtime::Request {
+            version: PROTOCOL_VERSION + 1,
+            command: HostCommand::StopHost,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, Response>(&mut pipe).unwrap(),
+        Response::Error(_)
+    ));
+    drop(pipe);
+    assert!(matches!(
+        execute(&results.1, || HostCommand::Ping),
+        Response::Pong { .. }
+    ));
+    execute(&results.0, || HostCommand::StopHost);
+}
+
+#[cfg(windows)]
+#[test]
+fn stopping_session_terminates_descendants_before_releasing_checkout() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::Threading::{OpenProcess, WaitForSingleObject},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init"]);
+    let endpoint = format!(
+        "descendants-{}-{}",
+        std::process::id(),
+        temp.path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "-")
+    );
+    let _host = HostGuard(
+        Client::launch(
+            Path::new(env!("CARGO_BIN_EXE_treerail-session-host")),
+            &endpoint,
+        )
+        .unwrap(),
+    );
+    let client = Client::new(&endpoint);
+    execute(&client, || HostCommand::Ping);
+    let script = "$p=Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; $p.Id | Set-Content descendant.pid; Start-Sleep -Seconds 60";
+    let id = match execute(&client, || HostCommand::Start {
+        request_id: "tree".into(),
+        checkout: temp.path().into(),
+        program: "powershell.exe".into(),
+        args: vec!["-NoProfile".into(), "-Command".into(), script.into()],
+        rows: 24,
+        cols: 80,
+    }) {
+        Response::Started { session, .. } => session,
+        value => panic!("{value:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let child_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(temp.path().join("descendant.pid"))
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "Descendant did not start");
+        std::thread::yield_now();
+    };
+    let handle = unsafe { OpenProcess(0x00100000, 0, child_pid) };
+    assert!(!handle.is_null());
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    execute(&client, || HostCommand::Stop {
+        session: id.clone(),
+    });
+    assert_eq!(
+        unsafe { WaitForSingleObject(handle.as_raw_handle(), 5000) },
+        WAIT_OBJECT_0
+    );
+    let _lease = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(treerail::host::CheckoutLease::acquire(temp.path()))
+        .unwrap();
+    execute(&client, || HostCommand::StopHost);
+}

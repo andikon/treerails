@@ -33,6 +33,67 @@ mod platform {
             .chain(Some(0))
             .collect())
     }
+    pub struct Pipe {
+        file: File,
+        deadline: std::time::Instant,
+    }
+    impl Pipe {
+        fn new(file: File) -> Result<Self> {
+            use std::os::windows::io::AsRawHandle;
+            let mode = windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
+            ensure!(
+                unsafe {
+                    windows_sys::Win32::System::Pipes::SetNamedPipeHandleState(
+                        file.as_raw_handle(),
+                        &mode,
+                        ptr::null(),
+                        ptr::null(),
+                    )
+                } != 0,
+                "Configure bounded local pipe: {}",
+                std::io::Error::last_os_error()
+            );
+            Ok(Self {
+                file,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            })
+        }
+        fn retry<T>(
+            &mut self,
+            mut operation: impl FnMut(&mut File) -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            loop {
+                match operation(&mut self.file) {
+                    Err(error) if error.raw_os_error() == Some(232) => {
+                        if std::time::Instant::now() >= self.deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Local host connection exceeded deadline",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+    impl std::io::Read for Pipe {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.retry(|file| match std::io::Read::read(file, buffer) {
+                Ok(0) if !buffer.is_empty() => Err(std::io::Error::from_raw_os_error(232)),
+                result => result,
+            })
+        }
+    }
+    impl std::io::Write for Pipe {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.retry(|file| std::io::Write::write(file, buffer))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     pub struct Listener {
         pipe: File,
     }
@@ -79,7 +140,7 @@ mod platform {
                 })
             }
         }
-        pub fn accept(self) -> Result<File> {
+        pub fn accept(self) -> Result<Pipe> {
             use std::os::windows::io::AsRawHandle;
             let connected = unsafe { ConnectNamedPipe(self.pipe.as_raw_handle(), ptr::null_mut()) };
             if connected == 0 {
@@ -90,10 +151,10 @@ mod platform {
                     std::io::Error::last_os_error()
                 );
             }
-            Ok(self.pipe)
+            Pipe::new(self.pipe)
         }
     }
-    pub fn connect(endpoint: &str) -> Result<File> {
+    pub fn connect(endpoint: &str) -> Result<Pipe> {
         let name = name(endpoint)?;
         let path = String::from_utf16(&name[..name.len() - 1])?;
         OpenOptions::new()
@@ -101,6 +162,7 @@ mod platform {
             .write(true)
             .open(path)
             .context("Connect to local session host")
+            .and_then(Pipe::new)
     }
 }
 #[cfg(unix)]
