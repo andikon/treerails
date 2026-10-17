@@ -145,6 +145,17 @@ mod platform {
             }
         }
     }
+    #[cfg(test)]
+    pub fn current_process() -> Result<ClientProcess> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        let handle = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(0x00100000, 0, std::process::id())
+        };
+        ensure!(!handle.is_null(), "Observe test UI process");
+        Ok(ClientProcess(unsafe {
+            OwnedHandle::from_raw_handle(handle)
+        }))
+    }
     pub fn client_process(pipe: &Pipe) -> Result<Option<ClientProcess>> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         unsafe {

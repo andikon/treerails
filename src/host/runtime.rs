@@ -308,6 +308,8 @@ pub(crate) struct Host {
     endpoint: String,
     launch_context: Option<LaunchContext>,
     caller: Option<ipc::ClientProcess>,
+    #[cfg(test)]
+    launcher: Option<PathBuf>,
     notifications: crate::notifications::Notifications,
     delivery_tx: Option<tokio::sync::mpsc::Sender<crate::notifications::Notice>>,
     delivery_rx: Option<tokio::sync::mpsc::Receiver<(String, Option<String>)>>,
@@ -578,7 +580,10 @@ impl Host {
                     pixel_width: 0,
                     pixel_height: 0,
                 })?;
-                let mut builder = CommandBuilder::new(std::env::current_exe()?);
+                let launcher = std::env::current_exe()?;
+                #[cfg(test)]
+                let launcher = self.launcher.clone().unwrap_or(launcher);
+                let mut builder = CommandBuilder::new(launcher);
                 builder.arg("--managed-child");
                 builder.arg(program);
                 builder.args(args);
@@ -1003,5 +1008,217 @@ pub async fn serve(endpoint: &str) -> Result<()> {
                 if stop{let _=transport_thread.join();return Ok(());}
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod notification_pipeline_tests {
+    use super::*;
+    use crate::{
+        copilot::{AttentionState, Observation},
+        notifications::Kind,
+    };
+
+    // A real child launcher at the process dependency boundary. The production
+    // Start command still acquires the checkout and assigns its execution job.
+    fn controlled_launcher(directory: &Path) -> PathBuf {
+        let source = directory.join("launcher.rs");
+        let executable = directory.join("launcher.exe");
+        let launcher_source = r#"
+fn main() {
+    let mut args=std::env::args_os().skip(1);
+    assert_eq!(args.next().unwrap(),"--managed-child");
+    let mut line=String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    assert_eq!(line.trim(),"treerail-start");
+    let status=std::process::Command::new(args.next().unwrap()).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}
+"#;
+        std::fs::write(&source, launcher_source).unwrap();
+        let output =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("--edition=2024")
+                .arg("--crate-name=treerail_test_launcher")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        executable
+    }
+    async fn observe(
+        host: &mut Host,
+        session: &str,
+        provider: &str,
+        sequence: u64,
+        kind: &str,
+        request: Option<&str>,
+    ) -> Result<Response> {
+        host.execute(HostCommand::Observe {
+            session: session.into(),
+            token: "fixture-token".into(),
+            observation: Observation {
+                session_id: provider.into(),
+                sequence,
+                kind: kind.into(),
+                request_id: request.map(str::to_owned),
+                cwd: None,
+            },
+        })
+        .await
+    }
+    #[tokio::test]
+    async fn notifications_follow_native_host_events_without_ui_replay_or_delivery_health_changes()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        crate::git::run(temp.path(), ["init"]).await.unwrap();
+        let mut host = Host {
+            instance: uuid::Uuid::new_v4().to_string(),
+            launcher: Some(controlled_launcher(temp.path())),
+            ..Host::default()
+        };
+        let session = match host
+            .execute(HostCommand::Start {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                checkout: temp.path().into(),
+                program: "cmd.exe".into(),
+                args: vec!["/D".into(), "/Q".into()],
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap()
+        {
+            Response::Started { session, .. } => session,
+            value => panic!("{value:?}"),
+        };
+        let provider = uuid::Uuid::new_v4().to_string();
+        host.sessions.get_mut(&session).unwrap().provider = Some(Provider {
+            checkout: std::fs::canonicalize(temp.path()).unwrap(),
+            session_id: provider.clone(),
+            token: "fixture-token".into(),
+            sequence: 0,
+            last_seen: std::time::Instant::now(),
+            valid: true,
+            attention: crate::copilot::Attention::default(),
+        });
+        host.execute(HostCommand::ConfigureSession {
+            session: session.clone(),
+            ticket: "example/repo#1".into(),
+            desktop_notifications: true,
+        })
+        .await
+        .unwrap();
+        let (delivery, mut notices) = tokio::sync::mpsc::channel(16);
+        host.delivery_tx = Some(delivery);
+        observe(&mut host, &session, &provider, 1, "bridge.connected", None)
+            .await
+            .unwrap();
+        host.maintain().await;
+        observe(
+            &mut host,
+            &session,
+            &provider,
+            2,
+            "assistant.turn_start",
+            None,
+        )
+        .await
+        .unwrap();
+        host.maintain().await;
+        assert!(notices.try_recv().is_err());
+        observe(
+            &mut host,
+            &session,
+            &provider,
+            3,
+            "permission.requested",
+            Some("permission-1"),
+        )
+        .await
+        .unwrap();
+        host.maintain().await;
+        assert_eq!(notices.try_recv().unwrap().kind, Kind::NeedsInput);
+        host.maintain().await;
+        assert!(notices.try_recv().is_err());
+        host.caller = Some(ipc::current_process().unwrap());
+        let token = match host
+            .execute(HostCommand::Attach {
+                session: session.clone(),
+                client: "ui".into(),
+                takeover: false,
+            })
+            .await
+            .unwrap()
+        {
+            Response::Terminal(state) => state.input_token.unwrap(),
+            value => panic!("{value:?}"),
+        };
+        host.execute(HostCommand::Detach {
+            session: session.clone(),
+            client: "ui".into(),
+            token,
+        })
+        .await
+        .unwrap();
+        host.caller = None;
+        host.maintain().await;
+        assert!(
+            notices.try_recv().is_err(),
+            "Reattachment must not replay the pending notice"
+        );
+        observe(
+            &mut host,
+            &session,
+            &provider,
+            4,
+            "permission.completed",
+            Some("permission-1"),
+        )
+        .await
+        .unwrap();
+        host.maintain().await;
+        observe(&mut host, &session, &provider, 5, "session.idle", None)
+            .await
+            .unwrap();
+        host.maintain().await;
+        assert!(
+            notices.try_recv().is_err(),
+            "Running and Ready remain quiet"
+        );
+        let (results, receiver) = tokio::sync::mpsc::channel(1);
+        host.delivery_rx = Some(receiver);
+        results
+            .send((session.clone(), Some("Desktop delivery unavailable".into())))
+            .await
+            .unwrap();
+        host.maintain().await;
+        let live = &host.sessions[&session];
+        let state = &live.provider.as_ref().unwrap().attention;
+        assert!(state.healthy);
+        assert_eq!(state.value, Some(AttentionState::Ready));
+        assert_eq!(
+            live.notification_error.as_deref(),
+            Some("Desktop delivery unavailable")
+        );
+        assert!(
+            observe(&mut host, &session, &provider, 9, "session.idle", None)
+                .await
+                .is_err()
+        );
+        host.maintain().await;
+        assert_eq!(notices.try_recv().unwrap().kind, Kind::Failure);
+        host.maintain().await;
+        assert!(
+            notices.try_recv().is_err(),
+            "Unchanged health failure must not repeat"
+        );
+        host.execute(HostCommand::Stop { session }).await.unwrap();
     }
 }
