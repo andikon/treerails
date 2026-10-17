@@ -41,6 +41,14 @@ pub struct SessionRecord {
     pub pending_start: Option<PendingStart>,
     #[serde(default)]
     pub execution_group: Option<String>,
+    #[serde(default)]
+    pub start_intent: Option<StartIntent>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartIntent {
+    pub handoff: String,
+    pub rows: u16,
+    pub cols: u16,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingStart {
@@ -279,7 +287,7 @@ fn has_owner(
             Some(record.id.as_str()) != except
                 && matches!(
                     record.health,
-                    Health::Live | Health::Starting | Health::Interrupted
+                    Health::Live | Health::Starting | Health::Interrupted | Health::Failed
                 )
                 && (record.ticket == ticket
                     || record
@@ -351,6 +359,15 @@ async fn execute_with(
                     record.ticket == ticket && record.task == task,
                     "Start request UUID was reused for a different target"
                 );
+                ensure!(
+                    record.start_intent.as_ref()
+                        == Some(&StartIntent {
+                            handoff: handoff.clone(),
+                            rows,
+                            cols
+                        }),
+                    "Start request UUID was reused with different parameters; retry the original request or Continue the recorded conversation"
+                );
                 if let Some(expected) = expected_brief {
                     ensure!(
                         expected == record.starting_brief,
@@ -379,6 +396,7 @@ async fn execute_with(
                     host_instance: Some(host_instance.clone()), branch: Some(checkout.branch.clone()),
                     pending_start: Some(PendingStart {request_id: id.clone(),host_instance:host_instance.clone(),resume:false,rows,cols}),
                     execution_group: execution_group.clone(),
+                    start_intent:Some(StartIntent{handoff:handoff.clone(),rows,cols}),
                 };
                 state.sessions.insert(record.id.clone(), record.clone()); choose(state, &record.id)
             })?;
@@ -672,7 +690,7 @@ async fn refresh_health(
     for record in snapshot.sessions.values().filter(|record| {
         matches!(
             record.health,
-            Health::Starting | Health::Live | Health::Interrupted
+            Health::Starting | Health::Live | Health::Interrupted | Health::Failed
         )
     }) {
         if record.host_instance.as_deref() != Some(&active) {
@@ -737,7 +755,7 @@ async fn reconcile(
         .get(session)
         .context("Unknown recorded conversation")?
         .clone();
-    if matches!(record.health, Health::Stopped | Health::Failed) && record.pending_start.is_none() {
+    if record.health == Health::Stopped && record.pending_start.is_none() {
         return Ok(Event::State(state));
     }
     verify_checkout(&state, &record).await?;
@@ -760,7 +778,7 @@ async fn reconcile(
                 Response::NotStarted { request_id } if request_id == pending.request_id => {
                     // Authoritative host has no accepted operation and no checkout lease remains.
                     let _lease = crate::host::CheckoutLease::acquire(&record.checkout).await?;
-                    workflow.update(|state| {let record=state.sessions.get_mut(session).context("Unknown session")?;record.health=Health::Failed;record.host_session=None;record.pending_start=None;record.error=Some("The saved start request was not accepted; choose Start new session explicitly.".into());Ok(())})?;
+                    workflow.update(|state| {let record=state.sessions.get_mut(session).context("Unknown session")?;record.health=Health::Stopped;record.host_session=None;record.pending_start=None;record.error=Some("The saved start request was not accepted; choose Start new session explicitly.".into());Ok(())})?;
                     return Ok(Event::State(workflow.snapshot()?));
                 }
                 Response::Ended { session: id } => {
@@ -1635,7 +1653,7 @@ mod tests {
         .await
         .unwrap();
         let current = f.state().sessions[&owner.id].clone();
-        assert_eq!(current.health, Health::Failed);
+        assert_eq!(current.health, Health::Stopped);
         assert!(current.pending_start.is_none());
         assert_eq!(f.runtime.launches.len(), 1);
     }
@@ -1659,6 +1677,38 @@ mod tests {
             panic!()
         };
         assert!(reconnected.error.is_none());
+        assert_eq!(f.runtime.launches.len(), 1);
+    }
+    #[tokio::test]
+    async fn retry_identity_rejects_changed_handoff_or_terminal_intent() {
+        let mut f = Fixture::new();
+        let request_id = crate::copilot::new_session_id();
+        f.command(Command::StartRequest {
+            request_id: request_id.clone(),
+            ticket: "owner/repo#1".into(),
+            task: "implementation".into(),
+            handoff: "original".into(),
+            rows: 30,
+            cols: 100,
+            expected_brief: None,
+        })
+        .await
+        .unwrap();
+        for (handoff, rows) in [("changed", 30), ("original", 31)] {
+            assert!(
+                f.command(Command::StartRequest {
+                    request_id: request_id.clone(),
+                    ticket: "owner/repo#1".into(),
+                    task: "implementation".into(),
+                    handoff: handoff.into(),
+                    rows,
+                    cols: 100,
+                    expected_brief: None
+                })
+                .await
+                .is_err()
+            );
+        }
         assert_eq!(f.runtime.launches.len(), 1);
     }
 }
