@@ -94,6 +94,8 @@ fn session(ticket: &workflow::TicketRecord, health: Health) -> SessionRecord {
         starting_brief: "Original immutable brief".into(),
         created_at: 10,
         host_session: Some("runtime-id".into()),
+        host_instance: None,
+        branch: None,
         health,
         current: true,
         error: None,

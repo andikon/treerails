@@ -810,6 +810,7 @@ mod tests {
                             reviewed_issue: None,
                             github_error: None,
                             last_attempt_at: None,
+                            checkout_removed_at: None,
                             tasks: vec![
                                 workflow::Task {
                                     id: "implementation".into(),

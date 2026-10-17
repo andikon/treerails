@@ -137,6 +137,7 @@ impl InputControl {
 }
 
 pub mod discovery;
+pub mod entry;
 mod execution;
 pub mod ipc;
 pub mod runtime;
