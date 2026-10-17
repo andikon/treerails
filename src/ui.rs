@@ -186,6 +186,7 @@ fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
         crate::settings::Section::Sources,
         crate::settings::Section::Worktrees,
         crate::settings::Section::Profiles,
+        crate::settings::Section::Notifications,
     ];
     frame.render_widget(
         Paragraph::new(Line::from(

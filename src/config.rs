@@ -13,6 +13,7 @@ use std::{
 pub struct Config {
     pub project_roots: Vec<PathBuf>,
     pub recursive: bool,
+    pub desktop_notifications: bool,
     pub default_profile: String,
     pub worktrees: WorktreeConfig,
     pub profiles: BTreeMap<String, Profile>,
@@ -91,6 +92,7 @@ impl Default for Config {
         Self {
             project_roots: vec![],
             recursive: false,
+            desktop_notifications: false,
             default_profile: "copilot".into(),
             worktrees: WorktreeConfig::default(),
             profiles: BTreeMap::from([
