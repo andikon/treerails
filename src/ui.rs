@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
+mod hosted_view;
 
 fn color(value: &str, fallback: Color) -> Color {
     value.parse().unwrap_or(fallback)
@@ -90,6 +91,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             ),
         );
     }
+    if app.latest_operation.is_none() {
+        hosted_view::attention(
+            frame,
+            app,
+            Rect::new(rows[0].x, rows[0].y.saturating_add(1), rows[0].width, 1),
+        );
+    }
     if app.settings_open {
         settings_view(frame, app, rows[1]);
     } else if app.project.is_none() {
@@ -124,11 +132,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     {
         " Tab next field · Ctrl+u clear · Enter accept · Ctrl+s apply · Esc explorer (keeps draft) "
     } else if app.settings_open {
-        " 1/2/3 sections · h/l switch · a add · Enter edit · Ctrl+s apply · i output · H history · Esc explorer · D discard "
+        " 1/2/3/4 sections · h/l switch · Enter edit · Ctrl+s apply · Esc explorer · D discard "
     } else if app.project.is_none() {
         " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
     } else if app.ticket_mode {
-        " j/k select · Enter open/select · c create · a adopt · i import · p progress · w basic · R refresh · v requirements · Esc back "
+        " s Continue · n new session · Enter input · x stop · d detach · ! takeover · g conversations · c create · a adopt · w basic · Esc back "
     } else {
         " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
@@ -151,6 +159,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         };
         modal_view(frame, app, modal, area);
     }
+    hosted_view::dialog(frame, app, area);
 }
 fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
     let Some(draft) = &app.settings else {
@@ -712,6 +721,14 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
 }
 
 fn tickets(frame: &mut Frame, app: &App, area: Rect) {
+    let area = if app.hosted.terminal.is_some() {
+        let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(area);
+        hosted_view::terminal(frame, app, panes[1]);
+        panes[0]
+    } else {
+        area
+    };
     if let Some(ticket) = &app.ticket {
         let rows = Layout::vertical([
             Constraint::Length(6),

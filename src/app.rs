@@ -7,6 +7,7 @@ use crate::{
     settings::{self, Draft},
     workflow::{self, Command as WorkflowCommand, Event as WorkflowEvent, TicketRecord},
 };
+pub mod hosted_ui;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -38,6 +39,7 @@ pub enum Operation {
 }
 #[derive(Debug)]
 pub enum Job {
+    Host(PathBuf, crate::host::runtime::HostCommand),
     Workflow(PathBuf, PathBuf, WorkflowCommand),
     Discover(Vec<PathBuf>, bool),
     Trees(PathBuf),
@@ -57,6 +59,7 @@ pub enum Job {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
+    Host(crate::host::runtime::Response),
     Workflow(WorkflowEvent),
     Projects(Vec<Project>, Vec<String>),
     Trees(PathBuf, Vec<Worktree>, String),
@@ -74,6 +77,7 @@ pub struct Completion {
 impl Job {
     pub fn token(&self) -> String {
         match self {
+            Self::Host(..) => "host".into(),
             Self::Workflow(..) => "workflow".into(),
             Self::Status(p) => format!("status:{}", p.display()),
             Self::Diff(p, f, s) => diff_key(p, &f.path, *s),
@@ -97,6 +101,9 @@ impl Job {
     }
     pub async fn execute(self) -> Result<Payload> {
         match self {
+            Self::Host(config, command) => {
+                Ok(Payload::Host(hosted_ui::request(config, command).await?))
+            }
             Self::Workflow(config, project, command) => Ok(Payload::Workflow(
                 workflow::Workflow::new(config)
                     .execute(&project, command)
@@ -287,6 +294,7 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub hosted: hosted_ui::HostedUi,
     pub ticket_mode: bool,
     pub issues: Vec<workflow::Issue>,
     pub issue_cursor: usize,
@@ -367,6 +375,7 @@ impl App {
             .cloned()
             .collect();
         Self {
+            hosted: hosted_ui::HostedUi::default(),
             ticket_mode: true,
             issues: vec![],
             issue_cursor: 0,
@@ -670,11 +679,20 @@ impl App {
             self.refresh_operation_picker();
             self.busy = false;
             self.epoch += 1;
-        } else if done.epoch != self.epoch {
+        } else if done.epoch != self.epoch && done.token != "host" {
             return;
         }
         match done.result {
+            Ok(Payload::Host(response)) => self.accept_host(response),
             Err(error) => {
+                if done.token == "host" {
+                    self.hosted.input = false;
+                    if let Some(snapshot) = &mut self.hosted.terminal {
+                        snapshot
+                            .attention
+                            .unavailable(format!("Host request failed: {error:#}"));
+                    }
+                }
                 self.say(format!("{error:#}"), true);
                 if operation && let Some(form) = self.recover_form.take() {
                     if self.modal.is_none() {
@@ -932,6 +950,7 @@ impl App {
         }
     }
     pub fn tick(&mut self) {
+        self.hosted_tick();
         if self
             .prefix
             .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
@@ -1075,6 +1094,9 @@ impl App {
     }
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.hosted_key(key) {
             return;
         }
         let repeating = key.kind == KeyEventKind::Repeat;
@@ -1909,6 +1931,9 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.hosted_paste(text) {
+            return;
+        }
         if self.settings_open {
             if let Some(draft) = &mut self.settings {
                 draft.paste(text);
@@ -2094,6 +2119,13 @@ impl App {
             return false;
         }
         match key.code {
+            KeyCode::Char('s') => self.begin_agent(false),
+            KeyCode::Char('n') => self.begin_agent(true),
+            KeyCode::Char('x') => self.stop_agent_dialog(),
+            KeyCode::Char('X') => self.hosted.dialog = Some(hosted_ui::Dialog::StopHost),
+            KeyCode::Char('d') => self.detach_agent(),
+            KeyCode::Char('!') => self.hosted.dialog = Some(hosted_ui::Dialog::Takeover),
+            KeyCode::Char('g') => self.show_sessions(),
             KeyCode::Char('w') => {
                 self.ticket_mode = false;
                 self.say("Basic worktrees · T tickets", false);
@@ -2120,6 +2152,21 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                if self.hosted.terminal.is_some()
+                    && self.hosted.token.is_some()
+                    && self.hosted.record.as_ref().is_some_and(|record| {
+                        self.ticket.as_ref().is_some_and(|ticket| {
+                            ticket.id() == record.ticket
+                                && ticket
+                                    .tasks
+                                    .get(self.task_cursor)
+                                    .is_some_and(|task| task.id == record.task)
+                        })
+                    })
+                {
+                    self.hosted.input = true;
+                    return true;
+                }
                 if let Some(ticket) = &self.ticket {
                     if let Some(task) = ticket.tasks.get(self.task_cursor) {
                         self.workflow_command(WorkflowCommand::SelectTask {
@@ -2263,6 +2310,16 @@ impl App {
         self.modal = Some(Modal::Requirements(review));
     }
     pub fn save(&mut self) -> Result<()> {
+        if let (Some(snapshot), Some(token)) = (&self.hosted.terminal, self.hosted.token) {
+            // Detach relinquishes keyboard control; it never stops the process.
+            if let Ok(client) = crate::host::runtime::Client::for_config(&self.config_path) {
+                let _ = client.execute(crate::host::runtime::HostCommand::Detach {
+                    session: snapshot.session.clone(),
+                    client: self.hosted.client.clone(),
+                    token,
+                });
+            }
+        }
         self.state
             .save(&self.config_path)
             .context("Save remembered selections")
