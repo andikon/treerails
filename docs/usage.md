@@ -84,6 +84,7 @@ supported. Tests and version-specific evidence are in
 | `X` | Stop the host after stopping its sessions |
 | `!` | Explicitly take terminal input control from another UI |
 | `r` | Reconcile an interrupted recorded session; no automatic agent restart |
+| `u` | Review and retry an unresolved launch using its original request UUID |
 | `R` / `v` | Refresh GitHub requirements / inspect and explicitly apply revisions |
 | `D` | Preview optional cleanup, protections and unpublished commits |
 | `E` | Inspect host and notification diagnostics |

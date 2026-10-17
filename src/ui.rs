@@ -136,7 +136,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.project.is_none() {
         " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
     } else if app.ticket_mode {
-        " s Continue · n new · Enter input · x stop · d detach · ! takeover · g conversations · c create · a adopt · D cleanup · w basic · Esc back "
+        " s Continue · n new · Enter input · b handover · r reconcile · u retry · x stop · d detach · g sessions · E errors · D cleanup · w basic "
     } else {
         " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };

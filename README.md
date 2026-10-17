@@ -82,6 +82,9 @@ recorded UUID, without replaying the starting brief. `g` lists retained
 conversations. `x` explicitly stops a session, while `X` stops an empty host.
 `!` explicitly takes terminal control from another UI. A waiting agent still owns
 its checkout; handover and cleanup require a verified stop.
+Use `b` for an inspected handover, `r` to reconcile an interrupted session, and `u`
+to review/retry an unresolved launch using its original request identity. `E` opens
+full host and notification diagnostics.
 
 Running, Needs input and Ready describe agent attention, independently of manual
 task progress. Other hosted tickets remain visible while you type. Lost status

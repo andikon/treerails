@@ -28,7 +28,6 @@ fn app() -> App {
     app.hosted.terminal = Some(TerminalSnapshot {
         session: "host-session-1".into(),
         process_id: Some(1),
-        execution_group: None,
         rows: 15,
         cols: 70,
         formatted: b"\x1b[?2004h\x1b[32mNative permission prompt\x1b[0m".to_vec(),
