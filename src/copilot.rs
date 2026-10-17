@@ -2,10 +2,55 @@
 //! Terminal output, process lifetime and task progress are deliberately not attention sources.
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 pub const EXTENSION_SOURCE: &str = include_str!("copilot/extension.mjs");
 pub const TESTED_COPILOT_VERSION: &str = "1.0.94";
+
+/// Install only the observer's own entrypoint outside managed Git checkouts.
+/// Other Copilot sessions discover it too, but it exits immediately without host context.
+/// Refuse collisions and user modifications; an upgrade must reconcile them explicitly.
+pub fn install_observer(copilot_home: &Path) -> Result<PathBuf> {
+    let directory = copilot_home
+        .join("extensions")
+        .join("treerail-session-host");
+    if let Ok(metadata) = fs::symlink_metadata(&directory)
+        && metadata.file_type().is_symlink()
+    {
+        bail!("Observer directory is a symlink; refusing installation");
+    }
+    fs::create_dir_all(&directory)?;
+    let entry = directory.join("extension.mjs");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&entry)
+    {
+        Ok(mut file) => {
+            file.write_all(EXTENSION_SOURCE.as_bytes())?;
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&entry)?;
+            if !metadata.file_type().is_file()
+                || metadata.len() != EXTENSION_SOURCE.len() as u64
+                || fs::read(&entry)? != EXTENSION_SOURCE.as_bytes()
+            {
+                bail!(
+                    "Copilot observer already exists with different contents: {}. Preserve or move that file before retrying",
+                    entry.display()
+                );
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(entry)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttentionState {
@@ -205,5 +250,14 @@ mod tests {
         state.observe("elicitation.requested", Some("question"));
         let encoded = serde_json::to_string(&state).unwrap();
         assert_eq!(state, serde_json::from_str(&encoded).unwrap());
+    }
+    #[test]
+    fn install_reuses_identical_and_preserves_existing_user_files() {
+        let home = tempfile::tempdir().unwrap();
+        let entry = install_observer(home.path()).unwrap();
+        assert_eq!(install_observer(home.path()).unwrap(), entry);
+        fs::write(&entry, "user edits").unwrap();
+        assert!(install_observer(home.path()).is_err());
+        assert_eq!(fs::read_to_string(entry).unwrap(), "user edits");
     }
 }

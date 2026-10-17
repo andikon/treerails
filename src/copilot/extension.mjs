@@ -7,6 +7,7 @@ const endpoint = process.env.TREERAIL_HOST_ENDPOINT;
 const localSession = process.env.TREERAIL_HOST_SESSION;
 const token = process.env.TREERAIL_HOST_TOKEN;
 const expected = process.env.TREERAIL_COPILOT_SESSION;
+if (![endpoint, localSession, token, expected].some(Boolean)) process.exit(0);
 if (!endpoint || !localSession || !token || !expected) throw new Error("Missing Tree Rail host context");
 if (!/^[a-zA-Z0-9-]{1,100}$/.test(endpoint)) throw new Error("Invalid host endpoint");
 const pipePath = process.platform === "win32"
