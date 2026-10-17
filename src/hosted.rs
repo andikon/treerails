@@ -237,6 +237,62 @@ fn choose(state: &mut workflow::WorkflowState, session: &str) -> Result<SessionR
         .selected_task = Some(chosen.task.clone());
     Ok(state.sessions.get(session).unwrap().clone())
 }
+/// Validate the physical checkout rather than trusting its remembered path/label.
+async fn verify_ticket_checkout(ticket: &TicketRecord) -> Result<workflow::Checkout> {
+    let checkout = ticket
+        .worktree
+        .as_ref()
+        .context("Prepare or adopt this ticket's checkout first")?;
+    let canonical = checkout
+        .path
+        .canonicalize()
+        .context("Ticket checkout is missing")?;
+    let registered = crate::git::worktrees(&ticket.project)
+        .await?
+        .into_iter()
+        .find(|candidate| crate::config::same_path(&candidate.path, &canonical))
+        .context("Ticket checkout is no longer a registered worktree of its project")?;
+    ensure!(
+        !registered.prunable && registered.original == checkout.original,
+        "Ticket worktree registration changed; reconcile its association before starting"
+    );
+    let common = |path: PathBuf| async move {
+        let directory = crate::git::text(
+            &path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?;
+        std::fs::canonicalize(directory.trim()).context("Resolve physical project identity")
+    };
+    ensure!(
+        common(ticket.project.clone()).await? == common(canonical.clone()).await?,
+        "Checkout path now belongs to another Git project; reconcile its association"
+    );
+    let actual = crate::git::text(&canonical, &["branch", "--show-current"]).await?;
+    let actual = if actual.trim().is_empty() {
+        "(detached)"
+    } else {
+        actual.trim()
+    };
+    ensure!(
+        actual == checkout.branch && registered.branch == checkout.branch,
+        "Git checkout branch changed after ticket preparation; review and reconcile it before starting"
+    );
+    let claim = workflow::claim_path(&canonical).await?;
+    let file = std::fs::File::open(&claim)
+        .context("Physical ticket association is missing; prepare or adopt the checkout again")?;
+    ensure!(
+        file.metadata()?.len() <= 4096,
+        "Physical ticket association exceeds its supported size"
+    );
+    let mut owner = String::new();
+    file.take(4097).read_to_string(&mut owner)?;
+    ensure!(
+        owner == ticket.id(),
+        "Physical checkout association belongs to another ticket; reconcile it before starting"
+    );
+    Ok(checkout.clone())
+}
 async fn verify_checkout(state: &workflow::WorkflowState, record: &SessionRecord) -> Result<()> {
     let ticket = state
         .tickets
@@ -246,10 +302,7 @@ async fn verify_checkout(state: &workflow::WorkflowState, record: &SessionRecord
         ticket.tasks.iter().any(|task| task.id == record.task),
         "Recorded task is missing; reconcile it first"
     );
-    let checkout = ticket
-        .worktree
-        .as_ref()
-        .context("Ticket worktree is no longer associated")?;
+    let checkout = verify_ticket_checkout(ticket).await?;
     ensure!(
         record
             .checkout
@@ -265,11 +318,6 @@ async fn verify_checkout(state: &workflow::WorkflowState, record: &SessionRecord
         ensure!(
             branch == &checkout.branch,
             "Ticket branch differs from this conversation's recorded branch"
-        );
-        let actual = crate::git::run(&record.checkout, ["branch", "--show-current"]).await?;
-        ensure!(
-            String::from_utf8(actual)?.trim() == branch,
-            "Git checkout branch changed outside this conversation; reconcile it before continuing"
         );
     }
     Ok(())
@@ -379,10 +427,15 @@ async fn execute_with(
                 }
                 return reconcile(runtime, &workflow, &record.id).await;
             }
+            let before = workflow.snapshot()?;
+            let ticket_before = before.tickets.get(&ticket).context("Unknown ticket")?;
+            let verified_checkout = verify_ticket_checkout(ticket_before).await?;
+            let verified_project = ticket_before.project.clone();
             let host_instance = instance(runtime).await?;
             let execution_group = runtime.execution_identity(&host_instance, &request_id)?;
             let record = workflow.update(|state| {
                 let ticket_record = state.tickets.get(&ticket).context("Unknown ticket")?;
+                ensure!(ticket_record.worktree.as_ref()==Some(&verified_checkout) && ticket_record.project==verified_project,"Ticket checkout association changed during verification; review it before starting");
                 let brief = starting_brief(ticket_record, &task, &handoff)?;
                 if let Some(expected) = &expected_brief { ensure!(expected == &brief, "Issue, task or workspace changed after brief review; inspect it again before starting"); }
                 ensure!(brief.len() <= 48 * 1024, "Starting brief exceeds the hosted limit; refine the ticket before starting");
@@ -587,6 +640,7 @@ async fn execute_with(
                 "Handover must remain inside this ticket"
             );
             let target = state.tickets.get(&ticket).context("Unknown ticket")?;
+            verify_ticket_checkout(target).await?;
             let brief = starting_brief(target, &task, &handoff)?;
             if let Some(expected) = &expected_brief {
                 ensure!(
@@ -1165,7 +1219,7 @@ mod tests {
         runtime: Runtime,
     }
     impl Fixture {
-        fn new() -> Self {
+        async fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let checkout = temp.path().join("checkout");
             std::fs::create_dir(&checkout).unwrap();
@@ -1187,11 +1241,23 @@ mod tests {
                         serde_json::from_value(serde_json::json!({
                             "repository":"owner/repo","project":checkout,"issue":{"number":1,"title":"Deliver feature","body":"Acceptance criteria remain issue requirements","state":"OPEN","url":"https://github.com/owner/repo/issues/1"},
                             "fetched_at":1,"tasks":[{"id":"implementation","title":"Implement","progress":"in_progress"},{"id":"review","title":"Review","progress":"pending"}],
-                            "next_task_id":2,"selected_task":"implementation","worktree":{"path":checkout,"branch":"feature","original":false}
+                            "next_task_id":2,"selected_task":"implementation","worktree":null
                         })).unwrap(),
                     );
                     Ok(())
                 })
+                .unwrap();
+            workflow
+                .execute(
+                    &checkout,
+                    workflow::Command::Prepare {
+                        ticket: "owner/repo#1".into(),
+                        preparation: workflow::Preparation::Adopt {
+                            path: checkout.clone(),
+                        },
+                    },
+                )
+                .await
                 .unwrap();
             let runtime = Runtime {
                 home: temp.path().join("copilot"),
@@ -1235,7 +1301,7 @@ mod tests {
     }
     #[tokio::test]
     async fn implementation_handover_review_and_exact_resume_preserve_conversations() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let implementation = f.start("implementation").await;
         let live = f
             .command(Command::Continue {
@@ -1297,7 +1363,7 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_stop_cannot_hand_over_or_replace_waiting_owner() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.runtime.fail_stop = true;
         assert!(
@@ -1331,7 +1397,7 @@ mod tests {
     }
     #[tokio::test]
     async fn ended_terminal_becomes_stopped_before_resuming_and_never_replays_brief() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.runtime
             .terminals
@@ -1356,7 +1422,7 @@ mod tests {
     }
     #[tokio::test]
     async fn missing_provider_history_requires_explicit_new_session_and_keeps_old_brief() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.command(Command::Stop {
             session: owner.id.clone(),
@@ -1401,7 +1467,7 @@ mod tests {
     }
     #[tokio::test]
     async fn mismatched_provider_identity_and_checkout_do_not_move_or_release_ownership() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.runtime
             .terminals
@@ -1452,7 +1518,7 @@ mod tests {
     }
     #[tokio::test]
     async fn successful_start_reply_loss_discovers_exact_operation_without_another_launch() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let request_id = crate::copilot::new_session_id();
         let brief = starting_brief(
             &f.state().tickets["owner/repo#1"],
@@ -1500,7 +1566,7 @@ mod tests {
     }
     #[tokio::test]
     async fn approved_brief_drift_is_rejected_before_start_or_stopping_an_owner() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let brief = starting_brief(
             &f.state().tickets["owner/repo#1"],
             "implementation",
@@ -1548,7 +1614,7 @@ mod tests {
     }
     #[tokio::test]
     async fn changed_host_stays_interrupted_until_execution_barrier_and_explicit_resume() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.runtime.instance = "host-two".into();
         f.runtime.terminals.clear();
@@ -1602,7 +1668,7 @@ mod tests {
     }
     #[tokio::test]
     async fn missing_execution_identity_is_never_replaced_by_a_free_lease_or_stale_pid() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.runtime.instance = "host-two".into();
         f.runtime.terminals.clear();
@@ -1625,7 +1691,7 @@ mod tests {
     }
     #[tokio::test]
     async fn an_authoritatively_unaccepted_start_can_be_abandoned_without_starting_it() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let owner = f.start("implementation").await;
         f.command(Command::Stop {
             session: owner.id.clone(),
@@ -1659,7 +1725,7 @@ mod tests {
     }
     #[tokio::test]
     async fn notification_setup_failure_keeps_the_running_conversation_reconnectable() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         f.runtime.fail_setup = true;
         let owner = f.start("implementation").await;
         assert_eq!(owner.health, Health::Live);
@@ -1681,7 +1747,7 @@ mod tests {
     }
     #[tokio::test]
     async fn retry_identity_rejects_changed_handoff_or_terminal_intent() {
-        let mut f = Fixture::new();
+        let mut f = Fixture::new().await;
         let request_id = crate::copilot::new_session_id();
         f.command(Command::StartRequest {
             request_id: request_id.clone(),
@@ -1710,5 +1776,141 @@ mod tests {
             );
         }
         assert_eq!(f.runtime.launches.len(), 1);
+    }
+    #[tokio::test]
+    async fn actual_branch_drift_rejects_new_start_and_handover_before_stopping_owner() {
+        let mut f = Fixture::new().await;
+        let checkout = f.state().tickets["owner/repo#1"]
+            .worktree
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        crate::git::run(
+            &checkout,
+            [
+                "-c",
+                "user.name=Lifecycle Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        )
+        .await
+        .unwrap();
+        let approved =
+            starting_brief(&f.state().tickets["owner/repo#1"], "implementation", "").unwrap();
+        crate::git::run(&checkout, ["switch", "-c", "outside"])
+            .await
+            .unwrap();
+        let error = f
+            .command(Command::StartRequest {
+                request_id: crate::copilot::new_session_id(),
+                ticket: "owner/repo#1".into(),
+                task: "implementation".into(),
+                handoff: String::new(),
+                rows: 30,
+                cols: 100,
+                expected_brief: Some(approved),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("branch changed"));
+        assert!(f.runtime.launches.is_empty());
+        assert!(f.state().sessions.is_empty());
+        crate::git::run(&checkout, ["switch", "feature"])
+            .await
+            .unwrap();
+        let owner = f.start("implementation").await;
+        let approved = starting_brief(&f.state().tickets["owner/repo#1"], "review", "").unwrap();
+        crate::git::run(&checkout, ["switch", "outside"])
+            .await
+            .unwrap();
+        assert!(
+            f.command(Command::Handover {
+                expected_brief: Some(approved),
+                from_session: owner.id.clone(),
+                ticket: owner.ticket.clone(),
+                task: "review".into(),
+                handoff: String::new(),
+                rows: 30,
+                cols: 100
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(f.state().sessions[&owner.id], owner);
+        assert_eq!(f.runtime.terminals.len(), 1);
+        assert_eq!(f.runtime.launches.len(), 1);
+    }
+    #[tokio::test]
+    async fn replacement_checkout_or_wrong_physical_claim_cannot_start_or_stop_an_owner() {
+        for active in [false, true] {
+            let mut f = Fixture::new().await;
+            let owner = if active {
+                Some(f.start("implementation").await)
+            } else {
+                None
+            };
+            let checkout = f.state().tickets["owner/repo#1"]
+                .worktree
+                .as_ref()
+                .unwrap()
+                .path
+                .clone();
+            let moved = f._temp.path().join("original-checkout");
+            assert_eq!(
+                checkout.parent().unwrap(),
+                moved.parent().unwrap().canonicalize().unwrap()
+            );
+            std::fs::rename(&checkout, &moved).unwrap();
+            std::fs::create_dir(&checkout).unwrap();
+            crate::git::run(&checkout, ["init", "--initial-branch=feature"])
+                .await
+                .unwrap();
+            let request = || Command::StartRequest {
+                request_id: crate::copilot::new_session_id(),
+                ticket: "owner/repo#1".into(),
+                task: "review".into(),
+                handoff: String::new(),
+                rows: 30,
+                cols: 100,
+                expected_brief: None,
+            };
+            let error = f.command(request()).await.unwrap_err();
+            assert!(format!("{error:#}").contains("association is missing"));
+            // A claim for another ticket is not an invitation to steal or overwrite it.
+            let claim = workflow::claim_path(&checkout).await.unwrap();
+            std::fs::write(&claim, "owner/repo#2").unwrap();
+            let error = f.command(request()).await.unwrap_err();
+            assert!(error.to_string().contains("another ticket"));
+            assert_eq!(std::fs::read_to_string(claim).unwrap(), "owner/repo#2");
+            if let Some(owner) = owner {
+                assert!(
+                    f.command(Command::Handover {
+                        expected_brief: None,
+                        from_session: owner.id.clone(),
+                        ticket: owner.ticket.clone(),
+                        task: "review".into(),
+                        handoff: String::new(),
+                        rows: 30,
+                        cols: 100
+                    })
+                    .await
+                    .is_err()
+                );
+                assert_eq!(f.state().sessions[&owner.id], owner);
+                assert_eq!(f.runtime.launches.len(), 1);
+                assert_eq!(f.runtime.terminals.len(), 1);
+            } else {
+                assert!(f.state().sessions.is_empty());
+                assert!(f.runtime.launches.is_empty());
+            }
+        }
     }
 }

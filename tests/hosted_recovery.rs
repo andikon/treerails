@@ -93,9 +93,21 @@ impl Fixture {
         })).unwrap();
         let path = temp.path().join("treerail.toml");
         workflow::Workflow::new(&path).update(|state| {
-            let ticket:workflow::TicketRecord=serde_json::from_value(serde_json::json!({"repository":"owner/repo","project":checkout,"issue":{"number":1,"title":"Deliver","body":"Acceptance criteria","state":"OPEN","url":"https://github.com/owner/repo/issues/1"},"fetched_at":1,"tasks":[{"id":"implementation","title":"Implement","progress":"in_progress"}],"next_task_id":1,"selected_task":"implementation","worktree":{"path":checkout,"branch":"feature","original":false}}))?;
+            let ticket:workflow::TicketRecord=serde_json::from_value(serde_json::json!({"repository":"owner/repo","project":checkout,"issue":{"number":1,"title":"Deliver","body":"Acceptance criteria","state":"OPEN","url":"https://github.com/owner/repo/issues/1"},"fetched_at":1,"tasks":[{"id":"implementation","title":"Implement","progress":"in_progress"}],"next_task_id":1,"selected_task":"implementation","worktree":null}))?;
             state.tickets.insert(record.ticket.clone(),ticket);state.sessions.insert(record.id.clone(),record.clone());Ok(())
         }).unwrap();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(workflow::Workflow::new(&path).execute(
+                &checkout,
+                workflow::Command::Prepare {
+                    ticket: record.ticket.clone(),
+                    preparation: workflow::Preparation::Adopt {
+                        path: checkout.clone(),
+                    },
+                },
+            ))
+            .unwrap();
         Self { temp, path, record }
     }
     fn ticket(&self, client: &Client, command: hosted::Command) -> anyhow::Result<hosted::Event> {

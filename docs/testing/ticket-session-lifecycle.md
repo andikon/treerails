@@ -7,6 +7,7 @@ Implemented for #12 and #13. Validated on native Windows, 17 October 2026.
 Ticket commands run inside the production session host through `HostCommand::Ticket`. Durable records stay in the existing combined TOML: ticket/task/provider UUID, immutable brief, selected conversation, checkout, branch, host generation, pending operation and execution barrier. Terminal screens and provider transcripts are not copied into it.
 
 - `StartRequest` identifies one inspected new-session intent. Retry uses its original UUID and payload. A changed task, handoff, dimensions or approved brief is rejected. Legacy `Start` creates a fresh intent for direct callers.
+- New-session and handover requests first verify actual project registration, common Git metadata, current branch and the physical ticket association claim. A replaced directory or external branch switch is rejected before an existing owner is stopped.
 - Approved briefs are compared against the latest issue/task/worktree inside the persistence transaction. Handover checks before stopping the old owner and again before launching the new one.
 - `Continue` reattaches without a second process, or verifies an ended group and explicitly resumes the exact saved provider UUID without replaying a brief. Missing provider history requires an explicit new conversation.
 - `SelectSession` starts nothing. `Handover` must stop and verify the previous managed execution before starting another task in the shared checkout. Failed stops retain ownership.
