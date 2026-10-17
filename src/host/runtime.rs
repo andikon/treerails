@@ -21,6 +21,26 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HostCommand {
     Ping,
+    Summary,
+    ConfigureSession {
+        session: String,
+        ticket: String,
+        desktop_notifications: bool,
+    },
+    StartCopilot {
+        request_id: String,
+        checkout: PathBuf,
+        provider_session_id: String,
+        resume: bool,
+        brief: Option<String>,
+        rows: u16,
+        cols: u16,
+    },
+    Observe {
+        session: String,
+        token: String,
+        observation: crate::copilot::Observation,
+    },
     Start {
         request_id: String,
         checkout: PathBuf,
@@ -74,6 +94,8 @@ pub struct TerminalSnapshot {
     pub sequence: u64,
     pub exited: bool,
     pub input_token: Option<u64>,
+    pub provider_session_id: Option<String>,
+    pub attention: crate::copilot::Attention,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
@@ -86,8 +108,21 @@ pub enum Response {
         process_id: Option<u32>,
     },
     Terminal(TerminalSnapshot),
+    Summary(Vec<SessionSummary>),
     Done,
+    Ended {
+        session: String,
+    },
     Error(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session: String,
+    pub provider_session_id: Option<String>,
+    pub attention: crate::copilot::Attention,
+    pub exited: bool,
+    pub notification_error: Option<String>,
 }
 
 pub struct Client {
@@ -175,18 +210,42 @@ struct Screen {
     parser: vt100::Parser,
     sequence: u64,
 }
+struct Provider {
+    session_id: String,
+    token: String,
+    sequence: u64,
+    last_seen: std::time::Instant,
+    valid: bool,
+    attention: crate::copilot::Attention,
+}
+struct LaunchContext {
+    local_id: String,
+    provider: Provider,
+}
 struct Session {
+    provider: Option<Provider>,
+    ticket: String,
+    desktop_notifications: bool,
+    notification_error: Option<String>,
     group: super::execution::ExecutionGroup,
     _lease: CheckoutLease,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     screen: Arc<Mutex<Screen>>,
     input: InputControl,
 }
 impl Session {
     fn snapshot(&mut self, id: &str, token: Option<ControlToken>) -> Result<Response> {
         let exited = self.group.stopped()?;
+        if let Some(provider) = self.provider.as_mut()
+            && provider.last_seen.elapsed() > std::time::Duration::from_secs(5)
+        {
+            provider.valid = false;
+            provider
+                .attention
+                .unavailable("Copilot observations lost; terminal remains available");
+        }
         let state = self
             .screen
             .lock()
@@ -206,18 +265,207 @@ impl Session {
             sequence: state.sequence,
             exited,
             input_token: token.map(|t| t.0),
+            provider_session_id: self
+                .provider
+                .as_ref()
+                .map(|provider| provider.session_id.clone()),
+            attention: self
+                .provider
+                .as_ref()
+                .map(|provider| provider.attention.clone())
+                .unwrap_or_default(),
         }))
     }
 }
 #[derive(Default)]
-struct Host {
+pub(crate) struct Host {
     sessions: BTreeMap<String, Session>,
     starts: BTreeMap<String, (String, Option<u32>)>,
+    fingerprints: BTreeMap<String, Vec<u8>>,
     instance: String,
+    endpoint: String,
+    launch_context: Option<LaunchContext>,
+    notifications: crate::notifications::Notifications,
+    delivery_tx: Option<tokio::sync::mpsc::Sender<crate::notifications::Notice>>,
+    delivery_rx: Option<tokio::sync::mpsc::Receiver<(String, Option<String>)>>,
 }
 impl Host {
-    async fn execute(&mut self, command: HostCommand) -> Result<Response> {
+    pub(crate) async fn execute(&mut self, command: HostCommand) -> Result<Response> {
+        let fingerprint = if matches!(
+            &command,
+            HostCommand::Start { .. } | HostCommand::StartCopilot { .. }
+        ) {
+            let bytes = serde_json::to_vec(&command)?;
+            ensure!(
+                bytes.len() <= 65536,
+                "Agent start specification exceeds 64 KiB"
+            );
+            Some(bytes)
+        } else {
+            None
+        };
         match command {
+            HostCommand::StartCopilot {
+                request_id,
+                checkout,
+                provider_session_id,
+                resume,
+                brief,
+                rows,
+                cols,
+            } => {
+                if let Some((session, process_id)) = self.starts.get(&request_id) {
+                    ensure!(
+                        self.fingerprints.get(&request_id) == fingerprint.as_ref(),
+                        "Start request identity was reused for different work"
+                    );
+                    return Ok(if self.sessions.contains_key(session) {
+                        Response::Started {
+                            session: session.clone(),
+                            process_id: *process_id,
+                        }
+                    } else {
+                        Response::Ended {
+                            session: session.clone(),
+                        }
+                    });
+                }
+                let home = directories::BaseDirs::new()
+                    .context("Current user home unavailable")?
+                    .home_dir()
+                    .join(".copilot");
+                if resume {
+                    ensure!(
+                        crate::copilot::is_uuid(&provider_session_id),
+                        "An exact Copilot conversation UUID is required"
+                    );
+                    ensure!(
+                        home.join("session-state")
+                            .join(&provider_session_id)
+                            .join("events.jsonl")
+                            .is_file(),
+                        "Recorded Copilot conversation is missing; choose an explicit new session instead"
+                    );
+                }
+                let args = crate::copilot::launch_arguments(
+                    &provider_session_id,
+                    if resume {
+                        crate::copilot::LaunchMode::Resume
+                    } else {
+                        crate::copilot::LaunchMode::New
+                    },
+                    brief.as_deref(),
+                )?;
+                crate::copilot::install_observer(&home)?;
+                let local_id = format!("session-{}", uuid::Uuid::new_v4());
+                self.launch_context = Some(LaunchContext {
+                    local_id,
+                    provider: Provider {
+                        session_id: provider_session_id,
+                        token: uuid::Uuid::new_v4().to_string(),
+                        sequence: 0,
+                        last_seen: std::time::Instant::now(),
+                        valid: true,
+                        attention: crate::copilot::Attention::default(),
+                    },
+                });
+                let original_request = request_id.clone();
+                let result = Box::pin(self.execute(HostCommand::Start {
+                    request_id,
+                    checkout,
+                    program: "copilot".into(),
+                    args,
+                    rows,
+                    cols,
+                }))
+                .await;
+                self.launch_context = None;
+                if result.is_ok() {
+                    self.fingerprints
+                        .insert(original_request, fingerprint.unwrap());
+                }
+                result
+            }
+            HostCommand::Observe {
+                session,
+                token,
+                observation,
+            } => {
+                let live = self
+                    .sessions
+                    .get_mut(&session)
+                    .context("Unknown hosted session")?;
+                let provider = live
+                    .provider
+                    .as_mut()
+                    .context("Session has no native provider")?;
+                ensure!(
+                    provider.token == token,
+                    "Provider observation authentication failed"
+                );
+                if provider.session_id != observation.session_id {
+                    provider.valid = false;
+                    provider.attention.unavailable(
+                        "Provider reported another conversation identity; checkout remains owned",
+                    );
+                    anyhow::bail!("Provider conversation identity mismatch");
+                }
+                // Folder trust can delay the first native extension connection.
+                // A genuine broken observation stream still cannot repair itself.
+                if provider.sequence == 0
+                    && observation.sequence == 1
+                    && observation.kind == "bridge.connected"
+                {
+                    provider.valid = true;
+                }
+                if !provider.valid || observation.sequence != provider.sequence.saturating_add(1) {
+                    provider.valid = false;
+                    provider.attention.unavailable(
+                        "Provider observation stream has a gap; checkout remains owned",
+                    );
+                    anyhow::bail!("Provider event stream unavailable");
+                }
+                provider.sequence = observation.sequence;
+                provider.last_seen = std::time::Instant::now();
+                provider
+                    .attention
+                    .observe(&observation.kind, observation.request_id.as_deref());
+                Ok(Response::Done)
+            }
+            HostCommand::Summary => {
+                let mut summaries = Vec::new();
+                for (id, session) in &mut self.sessions {
+                    let exited = session.group.stopped()?;
+                    summaries.push(SessionSummary {
+                        session: id.clone(),
+                        provider_session_id: session
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.session_id.clone()),
+                        attention: session
+                            .provider
+                            .as_ref()
+                            .map(|provider| provider.attention.clone())
+                            .unwrap_or_default(),
+                        exited,
+                        notification_error: session.notification_error.clone(),
+                    });
+                }
+                Ok(Response::Summary(summaries))
+            }
+            HostCommand::ConfigureSession {
+                session,
+                ticket,
+                desktop_notifications,
+            } => {
+                let live = self
+                    .sessions
+                    .get_mut(&session)
+                    .context("Unknown hosted session")?;
+                live.ticket = ticket;
+                live.desktop_notifications = desktop_notifications;
+                Ok(Response::Done)
+            }
             HostCommand::Ping => Ok(Response::Pong {
                 version: PROTOCOL_VERSION,
                 instance: self.instance.clone(),
@@ -235,11 +483,30 @@ impl Host {
                     "Start needs a bounded request identity"
                 );
                 if let Some((id, process_id)) = self.starts.get(&request_id) {
-                    return Ok(Response::Started {
-                        session: id.clone(),
-                        process_id: *process_id,
+                    ensure!(
+                        self.fingerprints.get(&request_id) == fingerprint.as_ref(),
+                        "Start request identity was reused for different work"
+                    );
+                    return Ok(if self.sessions.contains_key(id) {
+                        Response::Started {
+                            session: id.clone(),
+                            process_id: *process_id,
+                        }
+                    } else {
+                        Response::Ended {
+                            session: id.clone(),
+                        }
                     });
                 }
+                ensure!(
+                    self.starts.len() < 1024,
+                    "Host request history is full; explicitly stop this host after its sessions end"
+                );
+                let context = self.launch_context.take();
+                let id = context
+                    .as_ref()
+                    .map(|context| context.local_id.clone())
+                    .unwrap_or_else(|| format!("session-{}", uuid::Uuid::new_v4()));
                 ensure!(
                     self.sessions.len() < 128,
                     "Host session limit reached; stop unused sessions"
@@ -257,6 +524,12 @@ impl Host {
                 builder.arg(program);
                 builder.args(args);
                 builder.cwd(&checkout);
+                if let Some(context) = &context {
+                    builder.env("TREERAIL_HOST_ENDPOINT", &self.endpoint);
+                    builder.env("TREERAIL_HOST_SESSION", &context.local_id);
+                    builder.env("TREERAIL_HOST_TOKEN", &context.provider.token);
+                    builder.env("TREERAIL_COPILOT_SESSION", &context.provider.session_id);
+                }
                 let mut child = pair.slave.spawn_command(builder)?;
                 let group = match super::execution::ExecutionGroup::assign(child.as_ref()) {
                     Ok(group) => group,
@@ -271,6 +544,18 @@ impl Host {
                 let mut writer = pair.master.take_writer()?;
                 writer.write_all(b"treerail-start\r\n")?;
                 writer.flush()?;
+                let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+                std::thread::spawn(move || {
+                    while let Ok(bytes) = input_rx.recv() {
+                        if writer
+                            .write_all(&bytes)
+                            .and_then(|_| writer.flush())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
                 let screen = Arc::new(Mutex::new(Screen {
                     parser: vt100::Parser::new(rows, cols, 2000),
                     sequence: 0,
@@ -292,20 +577,25 @@ impl Host {
                         }
                     }
                 });
-                let id = format!("session-{}", uuid::Uuid::new_v4());
                 let process_id = child.process_id();
                 self.sessions.insert(
                     id.clone(),
                     Session {
+                        provider: context.map(|context| context.provider),
+                        ticket: String::new(),
+                        desktop_notifications: false,
+                        notification_error: None,
                         group,
                         _lease: lease,
                         child,
                         master: pair.master,
-                        writer,
+                        writer: input_tx,
                         screen,
                         input: InputControl::default(),
                     },
                 );
+                self.fingerprints
+                    .insert(request_id.clone(), fingerprint.unwrap());
                 self.starts.insert(request_id, (id.clone(), process_id));
                 Ok(Response::Started {
                     session: id,
@@ -350,8 +640,9 @@ impl Host {
                     } => {
                         session.input.authorize(&client, ControlToken(token))?;
                         ensure!(bytes.len() <= 65536, "Input too large");
-                        session.writer.write_all(&bytes)?;
-                        session.writer.flush()?;
+                        session.writer.try_send(bytes).context(
+                            "Agent input queue is full or unavailable; input was not accepted",
+                        )?;
                         Ok(Response::Done)
                     }
                     HostCommand::Resize {
@@ -394,6 +685,7 @@ impl Host {
                             "Agent stop could not be verified; checkout remains owned"
                         );
                         self.sessions.remove(&id);
+                        self.notifications.forget(&id);
                         Ok(Response::Done)
                     }
                     _ => unreachable!(),
@@ -404,44 +696,172 @@ impl Host {
 }
 fn validate_size(rows: u16, cols: u16) -> Result<()> {
     ensure!(
-        rows > 0 && cols > 0 && rows <= 500 && cols <= 500,
-        "Terminal dimensions must be between 1 and 500"
+        rows > 0
+            && cols > 0
+            && rows <= 500
+            && cols <= 500
+            && u32::from(rows) * u32::from(cols) <= 20000,
+        "Terminal dimensions must be between 1 and 500 with at most 20,000 cells"
     );
     Ok(())
 }
 
-/// Serve one bounded request per connection. Screen readers never depend on clients.
-pub async fn serve(endpoint: &str) -> Result<()> {
-    let _lifetime = super::discovery::host_lock(endpoint)?;
-    let mut host = Host {
-        instance: uuid::Uuid::new_v4().to_string(),
-        ..Host::default()
-    };
+struct Incoming {
+    request: Request,
+    reply: std::sync::mpsc::Sender<(Response, bool)>,
+}
+fn transport(endpoint: &str, sender: tokio::sync::mpsc::Sender<Result<Incoming>>) -> Result<()> {
     loop {
         let listener = ipc::Listener::bind(endpoint)?;
         let mut pipe = listener.accept()?;
-        let result = read_frame::<_, Request>(&mut pipe);
-        let mut stop = false;
-        let response = match result {
-            Ok(request) => match handshake(request.version) {
-                Ok(()) => {
-                    stop = matches!(request.command, HostCommand::StopHost);
-                    match host.execute(request.command).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            stop = false;
-                            Response::Error(format!("{error:#}"))
-                        }
-                    }
-                }
-                Err(error) => Response::Error(error.to_string()),
-            },
-            Err(error) => Response::Error(error.to_string()),
+        let request = match read_frame::<_, Request>(&mut pipe) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = write_frame(&mut pipe, &Response::Error(error.to_string()));
+                continue;
+            }
         };
+        let (reply, receive) = std::sync::mpsc::channel();
+        if sender
+            .blocking_send(Ok(Incoming { request, reply }))
+            .is_err()
+        {
+            return Ok(());
+        }
+        let (response, stop) = receive.recv().context("Session host command loop ended")?;
         let _ = write_frame(&mut pipe, &response);
         drop(pipe);
         if stop {
             return Ok(());
+        }
+    }
+}
+impl Host {
+    async fn maintain(&mut self) {
+        if let Some(receiver) = &mut self.delivery_rx {
+            while let Ok((id, error)) = receiver.try_recv() {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.notification_error = error;
+                }
+            }
+        }
+        for (id, session) in &mut self.sessions {
+            let mut action: Option<(crate::notifications::Kind, String)> = None;
+            let mut message = String::new();
+            if let Some(provider) = session.provider.as_mut() {
+                if provider.last_seen.elapsed() > std::time::Duration::from_secs(5) {
+                    provider.valid = false;
+                    provider
+                        .attention
+                        .unavailable("Copilot observations lost; terminal remains available");
+                }
+                if !provider.attention.healthy {
+                    // Startup is unknown rather than a failure until the timeout.
+                    if provider.last_seen.elapsed() > std::time::Duration::from_secs(5)
+                        || provider.sequence > 0 && !provider.valid
+                        || provider.attention.reason == "session.error"
+                    {
+                        action = Some((
+                            crate::notifications::Kind::Failure,
+                            provider.attention.reason.clone(),
+                        ));
+                        message = provider.attention.reason.clone();
+                    }
+                } else if provider.attention.value
+                    == Some(crate::copilot::AttentionState::NeedsInput)
+                {
+                    let identity = provider
+                        .attention
+                        .pending
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    action = Some((crate::notifications::Kind::NeedsInput, identity));
+                    message = "Copilot is waiting for your input".into();
+                }
+            }
+            if let Ok(Some(status)) = session.child.try_wait()
+                && !status.success()
+            {
+                action = Some((crate::notifications::Kind::Failure, "process-exit".into()));
+                message = "Agent process exited unsuccessfully".into();
+            }
+            self.notifications
+                .set_enabled(session.desktop_notifications);
+            let action_ref = action
+                .as_ref()
+                .map(|(kind, identity)| (*kind, identity.as_str()));
+            if let Some(notice) =
+                self.notifications
+                    .observe(id, &session.ticket, action_ref, &message)
+            {
+                // Delivery is isolated from managed execution and failures are surfaced
+                // separately; the ledger prevents replay when clients reconnect.
+                if self
+                    .delivery_tx
+                    .as_ref()
+                    .is_none_or(|sender| sender.try_send(notice).is_err())
+                {
+                    session.notification_error =
+                        Some("Desktop notification queue unavailable".into());
+                }
+            }
+        }
+    }
+}
+
+/// IO has bounded deadlines on a separate thread; maintenance remains active with no clients.
+pub async fn serve(endpoint: &str) -> Result<()> {
+    let _lifetime = super::discovery::host_lock(endpoint)?;
+    let mut host = Host {
+        instance: uuid::Uuid::new_v4().to_string(),
+        endpoint: endpoint.to_owned(),
+        ..Host::default()
+    };
+    let (delivery_tx, mut deliveries) =
+        tokio::sync::mpsc::channel::<crate::notifications::Notice>(32);
+    let (results, delivery_rx) = tokio::sync::mpsc::channel(32);
+    host.delivery_tx = Some(delivery_tx);
+    host.delivery_rx = Some(delivery_rx);
+    tokio::spawn(async move {
+        while let Some(notice) = deliveries.recv().await {
+            let error = crate::notifications::deliver(&notice)
+                .await
+                .err()
+                .map(|error| format!("{error:#}"));
+            if results.send((notice.session, error)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let (sender, mut incoming) = tokio::sync::mpsc::channel(8);
+    let endpoint = endpoint.to_owned();
+    std::thread::spawn(move || {
+        if let Err(error) = transport(&endpoint, sender.clone()) {
+            let _ = sender.blocking_send(Err(error));
+        }
+    });
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            _=ticker.tick()=>host.maintain().await,
+            next=incoming.recv()=>{
+                let Some(next)=next else {return Ok(());};
+                let Incoming{request,reply}=next?;
+                let mut stop=false;
+                let response=match handshake(request.version) {
+                    Err(error)=>Response::Error(error.to_string()),
+                    Ok(())=>{
+                        stop=matches!(request.command,HostCommand::StopHost);
+                        match host.execute(request.command).await {Ok(response)=>response,Err(error)=>{stop=false;Response::Error(format!("{error:#}"))}}
+                    }
+                };
+                // Observe every native transition before accepting the next event.
+                host.maintain().await;
+                let _=reply.send((response,stop));
+                if stop{return Ok(());}
+            }
         }
     }
 }

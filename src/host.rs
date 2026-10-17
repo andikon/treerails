@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// Reject incompatible peers before accepting any state-changing commands.
 pub fn handshake(peer_version: u32) -> Result<()> {

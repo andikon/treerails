@@ -115,6 +115,21 @@ fn actual_host_retains_terminal_across_client_exit_and_enforces_takeover() {
         rows: 24,
         cols: 80,
     };
+    // Deliberately lose a successful Start result after receiving only its header.
+    // Retrying the same request must return the existing process, never spawn twice.
+    {
+        let mut pipe = treerail::host::ipc::connect(&endpoint).unwrap();
+        write_frame(
+            &mut pipe,
+            &treerail::host::runtime::Request {
+                version: PROTOCOL_VERSION,
+                command: start(),
+            },
+        )
+        .unwrap();
+        let mut header = [0; 4];
+        std::io::Read::read_exact(&mut pipe, &mut header).unwrap();
+    }
     let (id, pid) = match execute(&client, start) {
         Response::Started {
             session,
@@ -223,6 +238,7 @@ fn actual_host_retains_terminal_across_client_exit_and_enforces_takeover() {
     execute(&client, || HostCommand::Stop {
         session: id.clone(),
     });
+    assert!(matches!(execute(&client,start),Response::Ended {session} if session==id));
     execute(&client, || HostCommand::StopHost);
     let deadline = Instant::now() + Duration::from_secs(5);
     while host.0.try_wait().unwrap().is_none() {
@@ -328,5 +344,43 @@ fn stopping_session_terminates_descendants_before_releasing_checkout() {
         .unwrap()
         .block_on(treerail::host::CheckoutLease::acquire(temp.path()))
         .unwrap();
+    execute(&client, || HostCommand::StopHost);
+}
+
+#[cfg(windows)]
+#[test]
+fn partial_client_frame_has_a_deadline_and_does_not_replace_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let endpoint = format!(
+        "slow-{}-{}",
+        std::process::id(),
+        temp.path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "-")
+    );
+    let _host = HostGuard(
+        Client::launch(
+            Path::new(env!("CARGO_BIN_EXE_treerail-session-host")),
+            &endpoint,
+        )
+        .unwrap(),
+    );
+    let client = Client::new(&endpoint);
+    let instance = match execute(&client, || HostCommand::Ping) {
+        Response::Pong { instance, .. } => instance,
+        value => panic!("{value:?}"),
+    };
+    let mut pipe = treerail::host::ipc::connect(&endpoint).unwrap();
+    std::io::Write::write_all(&mut pipe, &1000u32.to_be_bytes()).unwrap();
+    let began = Instant::now();
+    let instance_after = match execute(&client, || HostCommand::Ping) {
+        Response::Pong { instance, .. } => instance,
+        value => panic!("{value:?}"),
+    };
+    assert!(began.elapsed() < Duration::from_secs(8));
+    assert_eq!(instance, instance_after);
+    drop(pipe);
     execute(&client, || HostCommand::StopHost);
 }
