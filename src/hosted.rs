@@ -731,6 +731,7 @@ mod tests {
                             TerminalSnapshot {
                                 session: id.clone(),
                                 process_id: Some(42),
+                                execution_group: None,
                                 rows: 30,
                                 cols: 100,
                                 formatted: vec![],

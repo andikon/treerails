@@ -39,6 +39,10 @@ Parent directories are scanned one level deep by default. Folders containing `.w
 
 ## Everyday workflow
 
+Opening a project now shows its GitHub tickets. The direct worktree steps below
+remain available with `w`; `T` returns to tickets. Existing local Git operations
+and launch profiles remain usable without GitHub or hosted Copilot.
+
 1. Select a project with `j/k` and `Enter`.
 2. Press `a` for a new branch/worktree, or `b` to select a local or remote branch. The default directory is a sibling such as `my-project.worktrees/feature-login`.
 3. Set the starting point, such as `origin/develop`. `Ctrl+b` opens its picker. Check the destination, optionally choose a fetch, and press `Ctrl+s` to create.
@@ -57,6 +61,67 @@ Press `i` to inspect streamed Git and hook output while an operation runs, or it
 Press `H` for recent Git operations from this session. The list shows each action, original project/worktree and outcome; use `j/k`, `gg/G` or `/` to find a result, then `Enter` for its details. An older result stays selected while a newer operation's live status remains visible above it. `H` returns to history from details. Up to 20 operations are retained, including the current one; an inspected result is kept while the oldest other results are discarded. The list reports how many were discarded. History and output are never saved to `config.toml` and start empty next launch.
 
 ## Keyboard controls
+
+### Ticket sessions
+
+Ticket browsing requires authenticated `gh`; native hosted sessions additionally
+require Copilot. Native Windows hosting has been validated with Copilot 1.0.94.
+Its extension interface is experimental. Hosted process ownership on other
+platforms is explicitly unavailable until validated; their basic workflow remains
+supported. Tests and version-specific evidence are in
+[the compatibility report](research/copilot-hosting-proof.md).
+
+| Key | Ticket action |
+| --- | --- |
+| `c` / `a` | Prepare a shared worktree / adopt a registered one |
+| `s` | Continue the selected task; inspect a first starting brief when needed |
+| `n` | Start a separate recorded conversation after brief review |
+| `Enter` | Focus the visible native agent terminal |
+| `Ctrl+]` | Return from agent input to Tree Rail navigation |
+| `g` | Inspect and select recorded conversations |
+| `b` | Explicitly hand the shared checkout to another task/session |
+| `d` / `x` | Detach the view / explicitly stop the session |
+| `X` | Stop the host after stopping its sessions |
+| `!` | Explicitly take terminal input control from another UI |
+| `r` | Reconcile an interrupted recorded session; no automatic agent restart |
+| `R` / `v` | Refresh GitHub requirements / inspect and explicitly apply revisions |
+| `D` | Preview optional cleanup, protections and unpublished commits |
+| `E` | Inspect host and notification diagnostics |
+
+The starting brief includes the issue requirements, selected task, checkout and
+branch, plus any explicit handoff you supply. Review and scroll it before accepting.
+Each conversation keeps its original brief; Continue does not copy a transcript or
+resend that brief. A missing provider conversation is an error requiring an explicit
+new-session choice. Ready means Copilot finished responding, not that the task is done.
+Task progress remains manual with `p`.
+
+Navigation and agent-input modes use separate text labels and theme colors. In
+agent-input mode ordinary keys, including Escape and Ctrl+C, reach Copilot. Map a
+key to `agent_navigation` in `[keys]` to replace the default Ctrl+] shortcut.
+Pastes retain native bracketed-paste behavior. Only one UI controls a live terminal;
+explicit takeover invalidates the previous client's input authority.
+
+Closing the UI or detaching leaves the same agent running or waiting in the local
+host. Reopening and continuing restores its current screen and pending-input state.
+The host keeps bounded screen/history state in memory and drains output even with
+no UI. Host failure or reboot ends that live terminal: durable references remain,
+but recovery reconciles execution before an explicit exact-conversation resume.
+An uncertain stop does not release checkout ownership. Neither reconnect nor
+recovery automatically approves prompts, replays instructions or starts another task.
+
+Desktop notifications default to off. In settings, section `4 Notifications`, Enter
+toggles delivery; Ctrl+s saves. The host delivers input-request and session-failure
+notifications while detached. Ordinary output and Ready remain quiet. In-app
+indicators remain visible with notifications disabled or blocked by OS settings;
+delivery errors are separate from agent health and permissions.
+
+Ticket/task/conversation references and brief snapshots share the existing combined
+TOML file with settings. Terminal output is bounded in host memory, and Copilot owns
+its transcripts. Saves preserve unrelated settings, comments and concurrent edits.
+`--list` remains read-only and never starts the host. A standalone Tree Rail download
+includes its own host role; no service or login-startup installation is required.
+
+### Basic workspace keys
 
 | Keys | Action |
 | --- | --- |

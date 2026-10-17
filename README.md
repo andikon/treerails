@@ -66,6 +66,37 @@ comments and concurrent changes. Ticket preparation is exposed through the publi
 `workflow::Workflow` command/event interface for terminal clients and the later
 session host.
 
+### Hosted Copilot sessions
+
+After preparing the shared worktree, `s` continues the selected task or offers its
+first session. `n` creates a separate conversation after you inspect its starting
+brief and optional handoff. The native Copilot terminal appears inside Tree Rail;
+Enter switches to **AGENT INPUT**, and `Ctrl+]` returns to **NAVIGATION**. The two
+modes have different colors and labels. Escape and Ctrl+C reach Copilot while its
+terminal owns input. Override the return shortcut with a key mapped to
+`agent_navigation` in `[keys]`.
+
+`d` detaches the terminal view, and closing Tree Rail leaves hosted work alive.
+`s` reattaches to the same live process; a stopped conversation resumes its exact
+recorded UUID, without replaying the starting brief. `g` lists retained
+conversations. `x` explicitly stops a session, while `X` stops an empty host.
+`!` explicitly takes terminal control from another UI. A waiting agent still owns
+its checkout; handover and cleanup require a verified stop.
+
+Running, Needs input and Ready describe agent attention, independently of manual
+task progress. Other hosted tickets remain visible while you type. Lost status
+observation is shown as unavailable, and host interruption requires explicit
+reconciliation rather than automatically restarting agents. Desktop notifications
+are off by default; enable them in settings section **4 Notifications** for input
+requests and session failures. Ready and ordinary output remain quiet.
+
+Native hosted sessions are currently validated on **Windows with Copilot 1.0.94**
+and use its experimental extension interface. The basic worktree workflow remains
+available on Windows, Linux and macOS. See the
+[compatibility evidence](docs/research/copilot-hosting-proof.md) and
+[usage guide](docs/usage.md). The standalone executable also contains the host role;
+it does not require a service installation or a separately downloaded host.
+
 ## Built for the next ticket
 
 Feature development and code review often begin with the same steps: find the repository, find the right branch, create a worktree, and open a terminal. Tree Rail puts those steps in one keyboard-driven interface and stays open while you work.
