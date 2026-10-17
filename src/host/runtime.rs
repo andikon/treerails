@@ -993,12 +993,29 @@ pub async fn serve(endpoint: &str) -> Result<()> {
                 let Some(next)=next else {return Ok(());};
                 let Incoming{process,request,reply}=next?;
                 host.caller=process;
+                // Git/GitHub preparation owns no live terminal state. Run it outside
+                // the session loop so a slow fetch cannot starve provider events.
+                let command=match request.command {
+                    HostCommand::Ticket {config_path,command:crate::hosted::Command::Workflow {project,command}}
+                        if handshake(request.version).is_ok()=>{
+                        tokio::spawn(async move {
+                            let response=match crate::workflow::Workflow::new(config_path).execute(&project,command).await {
+                                Ok(event)=>Response::Ticket(Box::new(crate::hosted::Event::Workflow(Box::new(event)))),
+                                Err(error)=>Response::Error(format!("{error:#}")),
+                            };
+                            let _=reply.send((response,false));
+                        });
+                        host.caller=None;
+                        continue;
+                    }
+                    command=>command,
+                };
                 let mut stop=false;
                 let response=match handshake(request.version) {
                     Err(error)=>Response::Error(error.to_string()),
                     Ok(())=>{
-                        stop=matches!(request.command,HostCommand::StopHost);
-                        match host.execute(request.command).await {Ok(response)=>response,Err(error)=>{stop=false;Response::Error(format!("{error:#}"))}}
+                        stop=matches!(command,HostCommand::StopHost);
+                        match host.execute(command).await {Ok(response)=>response,Err(error)=>{stop=false;Response::Error(format!("{error:#}"))}}
                     }
                 };
                 host.caller=None;
