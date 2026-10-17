@@ -9,3 +9,4 @@ pub mod notifications;
 pub mod settings;
 pub mod startup;
 pub mod ui;
+pub mod workflow;

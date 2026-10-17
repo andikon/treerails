@@ -15,6 +15,33 @@ Find a project, choose a starting branch, and open your tools in the right works
 
 ![Tree Rail showing four parallel worktrees, colored file status, and an inline Git diff](docs/media/workspace.png)
 
+## Ticket workflow
+
+Enter a project to browse its existing GitHub issues (requires authenticated `gh`).
+Select an issue to inspect its requirements and persisted local tasks; browsing does
+not launch an agent or create a checkout. Each issue initially has one task. Press
+`i` to inspect and explicitly import checklist items under a Markdown heading named
+`Tasks`; other headings, acceptance criteria, prose and code fences are excluded.
+Importing the same title again keeps its original task identity. Select a task with
+Enter and use `p` to cycle Pending → In progress → Done manually. PgUp/PgDn scroll
+requirements.
+
+Press `c` to prepare the ticket's shared worktree with an explicit branch, starting
+point, destination and optional fetch, or `a` to adopt a registered worktree. All
+tasks reuse this association. Original checkouts remain identified and protected by
+the existing cleanup rules. A physical checkout cannot belong to another ticket,
+even through another configuration file. This association does not import or
+control externally launched Copilot conversations.
+
+The direct project → worktree workflow remains available: press `w` on a project or
+from ticket navigation, and `T` in the basic workspace to return to tickets. Existing
+launch profiles, Git actions and read-only `--list` discovery are unchanged.
+Ticket records, timestamps, task identities/progress and checkout associations live
+alongside settings in the combined TOML document; edits retain unrelated settings,
+comments and concurrent changes. Ticket preparation is exposed through the public
+`workflow::Workflow` command/event interface for terminal clients and the later
+session host.
+
 ## Built for the next ticket
 
 Feature development and code review often begin with the same steps: find the repository, find the right branch, create a worktree, and open a terminal. Tree Rail puts those steps in one keyboard-driven interface and stays open while you work.

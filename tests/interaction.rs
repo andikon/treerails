@@ -22,7 +22,7 @@ fn app() -> App {
         path: PathBuf::from("/code/app"),
         name: "app".into(),
     }];
-    app.open_project();
+    app.open_basic_project();
     app.trees = vec![Worktree {
         path: "/code/app".into(),
         branch: "main".into(),

@@ -266,6 +266,7 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    pub workflow: crate::workflow::WorkflowState,
     pub bases: BTreeMap<String, String>,
     pub last_project: Option<PathBuf>,
     pub last_worktree: Option<PathBuf>,

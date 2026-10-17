@@ -94,6 +94,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         settings_view(frame, app, rows[1]);
     } else if app.project.is_none() {
         projects(frame, app, rows[1]);
+    } else if app.ticket_mode {
+        tickets(frame, app, rows[1]);
     } else {
         workspace(frame, app, rows[1]);
     }
@@ -124,9 +126,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.settings_open {
         " 1/2/3 sections · h/l switch · a add · Enter edit · Ctrl+s apply · i output · H history · Esc explorer · D discard "
     } else if app.project.is_none() {
-        " j/k navigate   / search   Enter explore   , settings   R reload   i output · H history   ? help   q quit "
+        " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
+    } else if app.ticket_mode {
+        " j/k select · Enter open/select · c create · a adopt · i import · p progress · w basic · R refresh · Esc back "
     } else {
-        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
+        " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
@@ -703,5 +707,108 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 rows[form.fields.len()],
             );
         }
+    }
+}
+
+fn tickets(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(ticket) = &app.ticket {
+        let rows = Layout::vertical([
+            Constraint::Length(5),
+            Constraint::Percentage(45),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        let checkout = ticket
+            .worktree
+            .as_ref()
+            .map(|wt| {
+                format!(
+                    "{} · {}{}",
+                    wt.branch,
+                    wt.path.display(),
+                    if wt.original {
+                        " [original checkout]"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No shared worktree · c create or a adopt".into());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} #{} · {} [{}]\n{}\nCached at Unix {} · {}",
+                ticket.repository,
+                ticket.issue.number,
+                ticket.issue.title,
+                ticket.issue.state,
+                ticket.issue.url,
+                ticket.fetched_at,
+                checkout
+            ))
+            .wrap(Wrap { trim: false })
+            .block(border(" Ticket overview ", true, app)),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(ticket.issue.body.clone())
+                .scroll((app.ticket_scroll, 0))
+                .wrap(Wrap { trim: false })
+                .block(border(
+                    " GitHub requirements · PgUp/PgDn scroll ",
+                    false,
+                    app,
+                )),
+            rows[1],
+        );
+        let items: Vec<ListItem> = ticket
+            .tasks
+            .iter()
+            .map(|task| {
+                ListItem::new(format!(
+                    "{} {} · {:?} · {}",
+                    if ticket.selected_task.as_ref() == Some(&task.id) {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    task.id,
+                    task.progress,
+                    task.title
+                ))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(border(
+                    " Tasks · Enter select · p change progress ",
+                    true,
+                    app,
+                ))
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            rows[2],
+            &mut ListState::default().with_selected(Some(app.task_cursor)),
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .issues
+            .iter()
+            .map(|issue| {
+                ListItem::new(format!(
+                    "#{} [{}] {}",
+                    issue.number, issue.state, issue.title
+                ))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(border(
+                    " GitHub tickets · Enter inspect · w basic worktrees ",
+                    true,
+                    app,
+                ))
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            area,
+            &mut ListState::default().with_selected(Some(app.issue_cursor)),
+        );
     }
 }
