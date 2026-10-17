@@ -702,14 +702,10 @@ impl App {
             Ok(Payload::Host(response)) => self.accept_host(response),
             Err(error) => {
                 if done.token == "host" {
-                    self.hosted.input = false;
-                    if let Some(snapshot) = &mut self.hosted.terminal {
-                        snapshot
-                            .attention
-                            .unavailable(format!("Host request failed: {error:#}"));
-                    }
+                    self.hosted_request_failed(format!("{error:#}"));
+                } else {
+                    self.say(format!("{error:#}"), true);
                 }
-                self.say(format!("{error:#}"), true);
                 if operation && let Some(form) = self.recover_form.take() {
                     if self.modal.is_none() {
                         self.modal = Some(Modal::Form(form));
@@ -2140,6 +2136,7 @@ impl App {
             return false;
         }
         match key.code {
+            KeyCode::Char('b') => self.begin_handover(),
             KeyCode::Char('s') => self.begin_agent(false),
             KeyCode::Char('n') => self.begin_agent(true),
             KeyCode::Char('x') => self.stop_agent_dialog(),

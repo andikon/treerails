@@ -37,7 +37,7 @@ pub fn terminal(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(3),
     ])
     .split(area);
     let identity = app
@@ -98,6 +98,7 @@ pub fn terminal(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     if app.hosted.input
+        && app.hosted.dialog.is_none()
         && !snapshot.cursor_hidden
         && snapshot.cursor.0 < inner.height
         && snapshot.cursor.1 < inner.width
@@ -111,25 +112,44 @@ pub fn terminal(frame: &mut Frame, app: &App, area: Rect) {
         .find(|(_, action)| action.as_str() == "agent_navigation")
         .map(|(key, _)| key.as_str())
         .unwrap_or("ctrl+]");
+    let others = attention_text(app, true);
     frame.render_widget(
         Paragraph::new(format!(
-            "Enter focus · {exit} navigation · d detach · x stop\n{}",
+            "{exit} navigation · d detach · x stop · E diagnostics\n{}\n{}",
             if snapshot.attention.healthy {
                 ""
             } else {
                 &snapshot.attention.reason
-            }
+            },
+            others
         ))
         .style(Style::default().fg(mode_color)),
         rows[2],
     );
 }
 
-pub fn attention(frame: &mut Frame, app: &App, area: Rect) {
-    let text = app
+fn attention_text(app: &App, other_only: bool) -> String {
+    let current = app
+        .hosted
+        .terminal
+        .as_ref()
+        .map(|terminal| terminal.session.as_str());
+    let mut summaries = app
         .hosted
         .summaries
         .iter()
+        .filter(|summary| !other_only || Some(summary.session.as_str()) != current)
+        .collect::<Vec<_>>();
+    summaries.sort_by_key(
+        |summary| match (summary.attention.healthy, summary.attention.value) {
+            (_, Some(AttentionState::NeedsInput)) => 0,
+            (false, _) => 1,
+            _ if summary.notification_error.is_some() => 1,
+            _ => 2,
+        },
+    );
+    summaries
+        .into_iter()
         .map(|summary| {
             let record = app
                 .state
@@ -143,28 +163,30 @@ pub fn attention(frame: &mut Frame, app: &App, area: Rect) {
             let status = if summary.exited {
                 "ended"
             } else if !summary.attention.healthy {
-                "status unavailable"
+                "Status unavailable"
             } else {
                 match summary.attention.value {
                     Some(AttentionState::NeedsInput) => "Needs input",
                     Some(AttentionState::Running) => "Running",
                     Some(AttentionState::Ready) => "Ready",
-                    None => "status unavailable",
+                    None => "Status unavailable",
                 }
             };
             format!(
                 "{label}: {status}{}",
                 if summary.notification_error.is_some() {
-                    " (notification unavailable)"
+                    " (notification unavailable · E details)"
                 } else {
                     ""
                 }
             )
         })
         .collect::<Vec<_>>()
-        .join(" · ");
+        .join(" · ")
+}
+pub fn attention(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Yellow)),
+        Paragraph::new(attention_text(app, false)).style(Style::default().fg(Color::Yellow)),
         area,
     );
 }
@@ -180,15 +202,160 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
         area.height.saturating_sub(2),
     );
     frame.render_widget(Clear, area);
-    let (title,text)=match dialog {
-        Dialog::Start {brief,..}=>("Inspect starting brief · y start native Copilot · any other key cancel".to_string(),brief.clone()),
+    match dialog {
+        Dialog::Start {
+            brief,
+            handoff,
+            editing,
+            scroll,
+            from_session,
+            ..
+        } => {
+            let block = border(
+                if from_session.is_some() {
+                    " Inspect handover starting brief "
+                } else {
+                    " Inspect starting brief "
+                },
+                true,
+                app,
+            );
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let rows = Layout::vertical([
+                Constraint::Length(if from_session.is_some() { 3 } else { 1 }),
+                Constraint::Min(1),
+                Constraint::Length(6),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+            frame.render_widget(Paragraph::new(from_session.as_ref().map(|owner|format!("Explicit handover from {owner}: verify stop before starting the selected task. A failed stop keeps checkout ownership.")).unwrap_or_else(||"No agent starts until y confirms this brief.".into())).wrap(Wrap{trim:false}),rows[0]);
+            let text = crate::app::hosted_ui::draft_brief(brief, &handoff.value);
+            frame.render_widget(
+                Paragraph::new(text)
+                    .scroll((*scroll, 0))
+                    .wrap(Wrap { trim: false })
+                    .block(border(
+                        " Exact starting brief · PgUp/PgDn scroll ",
+                        false,
+                        app,
+                    )),
+                rows[1],
+            );
+            let block = border(
+                if *editing {
+                    " OPTIONAL HANDOFF · editing · Tab review "
+                } else {
+                    " Optional multiline handoff · Tab edit "
+                },
+                *editing,
+                app,
+            );
+            let text_area = block.inner(rows[2]);
+            let before = &handoff.value[..handoff.cursor];
+            let line = before.chars().filter(|c| *c == '\n').count();
+            let column = before.rsplit('\n').next().unwrap_or("").width();
+            let sy = line.saturating_sub(text_area.height.saturating_sub(1) as usize);
+            let sx = column.saturating_sub(text_area.width.saturating_sub(1) as usize);
+            frame.render_widget(
+                Paragraph::new(handoff.value.as_str())
+                    .scroll((
+                        sy.min(u16::MAX as usize) as u16,
+                        sx.min(u16::MAX as usize) as u16,
+                    ))
+                    .block(block),
+                rows[2],
+            );
+            if *editing && text_area.width > 0 && text_area.height > 0 {
+                frame.set_cursor_position((
+                    text_area.x + (column - sx) as u16,
+                    text_area.y + (line - sy) as u16,
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(if *editing {
+                    "Enter newline · Ctrl+u clear · Tab/Esc return to review (does not start)"
+                } else {
+                    "Tab edit handoff · j/k/PgUp/PgDn read · y confirm launch · Esc cancel"
+                })
+                .wrap(Wrap { trim: false }),
+                rows[3],
+            );
+            return;
+        }
+        Dialog::Sessions { records, cursor } => {
+            let items = records
+                .iter()
+                .map(|record| {
+                    ListItem::new(format!(
+                        "{} · {:?} · {}",
+                        record.provider_session_id,
+                        record.health,
+                        if record.current {
+                            "selected"
+                        } else {
+                            "recorded"
+                        }
+                    ))
+                })
+                .collect::<Vec<_>>();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(border(
+                        " Conversations · Enter select only · c Continue · Esc cancel ",
+                        true,
+                        app,
+                    ))
+                    .highlight_style(Style::default().bg(Color::DarkGray)),
+                area,
+                &mut ListState::default().with_selected(Some(*cursor)),
+            );
+            return;
+        }
+        Dialog::Diagnostics { scroll } => {
+            let mut lines = app.hosted.errors.iter().rev().cloned().collect::<Vec<_>>();
+            for summary in &app.hosted.summaries {
+                if let Some(error) = &summary.notification_error {
+                    lines.push(format!(
+                        "Desktop notification for {}: {error}",
+                        summary.session
+                    ));
+                }
+                if !summary.attention.healthy {
+                    lines.push(format!(
+                        "Agent status for {}: {}",
+                        summary.session, summary.attention.reason
+                    ));
+                }
+            }
+            if let Some(record) = &app.hosted.record
+                && let Some(error) = &record.error
+            {
+                lines.push(format!("Recorded conversation {}: {error}", record.id));
+            }
+            if lines.is_empty() {
+                lines.push("No host or desktop notification errors recorded.".into());
+            }
+            frame.render_widget(
+                Paragraph::new(lines.join("\n\n"))
+                    .scroll((*scroll, 0))
+                    .wrap(Wrap { trim: false })
+                    .block(border(
+                        " Host and notification diagnostics · j/k/PgUp/PgDn scroll · Esc close ",
+                        true,
+                        app,
+                    )),
+                area,
+            );
+            return;
+        }
+        _ => {}
+    }
+    let (title,text):(String,String)=match dialog {
         Dialog::Stop(_)=>("Stop agent session? · y confirm · any other key cancel".into(),"Stop the managed process and its descendants. The recorded conversation and branch remain available. This is separate from detaching the interface.".into()),
         Dialog::StopHost=>("Stop session host? · y confirm · any other key cancel".into(),"The host refuses to stop while agents are alive. Stop each session explicitly first.".into()),
         Dialog::Takeover=>("Take terminal control? · y confirm · any other key cancel".into(),"This revokes the previous UI client's keyboard and resize authority.".into()),
-        Dialog::Sessions {records,cursor}=>{
-            let items=records.iter().enumerate().map(|(index,record)|format!("{} {} · {:?} · {}",if index==*cursor {">"} else {" "},record.provider_session_id,record.health,if record.current {"current"} else {"recorded"})).collect::<Vec<_>>().join("\n");
-            ("Recorded conversations · j/k select · Enter continue · Esc cancel".into(),if items.is_empty() {"No recorded conversations. n starts a new session after brief review.".into()} else {items})
-        }
+        _=>unreachable!(),
     };
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
