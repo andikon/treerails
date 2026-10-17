@@ -435,6 +435,7 @@ async fn terminal_closure_and_cleanup_preview_offer_explicit_stop_then_optional_
     );
     assert!(record.worktree.unwrap().path.exists());
 }
+#[cfg(windows)]
 #[tokio::test]
 async fn actual_host_owner_must_be_verified_stopped_before_cleanup() {
     use std::time::{Duration, Instant};
@@ -542,4 +543,45 @@ async fn actual_host_owner_must_be_verified_stopped_before_cleanup() {
         owner.starting_brief
     );
     client.execute(HostCommand::StopHost).unwrap();
+}
+
+#[tokio::test]
+async fn physical_checkout_lease_blocks_both_cleanup_paths_on_every_platform() {
+    let temp = tempfile::tempdir().unwrap();
+    let (project, flow, record) = prepared(temp.path()).await;
+    let checkout = record.worktree.clone().unwrap();
+    let lease = treerail::host::CheckoutLease::acquire(&checkout.path)
+        .await
+        .unwrap();
+    assert!(
+        git::remove_worktree(&project, &checkout.path)
+            .await
+            .is_err()
+    );
+    assert!(
+        flow.execute_with(
+            &project,
+            Command::Cleanup {
+                ticket: record.id(),
+                expected_checkout: checkout.clone(),
+            },
+            &Source { closed: false }
+        )
+        .await
+        .is_err()
+    );
+    assert!(checkout.path.is_dir());
+    drop(lease);
+    flow.execute_with(
+        &project,
+        Command::Cleanup {
+            ticket: record.id(),
+            expected_checkout: checkout.clone(),
+        },
+        &Source { closed: false },
+    )
+    .await
+    .unwrap();
+    assert!(!checkout.path.exists());
+    assert!(flow.snapshot().unwrap().tickets.contains_key(&record.id()));
 }

@@ -226,8 +226,55 @@ impl Client {
     }
 }
 struct Screen {
-    parser: vt100::Parser,
+    parser: vt100::Parser<TerminalReplies>,
     sequence: u64,
+}
+
+struct TerminalReplies(std::sync::mpsc::SyncSender<Vec<u8>>);
+impl vt100::Callbacks for TerminalReplies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        final_byte: char,
+    ) {
+        // portable-pty enables ConPTY cursor inheritance. Answer the terminal
+        // protocol in the host even when no UI is present; otherwise startup can hang.
+        if i1.is_none() && i2.is_none() && final_byte == 'n' && params == [&[6u16][..]] {
+            let (row, col) = screen.cursor_position();
+            let _ = self
+                .0
+                .try_send(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+        }
+    }
+}
+fn terminal_parser(
+    rows: u16,
+    cols: u16,
+    input: std::sync::mpsc::SyncSender<Vec<u8>>,
+) -> vt100::Parser<TerminalReplies> {
+    vt100::Parser::new_with_callbacks(rows, cols, 2000, TerminalReplies(input))
+}
+
+#[cfg(test)]
+mod terminal_query_tests {
+    #[test]
+    fn detached_terminal_answers_fragmented_cursor_query_from_its_current_screen() {
+        let (input, replies) = std::sync::mpsc::sync_channel(8);
+        let mut parser = super::terminal_parser(24, 80, input);
+        parser.process(b"\x1b[3;5H\x1b[");
+        parser.process(b"6");
+        parser.process(b"n");
+        assert_eq!(
+            replies
+                .try_recv()
+                .expect("Host must answer the cursor query without an attached UI"),
+            b"\x1b[3;5R"
+        );
+        assert!(replies.try_recv().is_err());
+    }
 }
 struct Provider {
     checkout: PathBuf,
@@ -626,7 +673,7 @@ impl Host {
                     }
                 });
                 let screen = Arc::new(Mutex::new(Screen {
-                    parser: vt100::Parser::new(rows, cols, 2000),
+                    parser: terminal_parser(rows, cols, input_tx.clone()),
                     sequence: 0,
                 }));
                 let reader_screen = screen.clone();
