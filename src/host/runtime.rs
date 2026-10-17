@@ -20,6 +20,10 @@ pub struct Request {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum HostCommand {
+    Ticket {
+        config_path: PathBuf,
+        command: crate::hosted::Command,
+    },
     Ping,
     Summary,
     ConfigureSession {
@@ -99,6 +103,7 @@ pub struct TerminalSnapshot {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
+    Ticket(Box<crate::hosted::Event>),
     Pong {
         version: u32,
         instance: String,
@@ -305,6 +310,13 @@ impl Host {
             None
         };
         match command {
+            HostCommand::Ticket {
+                config_path,
+                command,
+            } => {
+                let event = Box::pin(crate::hosted::execute(self, config_path, command)).await?;
+                Ok(Response::Ticket(Box::new(event)))
+            }
             HostCommand::StartCopilot {
                 request_id,
                 checkout,
