@@ -96,6 +96,8 @@ fn session(ticket: &workflow::TicketRecord, health: Health) -> SessionRecord {
         host_session: Some("runtime-id".into()),
         host_instance: None,
         branch: None,
+        pending_start: None,
+        execution_group: None,
         health,
         current: true,
         error: None,

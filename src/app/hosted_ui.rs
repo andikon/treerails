@@ -664,6 +664,7 @@ impl App {
                     let (rows, cols) = self.hosted_dimensions();
                     let command = if let Some(from_session) = from_session {
                         hosted::Command::Handover {
+                            expected_brief: Some(draft_brief(&brief, &handoff.value)),
                             from_session,
                             ticket,
                             task,
