@@ -4,6 +4,7 @@ pub mod discover;
 pub mod feedback;
 pub mod git;
 pub mod host;
+pub mod hosted;
 pub mod launch;
 pub mod notifications;
 pub mod settings;

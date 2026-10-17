@@ -15,6 +15,7 @@ use std::{
 #[serde(default)]
 pub struct WorkflowState {
     pub tickets: BTreeMap<String, TicketRecord>,
+    pub sessions: BTreeMap<String, crate::hosted::SessionRecord>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Issue {
