@@ -1,9 +1,14 @@
 pub mod app;
 pub mod config;
+pub mod copilot;
 pub mod discover;
 pub mod feedback;
 pub mod git;
+pub mod host;
+pub mod hosted;
 pub mod launch;
+pub mod notifications;
 pub mod settings;
 pub mod startup;
 pub mod ui;
+pub mod workflow;

@@ -18,7 +18,7 @@ fn fresh_session_creates_one_document_and_reopens_its_selection() {
         name: "project".into(),
     };
     app.projects.push(project.clone());
-    app.open_project();
+    app.open_basic_project();
     let trees = vec![
         Worktree {
             path: project.path.clone(),
@@ -61,7 +61,7 @@ fn fresh_session_creates_one_document_and_reopens_its_selection() {
         token: "discover".into(),
         result: Ok(Payload::Projects(vec![project.clone()], vec![])),
     });
-    reopened.open_project();
+    reopened.open_basic_project();
     reopened.accept(Completion {
         epoch: reopened.epoch,
         token: "trees".into(),

@@ -15,6 +15,91 @@ Find a project, choose a starting branch, and open your tools in the right works
 
 ![Tree Rail showing four parallel worktrees, colored file status, and an inline Git diff](docs/media/workspace.png)
 
+## Ticket workflow
+
+Enter a project to browse its existing GitHub issues (requires authenticated `gh`).
+Select an issue to inspect its requirements and persisted local tasks; browsing does
+not launch an agent or create a checkout. Each issue initially has one task. Press
+`i` to inspect and explicitly import checklist items under a Markdown heading named
+`Tasks`; other headings, acceptance criteria, prose and code fences are excluded.
+Importing the same title again keeps its original task identity. Select a task with
+Enter and use `p` to cycle Pending → In progress → Done manually. PgUp/PgDn scroll
+requirements.
+
+Press `c` to prepare the ticket's shared worktree with an explicit branch, starting
+point, destination and optional fetch, or `a` to adopt a registered worktree. All
+tasks reuse this association. Original checkouts remain identified and protected by
+the existing cleanup rules. A physical checkout cannot belong to another ticket,
+even through another configuration file. This association does not import or
+control externally launched Copilot conversations.
+
+The direct project → worktree workflow remains available: press `w` on a project or
+from ticket navigation, and `T` in the basic workspace to return to tickets. Existing
+launch profiles, Git actions and read-only `--list` discovery are unchanged.
+Use `R` in a selected ticket to refresh GitHub requirements and state. Changes show
+`Issue updated`; `v` opens the previous/current requirements side by side with a
+task merge preview. `m` explicitly adds new task candidates while keeping existing
+identities and progress; `s` approves the displayed requirements as an instruction
+for the selected live task/session. Existing sessions retain their original starting
+briefs. A changed preview must be inspected again before it can be applied or sent.
+
+When GitHub is unavailable, already known tickets stay available with their last
+successful sync time and an explicit stale warning. This does not change Copilot
+health or require a successful issue refresh to reattach to local work. GitHub
+requests time out after 20 seconds; new offline-only tickets are never invented.
+
+A GitHub closure appears as `Ticket closed` while retaining every task's previous
+progress and every conversation's original brief. Press `D` in a ticket to inspect
+cleanup: the shared checkout, managed owner, protection reasons and unpublished
+local commits are shown before deletion. `x` explicitly requests stopping the
+recorded owner; reopen cleanup once its stop has been verified. `y` removes only a
+clean linked-worktree directory, preserving the branch and all workflow records.
+Running or waiting sessions, uncertain/failed stops, dirty directories, locked or
+missing worktrees, and original checkouts prevent cleanup. The basic deletion path
+also respects managed ownership. Removed checkouts remain identified in ticket
+history and are never silently recreated. GitHub issues and pull requests are not
+changed by cleanup.
+
+Ticket records, timestamps, task identities/progress and checkout associations live
+alongside settings in the combined TOML document; edits retain unrelated settings,
+comments and concurrent changes. Ticket preparation is exposed through the public
+`workflow::Workflow` command/event interface for terminal clients and the later
+session host.
+
+### Hosted Copilot sessions
+
+After preparing the shared worktree, `s` continues the selected task or offers its
+first session. `n` creates a separate conversation after you inspect its starting
+brief and optional handoff. The native Copilot terminal appears inside Tree Rail;
+Enter switches to **AGENT INPUT**, and `Ctrl+]` returns to **NAVIGATION**. The two
+modes have different colors and labels. Escape and Ctrl+C reach Copilot while its
+terminal owns input. Override the return shortcut with a key mapped to
+`agent_navigation` in `[keys]`.
+
+`d` detaches the terminal view, and closing Tree Rail leaves hosted work alive.
+`s` reattaches to the same live process; a stopped conversation resumes its exact
+recorded UUID, without replaying the starting brief. `g` lists retained
+conversations. `x` explicitly stops a session, while `X` stops an empty host.
+`!` explicitly takes terminal control from another UI. A waiting agent still owns
+its checkout; handover and cleanup require a verified stop.
+Use `b` for an inspected handover, `r` to reconcile an interrupted session, and `u`
+to review/retry an unresolved launch using its original request identity. `E` opens
+full host and notification diagnostics.
+
+Running, Needs input and Ready describe agent attention, independently of manual
+task progress. Other hosted tickets remain visible while you type. Lost status
+observation is shown as unavailable, and host interruption requires explicit
+reconciliation rather than automatically restarting agents. Desktop notifications
+are off by default; enable them in settings section **4 Notifications** for input
+requests and session failures. Ready and ordinary output remain quiet.
+
+Native hosted sessions are currently validated on **Windows with Copilot 1.0.94**
+and use its experimental extension interface. The basic worktree workflow remains
+available on Windows, Linux and macOS. See the
+[compatibility evidence](docs/research/copilot-hosting-proof.md) and
+[usage guide](docs/usage.md). The standalone executable also contains the host role;
+it does not require a service installation or a separately downloaded host.
+
 ## Built for the next ticket
 
 Feature development and code review often begin with the same steps: find the repository, find the right branch, create a worktree, and open a terminal. Tree Rail puts those steps in one keyboard-driven interface and stays open while you work.

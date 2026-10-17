@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
+mod hosted_view;
 
 fn color(value: &str, fallback: Color) -> Color {
     value.parse().unwrap_or(fallback)
@@ -90,10 +91,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
             ),
         );
     }
+    if app.latest_operation.is_none() {
+        hosted_view::attention(
+            frame,
+            app,
+            Rect::new(rows[0].x, rows[0].y.saturating_add(1), rows[0].width, 1),
+        );
+    }
     if app.settings_open {
         settings_view(frame, app, rows[1]);
     } else if app.project.is_none() {
         projects(frame, app, rows[1]);
+    } else if app.ticket_mode {
+        tickets(frame, app, rows[1]);
     } else {
         workspace(frame, app, rows[1]);
     }
@@ -122,11 +132,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     {
         " Tab next field · Ctrl+u clear · Enter accept · Ctrl+s apply · Esc explorer (keeps draft) "
     } else if app.settings_open {
-        " 1/2/3 sections · h/l switch · a add · Enter edit · Ctrl+s apply · i output · H history · Esc explorer · D discard "
+        " 1/2/3/4 sections · h/l switch · Enter edit · Ctrl+s apply · Esc explorer · D discard "
     } else if app.project.is_none() {
-        " j/k navigate   / search   Enter explore   , settings   R reload   i output · H history   ? help   q quit "
+        " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
+    } else if app.ticket_mode {
+        " s Continue · n new · Enter input · b handover · r reconcile · u retry · x stop · d detach · g sessions · E errors · D cleanup · w basic "
     } else {
-        " a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
+        " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
@@ -147,6 +159,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         };
         modal_view(frame, app, modal, area);
     }
+    hosted_view::dialog(frame, app, area);
 }
 fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
     let Some(draft) = &app.settings else {
@@ -186,6 +199,7 @@ fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
         crate::settings::Section::Sources,
         crate::settings::Section::Worktrees,
         crate::settings::Section::Profiles,
+        crate::settings::Section::Notifications,
     ];
     frame.render_widget(
         Paragraph::new(Line::from(
@@ -524,6 +538,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     match modal {
+        Modal::Cleanup(preview) => cleanup_preview(frame, app, preview, area),
+        Modal::Requirements(review) => requirements_review(frame, app, review, area),
         Modal::OperationDetails => {
             let Some(record) = app.inspected_operation() else {
                 return;
@@ -703,4 +719,238 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
     }
+}
+
+fn tickets(frame: &mut Frame, app: &App, area: Rect) {
+    let area = if app.hosted.terminal.is_some() {
+        let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(area);
+        hosted_view::terminal(frame, app, panes[1]);
+        panes[0]
+    } else {
+        area
+    };
+    if let Some(ticket) = &app.ticket {
+        let rows = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Percentage(45),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        let checkout = ticket
+            .worktree
+            .as_ref()
+            .map(|wt| {
+                format!(
+                    "{} · {}{}",
+                    wt.branch,
+                    wt.path.display(),
+                    if ticket.checkout_removed_at.is_some() {
+                        " [directory removed; branch retained]"
+                    } else if !wt.path.is_dir() {
+                        " [checkout missing]"
+                    } else if wt.original {
+                        " [original checkout]"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No shared worktree · c create or a adopt".into());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} #{} · {} [{}]{}{}\n{}\nLast sync Unix {} · {}\n{}",
+                ticket.repository,
+                ticket.issue.number,
+                ticket.issue.title,
+                ticket.issue.state,
+                if ticket.is_closed() {
+                    " · Ticket closed"
+                } else {
+                    ""
+                },
+                if ticket.issue_updated() {
+                    " · Issue updated · v inspect"
+                } else {
+                    ""
+                },
+                ticket.issue.url,
+                ticket.fetched_at,
+                checkout,
+                ticket
+                    .github_error
+                    .as_deref()
+                    .unwrap_or("GitHub issue cache · provider health is reported separately")
+            ))
+            .wrap(Wrap { trim: false })
+            .block(border(" Ticket overview ", true, app)),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(ticket.issue.body.clone())
+                .scroll((app.ticket_scroll, 0))
+                .wrap(Wrap { trim: false })
+                .block(border(
+                    " GitHub requirements · PgUp/PgDn scroll ",
+                    false,
+                    app,
+                )),
+            rows[1],
+        );
+        let items: Vec<ListItem> = ticket
+            .tasks
+            .iter()
+            .map(|task| {
+                ListItem::new(format!(
+                    "{} {} · {:?} · {}{}",
+                    if ticket.selected_task.as_ref() == Some(&task.id) {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    task.id,
+                    task.progress,
+                    task.title,
+                    if ticket.is_closed() {
+                        " · Ticket closed"
+                    } else {
+                        ""
+                    }
+                ))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(border(
+                    " Tasks · Enter select · p change progress ",
+                    true,
+                    app,
+                ))
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            rows[2],
+            &mut ListState::default().with_selected(Some(app.task_cursor)),
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .issues
+            .iter()
+            .map(|issue| {
+                ListItem::new(format!(
+                    "#{} [{}] {}",
+                    issue.number, issue.state, issue.title
+                ))
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(border(
+                    if app.issue_warning.is_empty() {
+                        " GitHub tickets · Enter inspect · w basic worktrees "
+                    } else {
+                        " Cached GitHub tickets · stale · Enter inspect · w basic "
+                    },
+                    true,
+                    app,
+                ))
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            area,
+            &mut ListState::default().with_selected(Some(app.issue_cursor)),
+        );
+    }
+}
+
+fn requirements_review(
+    frame: &mut Frame,
+    app: &App,
+    review: &crate::workflow::RequirementsReview,
+    area: Rect,
+) {
+    frame.render_widget(Clear, area);
+    let block = border(
+        " Issue requirements · j/k/PgUp/PgDn scroll · Esc cancel ",
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}\n\n{}",
+            review.previous.title, review.previous.body
+        ))
+        .scroll((app.ticket_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(border(" Previously reviewed requirements ", false, app)),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(review.instructions())
+            .scroll((app.ticket_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(border(
+                " Current requirements · exact text sent by s ",
+                true,
+                app,
+            )),
+        columns[1],
+    );
+    frame.render_widget(Paragraph::new(format!("Task merge preview: retain {} local tasks with their IDs, progress and sessions; add: {}\nm apply task additions explicitly · s send displayed revision to selected live task/session\nExisting sessions keep their original starting briefs. No conversation is created by this action.", review.retained_tasks.len(), if review.additions.is_empty() { "none".into() } else { review.additions.join(", ") })).wrap(Wrap {trim:false}), rows[1]);
+}
+
+fn cleanup_preview(
+    frame: &mut Frame,
+    app: &App,
+    preview: &crate::workflow::CleanupPreview,
+    area: Rect,
+) {
+    frame.render_widget(Clear, area);
+    let block = border(
+        " Ticket worktree cleanup · Esc cancel · j/k scroll ",
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![format!("{} · {}", preview.checkout.branch, preview.checkout.path.display()),
+        "This removes the checkout directory only. Branch, tasks, progress, starting briefs and conversation records are retained.".into()];
+    if let Some(owner) = &preview.owner {
+        lines.push(format!("Managed owner: {} · {:?} · task {}. Running and Needs input both retain ownership. x explicitly stop session, then reopen cleanup.", owner.id, owner.health, owner.task));
+    }
+    if let Some(warning) = &preview.ownership_warning {
+        lines.push(format!(
+            "Physical checkout ownership unavailable: {warning}"
+        ));
+    }
+    for (blocked, reason) in [
+        (preview.original, "Original checkout is protected"),
+        (preview.dirty, "Uncommitted changes: cleanup refused"),
+        (preview.locked, "Worktree is locked; repair with Git first"),
+        (
+            preview.missing,
+            "Checkout missing or no longer registered; records retained",
+        ),
+        (
+            preview.already_removed,
+            "Directory was already removed; records retained",
+        ),
+    ] {
+        if blocked {
+            lines.push(reason.into());
+        }
+    }
+    lines.push(format!("Unpublished local commits: {} (not reachable from locally fetched remote-tracking refs; no automatic fetch)",preview.unpublished_count));
+    lines.extend(preview.unpublished_commits.iter().cloned());
+    if preview.unpublished_count > preview.unpublished_commits.len() as u64 {
+        lines.push("Showing first 100 unpublished commits.".into());
+    }
+    lines.push(if preview.can_remove() { "y remove clean linked-worktree directory; branch is retained · n cancel" } else { "Cleanup blocked. No force-delete bypass. Stop or reconcile the owner and repair protected state first." }.into());
+    frame.render_widget(
+        Paragraph::new(lines.join("\n\n"))
+            .scroll((app.ticket_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }

@@ -11,6 +11,7 @@ pub enum Section {
     Sources,
     Worktrees,
     Profiles,
+    Notifications,
 }
 impl Section {
     pub fn title(self) -> &'static str {
@@ -18,6 +19,7 @@ impl Section {
             Self::Sources => "Sources",
             Self::Worktrees => "Worktrees",
             Self::Profiles => "Profiles",
+            Self::Notifications => "Notifications",
         }
     }
 }
@@ -146,6 +148,13 @@ impl Draft {
                 self.section = Section::Profiles;
                 self.cursor = 0;
             }
+            KeyCode::Char('4') => {
+                self.section = Section::Notifications;
+                self.cursor = 0;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.section == Section::Notifications => {
+                self.config.desktop_notifications = !self.config.desktop_notifications;
+            }
             KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => self.switch_section(-1),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => self.switch_section(1),
             KeyCode::Char('?') => return Action::Help,
@@ -167,6 +176,7 @@ impl Draft {
                     Section::Sources => Editor::source(String::new(), None),
                     Section::Worktrees => Editor::project(&self.config, None),
                     Section::Profiles => Editor::profile(&self.config, None),
+                    Section::Notifications => return Action::None,
                 });
             }
             KeyCode::Char('d')
@@ -200,6 +210,7 @@ impl Draft {
                         &self.config,
                         self.config.profiles.keys().nth(self.cursor).cloned(),
                     ),
+                    Section::Notifications => return Action::None,
                 });
             }
             KeyCode::Char('D') if self.dirty() => self.mode = Mode::Discard { quit: false },
@@ -212,11 +223,13 @@ impl Draft {
             Section::Sources => 0,
             Section::Worktrees => 1,
             Section::Profiles => 2,
+            Section::Notifications => 3,
         };
-        self.section = match (index + step).rem_euclid(3) {
+        self.section = match (index + step).rem_euclid(4) {
             0 => Section::Sources,
             1 => Section::Worktrees,
-            _ => Section::Profiles,
+            2 => Section::Profiles,
+            _ => Section::Notifications,
         };
         self.cursor = 0;
     }
@@ -231,6 +244,14 @@ impl Draft {
     }
     pub fn rows(&self) -> Vec<String> {
         match self.section {
+            Section::Notifications => vec![format!(
+                " Desktop notifications: {}  [Enter toggles; input requests and session failures only]",
+                if self.config.desktop_notifications {
+                    "on"
+                } else {
+                    "off"
+                }
+            )],
             Section::Sources => {
                 let mut rows: Vec<String> = self
                     .config
