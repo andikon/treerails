@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod copilot;
 pub mod discover;
 pub mod feedback;
 pub mod git;
