@@ -12,6 +12,62 @@ _Avoid_: Worktree when referring to the repository as a whole.
 A checked-out workspace belonging to a project, including its original checkout or a linked worktree.
 _Avoid_: Project when referring to one checked-out workspace.
 
+**Ticket**:
+A GitHub Issue defining a requested outcome and its acceptance criteria. A ticket can contain multiple tasks sharing its worktree.
+_Avoid_: Task when referring to the issue as a whole.
+
+**Task**:
+A workstream tracked by Tree Rail within a ticket, such as implementation or review. A task can have multiple agent sessions.
+_Avoid_: Ticket or agent session when referring to the workstream.
+
+**Agent session**:
+An agent conversation associated with a task.
+_Avoid_: Session without qualification when it could mean the running Tree Rail application.
+
+**Session attention**:
+Whether an agent session is Running, Needs input, or Ready for another instruction.
+_Avoid_: Task completion when describing the agent's current interaction state.
+
+**Session health**:
+Whether Tree Rail can reliably observe and control an agent session, including interruption or unavailable status observation.
+_Avoid_: Session attention when describing a failure to observe or control the session.
+
+**Starting brief**:
+The issue content, task objective, workspace context and optional handoff captured for the start of an agent session.
+_Avoid_: Conversation transcript when referring to the supplied starting context.
+
+**Workflow state**:
+Tree Rail's retained tasks, starting briefs, issue snapshots and agent-session associations for ticket work.
+_Avoid_: Configuration for work records or remembered selections for the entire workflow state.
+
+**Session host**:
+Tree Rail's background owner of live agent sessions, their terminal state, and their ticket-worktree ownership, independent of an attached UI.
+_Avoid_: Agent session when referring to the host itself.
+
+**UI client**:
+A Tree Rail interface connected to the session host to view and control ticket work.
+_Avoid_: Session host when referring to the attached interface.
+
+**Detach**:
+Disconnect a UI client while hosted agent sessions continue running or waiting for input.
+_Avoid_: Stop when only the interface is disconnected.
+
+**Reattach**:
+Reconnect a UI client to an existing live agent terminal in the session host.
+_Avoid_: Resume when returning to a process that is still running.
+
+**Resume**:
+Continue a saved agent conversation after its previous live terminal has ended.
+_Avoid_: Reattach when a new live terminal is needed to continue the conversation.
+
+**Navigation mode**:
+The input mode in which keyboard actions control Tree Rail navigation and workflow actions.
+_Avoid_: Agent-input mode when Tree Rail receives the keys.
+
+**Agent-input mode**:
+The input mode in which keyboard actions control the selected hosted agent terminal, except for the configured shortcut back to navigation mode.
+_Avoid_: Navigation mode when the agent receives the keys.
+
 **Project source**:
 A directory supplied for project discovery, either a repository itself or a parent directory containing repositories.
 _Avoid_: Project when referring to a parent directory containing several repositories.
