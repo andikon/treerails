@@ -285,6 +285,7 @@ impl Picker {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
+    Cleanup(Box<workflow::CleanupPreview>),
     Requirements(Box<workflow::RequirementsReview>),
     OperationDetails,
     Form(Form),
@@ -303,6 +304,7 @@ pub struct App {
     pub ticket_scroll: u16,
     pub issue_warning: String,
     pub pending_revision: Option<workflow::RevisionRequest>,
+    pub pending_cleanup_stop: Option<String>,
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
@@ -384,6 +386,7 @@ impl App {
             ticket_scroll: 0,
             issue_warning: String::new(),
             pending_revision: None,
+            pending_cleanup_stop: None,
             config,
             state,
             config_path,
@@ -503,6 +506,19 @@ impl App {
             .selected_tree()
             .map(|t| t.path.clone())
             .unwrap_or(project.path.clone());
+        if let Operation::Remove(target) = &op {
+            match workflow::Workflow::new(&self.config_path).snapshot() {
+                Ok(state) if workflow::deletion_owner(&state, target).is_none() => {}
+                Ok(_) => {
+                    self.say("Managed session has not been verified stopped; use ticket cleanup to stop it explicitly", true);
+                    return;
+                }
+                Err(error) => {
+                    self.say(format!("Cannot verify managed ownership: {error:#}"), true);
+                    return;
+                }
+            }
+        }
         self.busy = true;
         self.epoch += 1;
         let id = self.next_operation_id;
@@ -716,6 +732,10 @@ impl App {
                     self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
                     self.issue_warning = warning.clone();
                     self.say(warning, true);
+                }
+                WorkflowEvent::CleanupPreview(preview) => {
+                    self.ticket_scroll = 0;
+                    self.modal = Some(Modal::Cleanup(Box::new(preview)));
                 }
                 WorkflowEvent::Requirements(review) => {
                     self.ticket_scroll = 0;
@@ -1729,6 +1749,7 @@ impl App {
             return;
         }
         match modal {
+            Modal::Cleanup(preview) => self.cleanup_key(key, preview),
             Modal::Requirements(review) => self.requirements_key(key, review),
             Modal::OperationDetails => {
                 let count = self
@@ -2193,6 +2214,13 @@ impl App {
                     .unwrap_or(WorkflowCommand::List);
                 self.workflow_command(command);
             }
+            KeyCode::Char('D') => {
+                if let Some(ticket) = &self.ticket {
+                    self.workflow_command(WorkflowCommand::PreviewCleanup {
+                        ticket: ticket.id(),
+                    });
+                }
+            }
             KeyCode::Char('v') => {
                 if let Some(ticket) = &self.ticket {
                     self.workflow_command(WorkflowCommand::InspectUpdate {
@@ -2308,6 +2336,36 @@ impl App {
             _ => {}
         }
         self.modal = Some(Modal::Requirements(review));
+    }
+    fn cleanup_key(&mut self, key: KeyEvent, preview: Box<workflow::CleanupPreview>) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('n') => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('y') if key.kind == KeyEventKind::Press && preview.can_remove() => {
+                self.workflow_command(WorkflowCommand::Cleanup {
+                    ticket: preview.ticket,
+                    expected_checkout: preview.checkout,
+                });
+                return;
+            }
+            KeyCode::Char('x') if key.kind == KeyEventKind::Press => {
+                if let Some(owner) = &preview.owner {
+                    self.pending_cleanup_stop = Some(owner.id.clone());
+                    self.say(
+                        "Explicit session stop requested; reopen cleanup after verified stop",
+                        false,
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::Cleanup(preview));
     }
     pub fn save(&mut self) -> Result<()> {
         if let (Some(snapshot), Some(token)) = (&self.hosted.terminal, self.hosted.token) {

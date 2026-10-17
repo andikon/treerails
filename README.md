@@ -48,6 +48,18 @@ successful sync time and an explicit stale warning. This does not change Copilot
 health or require a successful issue refresh to reattach to local work. GitHub
 requests time out after 20 seconds; new offline-only tickets are never invented.
 
+A GitHub closure appears as `Ticket closed` while retaining every task's previous
+progress and every conversation's original brief. Press `D` in a ticket to inspect
+cleanup: the shared checkout, managed owner, protection reasons and unpublished
+local commits are shown before deletion. `x` explicitly requests stopping the
+recorded owner; reopen cleanup once its stop has been verified. `y` removes only a
+clean linked-worktree directory, preserving the branch and all workflow records.
+Running or waiting sessions, uncertain/failed stops, dirty directories, locked or
+missing worktrees, and original checkouts prevent cleanup. The basic deletion path
+also respects managed ownership. Removed checkouts remain identified in ticket
+history and are never silently recreated. GitHub issues and pull requests are not
+changed by cleanup.
+
 Ticket records, timestamps, task identities/progress and checkout associations live
 alongside settings in the combined TOML document; edits retain unrelated settings,
 comments and concurrent changes. Ticket preparation is exposed through the public

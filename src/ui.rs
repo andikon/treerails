@@ -136,7 +136,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.project.is_none() {
         " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
     } else if app.ticket_mode {
-        " s Continue · n new session · Enter input · x stop · d detach · ! takeover · g conversations · c create · a adopt · w basic · Esc back "
+        " s Continue · n new · Enter input · x stop · d detach · ! takeover · g conversations · c create · a adopt · D cleanup · w basic · Esc back "
     } else {
         " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
@@ -538,6 +538,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     match modal {
+        Modal::Cleanup(preview) => cleanup_preview(frame, app, preview, area),
         Modal::Requirements(review) => requirements_review(frame, app, review, area),
         Modal::OperationDetails => {
             let Some(record) = app.inspected_operation() else {
@@ -744,7 +745,11 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
                     "{} · {}{}",
                     wt.branch,
                     wt.path.display(),
-                    if wt.original {
+                    if ticket.checkout_removed_at.is_some() {
+                        " [directory removed; branch retained]"
+                    } else if !wt.path.is_dir() {
+                        " [checkout missing]"
+                    } else if wt.original {
                         " [original checkout]"
                     } else {
                         ""
@@ -754,11 +759,16 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_else(|| "No shared worktree · c create or a adopt".into());
         frame.render_widget(
             Paragraph::new(format!(
-                "{} #{} · {} [{}]{}\n{}\nLast sync Unix {} · {}\n{}",
+                "{} #{} · {} [{}]{}{}\n{}\nLast sync Unix {} · {}\n{}",
                 ticket.repository,
                 ticket.issue.number,
                 ticket.issue.title,
                 ticket.issue.state,
+                if ticket.is_closed() {
+                    " · Ticket closed"
+                } else {
+                    ""
+                },
                 if ticket.issue_updated() {
                     " · Issue updated · v inspect"
                 } else {
@@ -792,7 +802,7 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             .iter()
             .map(|task| {
                 ListItem::new(format!(
-                    "{} {} · {:?} · {}",
+                    "{} {} · {:?} · {}{}",
                     if ticket.selected_task.as_ref() == Some(&task.id) {
                         "●"
                     } else {
@@ -800,7 +810,12 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
                     },
                     task.id,
                     task.progress,
-                    task.title
+                    task.title,
+                    if ticket.is_closed() {
+                        " · Ticket closed"
+                    } else {
+                        ""
+                    }
                 ))
             })
             .collect();
@@ -883,4 +898,59 @@ fn requirements_review(
         columns[1],
     );
     frame.render_widget(Paragraph::new(format!("Task merge preview: retain {} local tasks with their IDs, progress and sessions; add: {}\nm apply task additions explicitly · s send displayed revision to selected live task/session\nExisting sessions keep their original starting briefs. No conversation is created by this action.", review.retained_tasks.len(), if review.additions.is_empty() { "none".into() } else { review.additions.join(", ") })).wrap(Wrap {trim:false}), rows[1]);
+}
+
+fn cleanup_preview(
+    frame: &mut Frame,
+    app: &App,
+    preview: &crate::workflow::CleanupPreview,
+    area: Rect,
+) {
+    frame.render_widget(Clear, area);
+    let block = border(
+        " Ticket worktree cleanup · Esc cancel · j/k scroll ",
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![format!("{} · {}", preview.checkout.branch, preview.checkout.path.display()),
+        "This removes the checkout directory only. Branch, tasks, progress, starting briefs and conversation records are retained.".into()];
+    if let Some(owner) = &preview.owner {
+        lines.push(format!("Managed owner: {} · {:?} · task {}. Running and Needs input both retain ownership. x explicitly stop session, then reopen cleanup.", owner.id, owner.health, owner.task));
+    }
+    if let Some(warning) = &preview.ownership_warning {
+        lines.push(format!(
+            "Physical checkout ownership unavailable: {warning}"
+        ));
+    }
+    for (blocked, reason) in [
+        (preview.original, "Original checkout is protected"),
+        (preview.dirty, "Uncommitted changes: cleanup refused"),
+        (preview.locked, "Worktree is locked; repair with Git first"),
+        (
+            preview.missing,
+            "Checkout missing or no longer registered; records retained",
+        ),
+        (
+            preview.already_removed,
+            "Directory was already removed; records retained",
+        ),
+    ] {
+        if blocked {
+            lines.push(reason.into());
+        }
+    }
+    lines.push(format!("Unpublished local commits: {} (not reachable from locally fetched remote-tracking refs; no automatic fetch)",preview.unpublished_count));
+    lines.extend(preview.unpublished_commits.iter().cloned());
+    if preview.unpublished_count > preview.unpublished_commits.len() as u64 {
+        lines.push("Showing first 100 unpublished commits.".into());
+    }
+    lines.push(if preview.can_remove() { "y remove clean linked-worktree directory; branch is retained · n cancel" } else { "Cleanup blocked. No force-delete bypass. Stop or reconcile the owner and repair protected state first." }.into());
+    frame.render_widget(
+        Paragraph::new(lines.join("\n\n"))
+            .scroll((app.ticket_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }

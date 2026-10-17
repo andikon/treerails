@@ -286,6 +286,9 @@ impl App {
         self.hosted.token = None;
     }
     pub fn hosted_tick(&mut self) {
+        if let Some(session) = self.pending_cleanup_stop.take() {
+            self.session_command(hosted::Command::Stop { session });
+        }
         if self.hosted.notifications_enabled != self.config.desktop_notifications {
             self.hosted.notifications_enabled = self.config.desktop_notifications;
             let active = self

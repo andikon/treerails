@@ -45,8 +45,13 @@ pub struct TicketRecord {
     pub next_task_id: u64,
     pub selected_task: Option<String>,
     pub worktree: Option<Checkout>,
+    #[serde(default)]
+    pub checkout_removed_at: Option<u64>,
 }
 impl TicketRecord {
+    pub fn is_closed(&self) -> bool {
+        self.issue.state.eq_ignore_ascii_case("closed")
+    }
     pub fn id(&self) -> String {
         format!("{}#{}", self.repository, self.issue.number)
     }
@@ -120,6 +125,13 @@ pub enum Command {
         task: String,
         progress: Progress,
     },
+    PreviewCleanup {
+        ticket: String,
+    },
+    Cleanup {
+        ticket: String,
+        expected_checkout: Checkout,
+    },
     Prepare {
         ticket: String,
         preparation: Preparation,
@@ -134,6 +146,7 @@ pub enum Event {
     CachedIssues { issues: Vec<Issue>, warning: String },
     Requirements(RequirementsReview),
     RevisionRequested(RevisionRequest),
+    CleanupPreview(CleanupPreview),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +198,47 @@ impl TicketRecord {
             fetched_at: self.fetched_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupPreview {
+    pub ticket: String,
+    pub checkout: Checkout,
+    pub owner: Option<crate::hosted::SessionRecord>,
+    pub missing: bool,
+    pub original: bool,
+    pub locked: bool,
+    pub dirty: bool,
+    pub unpublished_count: u64,
+    pub unpublished_commits: Vec<String>,
+    pub ownership_warning: Option<String>,
+    pub already_removed: bool,
+}
+impl CleanupPreview {
+    pub fn can_remove(&self) -> bool {
+        !self.missing
+            && !self.original
+            && !self.locked
+            && !self.dirty
+            && !self.already_removed
+            && self.owner.is_none()
+            && self.ownership_warning.is_none()
+    }
+}
+/// A failed or interrupted stop is deliberately conservative until reconciled.
+/// The OS lease additionally protects against owners in other config contexts.
+pub fn deletion_owner<'a>(
+    state: &'a WorkflowState,
+    checkout: &Path,
+) -> Option<&'a crate::hosted::SessionRecord> {
+    state
+        .sessions
+        .values()
+        .filter(|session| {
+            config::same_path(&session.checkout, checkout)
+                && session.health != crate::hosted::Health::Stopped
+        })
+        .max_by_key(|session| session.created_at)
 }
 
 /// Inject GitHub transport without substituting workflow policy in tests.
@@ -332,6 +386,7 @@ impl Workflow {
                         next_task_id: 1,
                         selected_task: None,
                         worktree: None,
+                        checkout_removed_at: None,
                     });
                     record.issue = issue;
                     record.fetched_at = now();
@@ -413,12 +468,46 @@ impl Workflow {
                     .progress = progress;
                 Ok(())
             }),
+            Command::PreviewCleanup { ticket } => Ok(Event::CleanupPreview(
+                self.cleanup_preview(project, &ticket).await?,
+            )),
+            Command::Cleanup {
+                ticket,
+                expected_checkout,
+            } => {
+                let _preparation_lock = preparation_lock(project).await?;
+                let state = self.snapshot()?;
+                let record = self.record(project, &ticket)?;
+                ensure!(
+                    record.worktree.as_ref() == Some(&expected_checkout),
+                    "Ticket checkout changed after preview; inspect cleanup again"
+                );
+                ensure!(
+                    record.checkout_removed_at.is_none(),
+                    "This ticket checkout was already removed"
+                );
+                ensure!(
+                    deletion_owner(&state, &expected_checkout.path).is_none(),
+                    "A recorded managed session has not been verified stopped; stop or reconcile it before cleanup"
+                );
+                let lease = crate::host::CheckoutLease::acquire(&expected_checkout.path).await?;
+                git::remove_worktree_leased(project, &expected_checkout.path, &lease).await?;
+                self.change(project, &ticket, |record| {
+                    ensure!(record.worktree.as_ref() == Some(&expected_checkout), "Checkout removed but ticket association changed concurrently; inspect its history");
+                    record.checkout_removed_at = Some(now());
+                    Ok(())
+                })
+            }
             Command::Prepare {
                 ticket,
                 preparation,
             } => {
                 let _preparation_lock = preparation_lock(project).await?;
                 let record = self.record(project, &ticket)?;
+                ensure!(
+                    record.checkout_removed_at.is_none(),
+                    "Ticket checkout was removed; its retained history cannot be automatically recreated"
+                );
                 if let Some(checkout) = record.worktree {
                     ensure!(
                         git::worktrees(project)
@@ -523,6 +612,70 @@ impl Workflow {
                 }
             }
             Ok(())
+        })
+    }
+    pub async fn cleanup_preview(&self, project: &Path, ticket: &str) -> Result<CleanupPreview> {
+        let record = self.record(project, ticket)?;
+        let checkout = record
+            .worktree
+            .context("This ticket has no associated checkout")?;
+        let state = self.snapshot()?;
+        let owner = deletion_owner(&state, &checkout.path).cloned();
+        let trees = git::worktrees(project).await?;
+        let registered = trees
+            .iter()
+            .find(|tree| config::same_path(&tree.path, &checkout.path));
+        let missing = !checkout.path.is_dir()
+            || registered.is_none()
+            || registered.is_some_and(|tree| tree.prunable);
+        let original = checkout.original || registered.is_some_and(|tree| tree.original);
+        let locked = registered.is_some_and(|tree| tree.locked);
+        let mut dirty = false;
+        let mut unpublished_count = 0;
+        let mut unpublished_commits = vec![];
+        let mut ownership_warning = None;
+        if !missing {
+            dirty = !git::status(&checkout.path).await?.files.is_empty();
+            unpublished_count = git::text(
+                &checkout.path,
+                &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+            )
+            .await?
+            .trim()
+            .parse()
+            .context("Read unpublished commit count")?;
+            unpublished_commits = git::text(
+                &checkout.path,
+                &[
+                    "log",
+                    "-n",
+                    "100",
+                    "--format=%h %s",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                ],
+            )
+            .await?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+            if let Err(error) = crate::host::CheckoutLease::acquire(&checkout.path).await {
+                ownership_warning = Some(format!("{error:#}"));
+            }
+        }
+        Ok(CleanupPreview {
+            ticket: ticket.into(),
+            checkout,
+            owner,
+            missing,
+            original,
+            locked,
+            dirty,
+            unpublished_count,
+            unpublished_commits,
+            ownership_warning,
+            already_removed: record.checkout_removed_at.is_some(),
         })
     }
     fn record(&self, project: &Path, ticket: &str) -> Result<TicketRecord> {

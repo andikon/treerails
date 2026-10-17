@@ -60,6 +60,8 @@ pub enum Command {
     },
 }
 
+// Workflow events retain complete durable snapshots.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     Workflow(workflow::Event),
