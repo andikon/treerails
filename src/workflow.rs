@@ -32,6 +32,14 @@ pub struct TicketRecord {
     pub issue: Issue,
     pub fetched_at: u64,
     #[serde(default)]
+    pub prepared_issue: Option<Issue>,
+    #[serde(default)]
+    pub reviewed_issue: Option<Issue>,
+    #[serde(default)]
+    pub github_error: Option<String>,
+    #[serde(default)]
+    pub last_attempt_at: Option<u64>,
+    #[serde(default)]
     pub tasks: Vec<Task>,
     #[serde(default)]
     pub next_task_id: u64,
@@ -84,6 +92,21 @@ pub enum Command {
     Reopen {
         ticket: String,
     },
+    Refresh {
+        ticket: String,
+    },
+    InspectUpdate {
+        ticket: String,
+    },
+    ApplyTaskMerge {
+        ticket: String,
+        expected_issue: Issue,
+    },
+    ReviseInstructions {
+        ticket: String,
+        task: String,
+        expected_issue: Issue,
+    },
     ImportTasks {
         ticket: String,
         titles: Vec<String>,
@@ -108,6 +131,60 @@ pub enum Command {
 pub enum Event {
     Issues(Vec<Issue>),
     Ticket(TicketRecord),
+    CachedIssues { issues: Vec<Issue>, warning: String },
+    Requirements(RequirementsReview),
+    RevisionRequested(RevisionRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequirementsReview {
+    pub ticket: String,
+    pub previous: Issue,
+    pub current: Issue,
+    pub retained_tasks: Vec<Task>,
+    pub additions: Vec<String>,
+    pub fetched_at: u64,
+}
+impl RequirementsReview {
+    pub fn instructions(&self) -> String {
+        format!(
+            "Revised requirements for {}\n{}\n\n{}",
+            self.current.url, self.current.title, self.current.body
+        )
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevisionRequest {
+    pub ticket: String,
+    pub task: String,
+    pub expected_issue: Issue,
+    pub instructions: String,
+}
+impl TicketRecord {
+    pub fn issue_updated(&self) -> bool {
+        self.reviewed_issue
+            .as_ref()
+            .or(self.prepared_issue.as_ref())
+            .is_some_and(|old| old.title != self.issue.title || old.body != self.issue.body)
+    }
+    pub fn requirements_review(&self) -> RequirementsReview {
+        RequirementsReview {
+            ticket: self.id(),
+            previous: self
+                .reviewed_issue
+                .as_ref()
+                .or(self.prepared_issue.as_ref())
+                .unwrap_or(&self.issue)
+                .clone(),
+            current: self.issue.clone(),
+            retained_tasks: self.tasks.clone(),
+            additions: import_candidates(&self.issue.body)
+                .into_iter()
+                .filter(|title| !self.tasks.iter().any(|task| &task.title == title))
+                .collect(),
+            fetched_at: self.fetched_at,
+        }
+    }
 }
 
 /// Inject GitHub transport without substituting workflow policy in tests.
@@ -120,12 +197,15 @@ pub trait IssueSource {
 pub struct Github;
 impl Github {
     async fn json<T: serde::de::DeserializeOwned>(project: &Path, args: &[&str]) -> Result<T> {
-        let output = tokio::process::Command::new("gh")
+        let mut command = tokio::process::Command::new("gh");
+        command
             .args(args)
             .current_dir(project)
             .stdin(std::process::Stdio::null())
-            .output()
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
             .await
+            .context("GitHub request timed out after 20 seconds")?
             .context("Run GitHub CLI")?;
         ensure!(
             output.status.success(),
@@ -201,8 +281,35 @@ impl Workflow {
         source: &impl IssueSource,
     ) -> Result<Event> {
         match command {
-            Command::List => Ok(Event::Issues(source.list(project).await?)),
+            Command::List => match source.list(project).await {
+                Ok(issues) => Ok(Event::Issues(issues)),
+                Err(error) => {
+                    let issues: Vec<_> = self
+                        .snapshot()?
+                        .tickets
+                        .values()
+                        .filter(|record| config::same_path(project, &record.project))
+                        .map(|record| record.issue.clone())
+                        .collect();
+                    if issues.is_empty() {
+                        return Err(error).context(
+                            "GitHub unavailable; no known tickets are cached for this project",
+                        );
+                    }
+                    Ok(Event::CachedIssues {
+                        issues,
+                        warning: format!(
+                            "GitHub unavailable: {error:#}. Showing known cached tickets; issue state may be stale."
+                        ),
+                    })
+                }
+            },
             Command::Open { number } => {
+                if let Some(record) = self.snapshot()?.tickets.values().find(|record| {
+                    record.issue.number == number && config::same_path(project, &record.project)
+                }) {
+                    return self.refresh(project, &record.id(), source).await;
+                }
                 let repository = source.repository(project).await?;
                 let issue = source.get(project, number).await?;
                 ensure!(
@@ -217,6 +324,10 @@ impl Workflow {
                         project,
                         issue: issue.clone(),
                         fetched_at: now(),
+                        prepared_issue: Some(issue.clone()),
+                        reviewed_issue: Some(issue.clone()),
+                        github_error: None,
+                        last_attempt_at: Some(now()),
                         tasks: vec![],
                         next_task_id: 1,
                         selected_task: None,
@@ -232,6 +343,46 @@ impl Workflow {
                 .map(Event::Ticket)
             }
             Command::Reopen { ticket } => Ok(Event::Ticket(self.record(project, &ticket)?)),
+            Command::Refresh { ticket } => self.refresh(project, &ticket, source).await,
+            Command::InspectUpdate { ticket } => Ok(Event::Requirements(
+                self.record(project, &ticket)?.requirements_review(),
+            )),
+            Command::ApplyTaskMerge {
+                ticket,
+                expected_issue,
+            } => self.change(project, &ticket, |record| {
+                ensure!(
+                    record.issue == expected_issue,
+                    "Issue changed after preview; inspect the update again"
+                );
+                for title in record.requirements_review().additions {
+                    add_task(record, title);
+                }
+                record.reviewed_issue = Some(record.issue.clone());
+                Ok(())
+            }),
+            Command::ReviseInstructions {
+                ticket,
+                task,
+                expected_issue,
+            } => {
+                let record = self.record(project, &ticket)?;
+                ensure!(
+                    record.issue == expected_issue,
+                    "Issue changed after preview; inspect the update again"
+                );
+                ensure!(
+                    record.selected_task.as_ref() == Some(&task)
+                        && record.tasks.iter().any(|candidate| candidate.id == task),
+                    "Select the task again before sending revised requirements"
+                );
+                Ok(Event::RevisionRequested(RevisionRequest {
+                    ticket,
+                    task,
+                    expected_issue,
+                    instructions: record.requirements_review().instructions(),
+                }))
+            }
             Command::ImportTasks { ticket, titles } => {
                 ensure!(!titles.is_empty(), "Select at least one task to import");
                 self.change(project, &ticket, |record| {
@@ -336,6 +487,43 @@ impl Workflow {
                 result
             }
         }
+    }
+    async fn refresh(
+        &self,
+        project: &Path,
+        ticket: &str,
+        source: &impl IssueSource,
+    ) -> Result<Event> {
+        let before = self.record(project, ticket)?;
+        // Local attachment never depends on GitHub availability; failures update
+        // only cache freshness/availability and leave provider state untouched.
+        let result = source.get(project, before.issue.number).await;
+        self.change(project, ticket, |record| {
+            if record.prepared_issue.is_none() {
+                record.prepared_issue = Some(record.issue.clone());
+            }
+            if record.reviewed_issue.is_none() {
+                record.reviewed_issue = Some(record.issue.clone());
+            }
+            record.last_attempt_at = Some(now());
+            match result {
+                Ok(issue) => {
+                    ensure!(
+                        issue.number == record.issue.number && issue.url == record.issue.url,
+                        "GitHub issue identity changed unexpectedly"
+                    );
+                    record.issue = issue;
+                    record.fetched_at = now();
+                    record.github_error = None;
+                }
+                Err(error) => {
+                    record.github_error = Some(format!(
+                        "GitHub unavailable: {error:#}. Cached issue state may be stale."
+                    ))
+                }
+            }
+            Ok(())
+        })
     }
     fn record(&self, project: &Path, ticket: &str) -> Result<TicketRecord> {
         let state = self.snapshot()?;

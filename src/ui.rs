@@ -128,7 +128,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.project.is_none() {
         " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
     } else if app.ticket_mode {
-        " j/k select · Enter open/select · c create · a adopt · i import · p progress · w basic · R refresh · Esc back "
+        " j/k select · Enter open/select · c create · a adopt · i import · p progress · w basic · R refresh · v requirements · Esc back "
     } else {
         " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
     };
@@ -529,6 +529,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     match modal {
+        Modal::Requirements(review) => requirements_review(frame, app, review, area),
         Modal::OperationDetails => {
             let Some(record) = app.inspected_operation() else {
                 return;
@@ -713,7 +714,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
 fn tickets(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(ticket) = &app.ticket {
         let rows = Layout::vertical([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Percentage(45),
             Constraint::Min(3),
         ])
@@ -736,14 +737,23 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_else(|| "No shared worktree · c create or a adopt".into());
         frame.render_widget(
             Paragraph::new(format!(
-                "{} #{} · {} [{}]\n{}\nCached at Unix {} · {}",
+                "{} #{} · {} [{}]{}\n{}\nLast sync Unix {} · {}\n{}",
                 ticket.repository,
                 ticket.issue.number,
                 ticket.issue.title,
                 ticket.issue.state,
+                if ticket.issue_updated() {
+                    " · Issue updated · v inspect"
+                } else {
+                    ""
+                },
                 ticket.issue.url,
                 ticket.fetched_at,
-                checkout
+                checkout,
+                ticket
+                    .github_error
+                    .as_deref()
+                    .unwrap_or("GitHub issue cache · provider health is reported separately")
             ))
             .wrap(Wrap { trim: false })
             .block(border(" Ticket overview ", true, app)),
@@ -802,7 +812,11 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_stateful_widget(
             List::new(items)
                 .block(border(
-                    " GitHub tickets · Enter inspect · w basic worktrees ",
+                    if app.issue_warning.is_empty() {
+                        " GitHub tickets · Enter inspect · w basic worktrees "
+                    } else {
+                        " Cached GitHub tickets · stale · Enter inspect · w basic "
+                    },
                     true,
                     app,
                 ))
@@ -811,4 +825,45 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             &mut ListState::default().with_selected(Some(app.issue_cursor)),
         );
     }
+}
+
+fn requirements_review(
+    frame: &mut Frame,
+    app: &App,
+    review: &crate::workflow::RequirementsReview,
+    area: Rect,
+) {
+    frame.render_widget(Clear, area);
+    let block = border(
+        " Issue requirements · j/k/PgUp/PgDn scroll · Esc cancel ",
+        true,
+        app,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}\n\n{}",
+            review.previous.title, review.previous.body
+        ))
+        .scroll((app.ticket_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(border(" Previously reviewed requirements ", false, app)),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(review.instructions())
+            .scroll((app.ticket_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(border(
+                " Current requirements · exact text sent by s ",
+                true,
+                app,
+            )),
+        columns[1],
+    );
+    frame.render_widget(Paragraph::new(format!("Task merge preview: retain {} local tasks with their IDs, progress and sessions; add: {}\nm apply task additions explicitly · s send displayed revision to selected live task/session\nExisting sessions keep their original starting briefs. No conversation is created by this action.", review.retained_tasks.len(), if review.additions.is_empty() { "none".into() } else { review.additions.join(", ") })).wrap(Wrap {trim:false}), rows[1]);
 }

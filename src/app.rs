@@ -53,6 +53,8 @@ pub enum Job {
         op: Operation,
     },
 }
+// Workflow snapshots deliberately cross the job boundary by value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
     Workflow(WorkflowEvent),
@@ -276,6 +278,7 @@ impl Picker {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
+    Requirements(Box<workflow::RequirementsReview>),
     OperationDetails,
     Form(Form),
     Picker(Picker),
@@ -290,6 +293,8 @@ pub struct App {
     pub ticket: Option<TicketRecord>,
     pub task_cursor: usize,
     pub ticket_scroll: u16,
+    pub issue_warning: String,
+    pub pending_revision: Option<workflow::RevisionRequest>,
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
@@ -368,6 +373,8 @@ impl App {
             ticket: None,
             task_cursor: 0,
             ticket_scroll: 0,
+            issue_warning: String::new(),
+            pending_revision: None,
             config,
             state,
             config_path,
@@ -681,9 +688,27 @@ impl App {
             }
             Ok(Payload::Workflow(event)) => match event {
                 WorkflowEvent::Issues(issues) => {
+                    self.issue_warning.clear();
                     self.issues = issues;
                     self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
                     self.say("Select a GitHub issue · w basic worktrees", false);
+                }
+                WorkflowEvent::CachedIssues { issues, warning } => {
+                    self.issues = issues;
+                    self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
+                    self.issue_warning = warning.clone();
+                    self.say(warning, true);
+                }
+                WorkflowEvent::Requirements(review) => {
+                    self.ticket_scroll = 0;
+                    self.modal = Some(Modal::Requirements(Box::new(review)));
+                }
+                WorkflowEvent::RevisionRequested(request) => {
+                    self.pending_revision = Some(request);
+                    self.say(
+                        "Revised requirements approved; awaiting the selected live session",
+                        false,
+                    );
                 }
                 WorkflowEvent::Ticket(ticket) => {
                     if self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id()) {
@@ -694,11 +719,18 @@ impl App {
                             .unwrap_or(0);
                         self.ticket_scroll = 0;
                     }
+                    let warning = ticket.github_error.clone();
+                    let updated = ticket.issue_updated();
                     self.ticket = Some(ticket);
-                    self.say(
-                        "Ticket ready · c create or a adopt shared worktree · i import tasks",
-                        false,
-                    );
+                    let unavailable = warning.is_some();
+                    let message = warning.unwrap_or_else(|| {
+                        if updated {
+                            "Issue updated · v inspect requirements · R refresh".into()
+                        } else {
+                            "Ticket ready · c create or a adopt shared worktree · i import tasks · R refresh".into()
+                        }
+                    });
+                    self.say(message, unavailable);
                 }
             },
             Ok(Payload::Projects(projects, warnings)) => {
@@ -1675,6 +1707,7 @@ impl App {
             return;
         }
         match modal {
+            Modal::Requirements(review) => self.requirements_key(key, review),
             Modal::OperationDetails => {
                 let count = self
                     .inspected_operation()
@@ -2103,7 +2136,23 @@ impl App {
             }
             KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
             KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
-            KeyCode::Char('R') => self.workflow_command(WorkflowCommand::List),
+            KeyCode::Char('R') => {
+                let command = self
+                    .ticket
+                    .as_ref()
+                    .map(|record| WorkflowCommand::Refresh {
+                        ticket: record.id(),
+                    })
+                    .unwrap_or(WorkflowCommand::List);
+                self.workflow_command(command);
+            }
+            KeyCode::Char('v') => {
+                if let Some(ticket) = &self.ticket {
+                    self.workflow_command(WorkflowCommand::InspectUpdate {
+                        ticket: ticket.id(),
+                    });
+                }
+            }
             KeyCode::Char('p') => {
                 if let Some(ticket) = &self.ticket
                     && let Some(task) = ticket.tasks.get(self.task_cursor)
@@ -2174,6 +2223,44 @@ impl App {
             _ => {}
         }
         true
+    }
+    fn requirements_key(&mut self, key: KeyEvent, review: Box<workflow::RequirementsReview>) {
+        match key.code {
+            KeyCode::Char('q') => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
+            KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
+            KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
+                self.workflow_command(WorkflowCommand::ApplyTaskMerge {
+                    ticket: review.ticket,
+                    expected_issue: review.current,
+                });
+                return;
+            }
+            KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
+                if let Some(task) = self
+                    .ticket
+                    .as_ref()
+                    .filter(|ticket| ticket.id() == review.ticket)
+                    .and_then(|ticket| ticket.selected_task.clone())
+                {
+                    self.workflow_command(WorkflowCommand::ReviseInstructions {
+                        ticket: review.ticket,
+                        task,
+                        expected_issue: review.current,
+                    });
+                    return;
+                }
+                self.say("Select a task before sending revised requirements", true);
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::Requirements(review));
     }
     pub fn save(&mut self) -> Result<()> {
         self.state

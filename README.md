@@ -36,6 +36,18 @@ control externally launched Copilot conversations.
 The direct project → worktree workflow remains available: press `w` on a project or
 from ticket navigation, and `T` in the basic workspace to return to tickets. Existing
 launch profiles, Git actions and read-only `--list` discovery are unchanged.
+Use `R` in a selected ticket to refresh GitHub requirements and state. Changes show
+`Issue updated`; `v` opens the previous/current requirements side by side with a
+task merge preview. `m` explicitly adds new task candidates while keeping existing
+identities and progress; `s` approves the displayed requirements as an instruction
+for the selected live task/session. Existing sessions retain their original starting
+briefs. A changed preview must be inspected again before it can be applied or sent.
+
+When GitHub is unavailable, already known tickets stay available with their last
+successful sync time and an explicit stale warning. This does not change Copilot
+health or require a successful issue refresh to reattach to local work. GitHub
+requests time out after 20 seconds; new offline-only tickets are never invented.
+
 Ticket records, timestamps, task identities/progress and checkout associations live
 alongside settings in the combined TOML document; edits retain unrelated settings,
 comments and concurrent changes. Ticket preparation is exposed through the public
