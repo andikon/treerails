@@ -65,6 +65,8 @@ pub struct Observation {
     pub sequence: u64,
     pub kind: String,
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

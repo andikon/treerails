@@ -26,6 +26,9 @@ pub enum HostCommand {
     },
     Ping,
     Summary,
+    FindStart {
+        request_id: String,
+    },
     ConfigureSession {
         session: String,
         ticket: String,
@@ -88,6 +91,8 @@ pub enum HostCommand {
 pub struct TerminalSnapshot {
     pub session: String,
     pub process_id: Option<u32>,
+    #[serde(default)]
+    pub execution_group: Option<String>,
     pub rows: u16,
     pub cols: u16,
     pub formatted: Vec<u8>,
@@ -115,6 +120,9 @@ pub enum Response {
     Terminal(TerminalSnapshot),
     Summary(Vec<SessionSummary>),
     Done,
+    NotStarted {
+        request_id: String,
+    },
     Ended {
         session: String,
     },
@@ -198,6 +206,12 @@ impl Client {
     /// The caller retains no terminal handles; Windows console closure cannot drop its PTYs.
     pub fn launch(executable: &Path, endpoint: &str) -> Result<std::process::Child> {
         let mut command = Command::new(executable);
+        if executable
+            .file_stem()
+            .is_none_or(|name| name != "treerail-session-host")
+        {
+            command.arg("--session-host");
+        }
         command
             .arg(endpoint)
             .stdin(Stdio::null())
@@ -216,6 +230,7 @@ struct Screen {
     sequence: u64,
 }
 struct Provider {
+    checkout: PathBuf,
     session_id: String,
     token: String,
     sequence: u64,
@@ -239,6 +254,7 @@ struct Session {
     writer: std::sync::mpsc::SyncSender<Vec<u8>>,
     screen: Arc<Mutex<Screen>>,
     input: InputControl,
+    controller_process: Option<ipc::ClientProcess>,
 }
 impl Session {
     fn snapshot(&mut self, id: &str, token: Option<ControlToken>) -> Result<Response> {
@@ -260,6 +276,7 @@ impl Session {
         Ok(Response::Terminal(TerminalSnapshot {
             session: id.to_owned(),
             process_id: self.child.process_id(),
+            execution_group: self.group.identity(),
             rows,
             cols,
             formatted: screen.state_formatted(),
@@ -290,6 +307,7 @@ pub(crate) struct Host {
     instance: String,
     endpoint: String,
     launch_context: Option<LaunchContext>,
+    caller: Option<ipc::ClientProcess>,
     notifications: crate::notifications::Notifications,
     delivery_tx: Option<tokio::sync::mpsc::Sender<crate::notifications::Notice>>,
     delivery_rx: Option<tokio::sync::mpsc::Receiver<(String, Option<String>)>>,
@@ -373,6 +391,8 @@ impl Host {
                 self.launch_context = Some(LaunchContext {
                     local_id,
                     provider: Provider {
+                        checkout: std::fs::canonicalize(&checkout)
+                            .context("Resolve Copilot checkout")?,
                         session_id: provider_session_id,
                         token: uuid::Uuid::new_v4().to_string(),
                         sequence: 0,
@@ -422,6 +442,18 @@ impl Host {
                     );
                     anyhow::bail!("Provider conversation identity mismatch");
                 }
+                if observation.kind == "session.context_changed" {
+                    let unchanged = observation
+                        .cwd
+                        .as_deref()
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                        .is_some_and(|path| crate::config::same_path(&path, &provider.checkout));
+                    if !unchanged {
+                        provider.valid = false;
+                        provider.attention.unavailable("Copilot changed workspace context; checkout remains owned until explicitly stopped");
+                        anyhow::bail!("Provider workspace context changed");
+                    }
+                }
                 // Folder trust can delay the first native extension connection.
                 // A genuine broken observation stream still cannot repair itself.
                 if provider.sequence == 0
@@ -443,6 +475,21 @@ impl Host {
                     .attention
                     .observe(&observation.kind, observation.request_id.as_deref());
                 Ok(Response::Done)
+            }
+            HostCommand::FindStart { request_id } => {
+                let Some((session, process_id)) = self.starts.get(&request_id) else {
+                    return Ok(Response::NotStarted { request_id });
+                };
+                Ok(if self.sessions.contains_key(session) {
+                    Response::Started {
+                        session: session.clone(),
+                        process_id: *process_id,
+                    }
+                } else {
+                    Response::Ended {
+                        session: session.clone(),
+                    }
+                })
             }
             HostCommand::Summary => {
                 let mut summaries = Vec::new();
@@ -543,7 +590,12 @@ impl Host {
                     builder.env("TREERAIL_COPILOT_SESSION", &context.provider.session_id);
                 }
                 let mut child = pair.slave.spawn_command(builder)?;
-                let group = match super::execution::ExecutionGroup::assign(child.as_ref()) {
+                let group = match super::execution::ExecutionGroup::assign(
+                    child.as_ref(),
+                    super::execution::execution_group_identity(&self.instance, &request_id)
+                        .ok()
+                        .as_deref(),
+                ) {
                     Ok(group) => group,
                     Err(error) => {
                         let _ = child.kill();
@@ -604,6 +656,7 @@ impl Host {
                         writer: input_tx,
                         screen,
                         input: InputControl::default(),
+                        controller_process: None,
                     },
                 );
                 self.fingerprints
@@ -641,7 +694,19 @@ impl Host {
                     HostCommand::Attach {
                         client, takeover, ..
                     } => {
+                        #[cfg(windows)]
+                        ensure!(
+                            self.caller
+                                .as_ref()
+                                .is_some_and(|process| process.is_alive()),
+                            "UI client ended before attachment"
+                        );
                         let token = session.input.attach(&client, takeover)?;
+                        session.controller_process = self
+                            .caller
+                            .as_ref()
+                            .map(|process| process.try_clone())
+                            .transpose()?;
                         session.snapshot(&id, Some(token))
                     }
                     HostCommand::Input {
@@ -683,6 +748,7 @@ impl Host {
                     }
                     HostCommand::Detach { client, token, .. } => {
                         session.input.detach(&client, ControlToken(token))?;
+                        session.controller_process = None;
                         Ok(Response::Done)
                     }
                     HostCommand::Snapshot { .. } => session.snapshot(&id, None),
@@ -719,35 +785,87 @@ fn validate_size(rows: u16, cols: u16) -> Result<()> {
 }
 
 struct Incoming {
+    process: Option<ipc::ClientProcess>,
     request: Request,
     reply: std::sync::mpsc::Sender<(Response, bool)>,
 }
 fn transport(endpoint: &str, sender: tokio::sync::mpsc::Sender<Result<Incoming>>) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let stopping = Arc::new(AtomicBool::new(false));
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         let listener = ipc::Listener::bind(endpoint)?;
-        let mut pipe = listener.accept()?;
-        let request = match read_frame::<_, Request>(&mut pipe) {
-            Ok(request) => request,
+        let mut pipe = match listener.accept() {
+            Ok(pipe) => pipe,
             Err(error) => {
-                let _ = write_frame(&mut pipe, &Response::Error(error.to_string()));
-                continue;
+                let disconnected = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| matches!(error.raw_os_error(), Some(109 | 232 | 233)));
+                if disconnected {
+                    continue;
+                }
+                return Err(error);
             }
         };
-        let (reply, receive) = std::sync::mpsc::channel();
-        if sender
-            .blocking_send(Ok(Incoming { request, reply }))
-            .is_err()
-        {
+        if stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        let (response, stop) = receive.recv().context("Session host command loop ended")?;
-        let _ = write_frame(&mut pipe, &response);
-        drop(pipe);
-        if stop {
-            return Ok(());
+        if active.fetch_add(1, Ordering::AcqRel) >= 32 {
+            active.fetch_sub(1, Ordering::AcqRel);
+            let _ = write_frame(
+                &mut pipe,
+                &Response::Error("Too many concurrent host connections".into()),
+            );
+            continue;
         }
+        let sender = sender.clone();
+        let stopping = stopping.clone();
+        let active = active.clone();
+        let endpoint = endpoint.to_owned();
+        std::thread::spawn(move || {
+            struct Count(Arc<AtomicUsize>);
+            impl Drop for Count {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _count = Count(active);
+            let result = (|| -> Result<bool> {
+                let process = ipc::client_process(&pipe)?;
+                let request = read_frame::<_, Request>(&mut pipe)?;
+                let (reply, receive) = std::sync::mpsc::channel();
+                if sender
+                    .blocking_send(Ok(Incoming {
+                        process,
+                        request,
+                        reply,
+                    }))
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                let (response, stop) = receive
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .context("Session host command result timed out")?;
+                let _ = write_frame(&mut pipe, &response);
+                Ok(stop)
+            })();
+            match result {
+                Ok(true) => {
+                    drop(pipe);
+                    stopping.store(true, Ordering::Release);
+                    // Wake the accept loop only after Stop host's reply has been written.
+                    let _ = ipc::connect(&endpoint);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = write_frame(&mut pipe, &Response::Error(error.to_string()));
+                }
+            }
+        });
     }
 }
+
 impl Host {
     async fn maintain(&mut self) {
         if let Some(receiver) = &mut self.delivery_rx {
@@ -758,6 +876,14 @@ impl Host {
             }
         }
         for (id, session) in &mut self.sessions {
+            if session
+                .controller_process
+                .as_ref()
+                .is_some_and(|process| !process.is_alive())
+            {
+                session.controller_process = None;
+                session.input.disconnected();
+            }
             let mut action: Option<(crate::notifications::Kind, String)> = None;
             let mut message = String::new();
             if let Some(provider) = session.provider.as_mut() {
@@ -849,7 +975,7 @@ pub async fn serve(endpoint: &str) -> Result<()> {
     });
     let (sender, mut incoming) = tokio::sync::mpsc::channel(8);
     let endpoint = endpoint.to_owned();
-    std::thread::spawn(move || {
+    let transport_thread = std::thread::spawn(move || {
         if let Err(error) = transport(&endpoint, sender.clone()) {
             let _ = sender.blocking_send(Err(error));
         }
@@ -860,7 +986,8 @@ pub async fn serve(endpoint: &str) -> Result<()> {
             _=ticker.tick()=>host.maintain().await,
             next=incoming.recv()=>{
                 let Some(next)=next else {return Ok(());};
-                let Incoming{request,reply}=next?;
+                let Incoming{process,request,reply}=next?;
+                host.caller=process;
                 let mut stop=false;
                 let response=match handshake(request.version) {
                     Err(error)=>Response::Error(error.to_string()),
@@ -869,10 +996,11 @@ pub async fn serve(endpoint: &str) -> Result<()> {
                         match host.execute(request.command).await {Ok(response)=>response,Err(error)=>{stop=false;Response::Error(format!("{error:#}"))}}
                     }
                 };
+                host.caller=None;
                 // Observe every native transition before accepting the next event.
                 host.maintain().await;
                 let _=reply.send((response,stop));
-                if stop{return Ok(());}
+                if stop{let _=transport_thread.join();return Ok(());}
             }
         }
     }

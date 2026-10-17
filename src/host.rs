@@ -118,6 +118,9 @@ impl InputControl {
         self.owner = Some((client.to_owned(), token));
         Ok(token)
     }
+    pub(crate) fn disconnected(&mut self) {
+        self.owner = None;
+    }
     pub fn authorize(&self, client: &str, token: ControlToken) -> Result<()> {
         if self
             .owner
@@ -138,6 +141,6 @@ impl InputControl {
 
 pub mod discovery;
 pub mod entry;
-mod execution;
+pub mod execution;
 pub mod ipc;
 pub mod runtime;

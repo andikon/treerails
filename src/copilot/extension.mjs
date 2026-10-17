@@ -17,19 +17,38 @@ if (process.platform !== "win32" && !process.env.XDG_RUNTIME_DIR) throw new Erro
 let sequence = 0;
 let pending = 0;
 let queue = Promise.resolve();
-function send(kind, requestId) {
+async function connectHost() {
+    const deadline = Date.now() + 3000;
+    for (;;) {
+        try {
+            return await new Promise((resolve, reject) => {
+                const socket = net.createConnection(pipePath);
+                socket.setTimeout(3000, () => { const error=new Error("Tree Rail host connect timed out"); error.code="ETIMEDOUT"; socket.destroy(error); });
+                const failed = error => { socket.destroy(); reject(error); };
+                socket.once("error", failed);
+                socket.once("connect", () => { socket.removeListener("error", failed); socket.setTimeout(0); resolve(socket); });
+            });
+        } catch (error) {
+            if (!["ENOENT", "EBUSY", "ECONNREFUSED"].includes(error.code) || Date.now() >= deadline) throw error;
+            // Connection-only retry. Never replay an observation after writing bytes.
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+    }
+}
+function send(kind, requestId, cwd) {
     if (++pending > 64) process.exit(1);
-    const observation = {session_id: expected, sequence: ++sequence, kind, request_id: requestId ?? null};
-    queue = queue.then(() => new Promise((resolve, reject) => {
-        const socket = net.createConnection(pipePath);
+    const observation = {session_id: expected, sequence: ++sequence, kind, request_id: requestId ?? null, cwd: cwd ?? null};
+    queue = queue.then(async () => {
+        const socket = await connectHost();
+        return new Promise((resolve, reject) => {
         socket.setTimeout(3000, () => socket.destroy(new Error("Tree Rail host timed out")));
         socket.once("error", reject);
         let received = Buffer.alloc(0);
-        socket.once("connect", () => {
+        {
             const json = Buffer.from(JSON.stringify({version: 1, command: {Observe: {session: localSession, token, observation}}}));
             const prefix = Buffer.alloc(4); prefix.writeUInt32BE(json.length);
             socket.write(Buffer.concat([prefix, json]));
-        });
+        }
         socket.on("data", bytes => {
             received = Buffer.concat([received, bytes]);
             if (received.length > 65540) { socket.destroy(); reject(new Error("Oversized host response")); return; }
@@ -44,12 +63,13 @@ function send(kind, requestId) {
             } catch (error) { socket.destroy(); reject(error); }
         });
         socket.once("end", () => { if (received.length < 4 || received.length < received.readUInt32BE(0) + 4) reject(new Error("Incomplete host response")); });
-    })).catch(() => process.exit(1));
+        });
+    }).catch(() => process.exit(1));
 }
 const session = await joinSession({});
 if (session.sessionId !== expected) throw new Error("Copilot conversation identity differs from recorded UUID");
 send("bridge.connected");
-for (const kind of ["assistant.turn_start", "session.idle", "session.error", "permission.requested", "permission.completed", "user_input.requested", "user_input.completed", "elicitation.requested", "elicitation.completed"]) {
-    session.on(kind, event => { if (!event.agentId) send(kind, event.data?.requestId); });
+for (const kind of ["assistant.turn_start", "session.idle", "session.error", "permission.requested", "permission.completed", "user_input.requested", "user_input.completed", "elicitation.requested", "elicitation.completed", "session.context_changed"]) {
+    session.on(kind, event => { if (!event.agentId) send(kind, event.data?.requestId, event.data?.cwd); });
 }
 setInterval(() => send("bridge.heartbeat"), 1000);

@@ -22,13 +22,15 @@ const server = net.createServer(socket => {
         assert.equal(observed.session,"local-session");
         assert.equal(observed.observation.session_id,process.env.TREERAIL_COPILOT_SESSION);
         assert.equal(observed.observation.sequence,++count);
+        if(observed.observation.kind==="session.context_changed") assert.equal(observed.observation.cwd,runtime);
         const reply = Buffer.from(JSON.stringify("Done")); const prefix = Buffer.alloc(4); prefix.writeUInt32BE(reply.length);
         // Fragmented replies exercise partial-frame handling.
         socket.write(prefix.subarray(0,2)); socket.write(Buffer.concat([prefix.subarray(2),reply]));
-        if (count === 5) { console.log("Private pipe observer framing, identity and sequence passed (controlled SDK events)"); setTimeout(() => process.exit(0),20); }
+        if (count === 6) { console.log("Private pipe observer framing, identity and sequence passed (controlled SDK events)"); setTimeout(() => process.exit(0),20); }
     });
 });
-await new Promise(resolve => server.listen(pipePath,resolve));
+// Begin observation before the endpoint exists to exercise connect-only retry.
+setTimeout(() => server.listen(pipePath),150);
 const callbacks = new Map();
 globalThis.probeJoinSession = async () => ({sessionId:process.env.TREERAIL_COPILOT_SESSION,on:(kind,callback)=>callbacks.set(kind,callback)});
 let source = await fs.readFile(new URL("../src/copilot/extension.mjs",import.meta.url),"utf8");
@@ -37,5 +39,6 @@ await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64
 callbacks.get("assistant.turn_start")({data:{}});
 callbacks.get("elicitation.requested")({data:{requestId:"question"}});
 callbacks.get("elicitation.completed")({data:{requestId:"question"}});
+callbacks.get("session.context_changed")({data:{cwd:runtime}});
 callbacks.get("session.idle")({data:{}});
 setTimeout(() => { console.error("Observer smoke timed out"); process.exit(1); },5000);
