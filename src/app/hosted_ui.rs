@@ -17,6 +17,7 @@ pub struct HostedUi {
     pub poll: Instant,
     pub summary_poll: Instant,
     pub errors: VecDeque<String>,
+    pub pending_launch: Option<hosted::Command>,
     notifications_enabled: Option<bool>,
     configured_sessions: BTreeSet<String>,
     notification_retry: Instant,
@@ -37,6 +38,7 @@ impl Default for HostedUi {
             poll: Instant::now(),
             summary_poll: Instant::now(),
             errors: VecDeque::new(),
+            pending_launch: None,
             notifications_enabled: None,
             configured_sessions: BTreeSet::new(),
             notification_retry: Instant::now(),
@@ -54,6 +56,11 @@ pub enum Dialog {
         editing: bool,
         scroll: u16,
         from_session: Option<String>,
+        request_id: String,
+    },
+    Reconcile(String),
+    RetryStart {
+        scroll: u16,
     },
     Diagnostics {
         scroll: u16,
@@ -72,7 +79,11 @@ pub async fn request(config: PathBuf, command: HostCommand) -> Result<Response> 
         let launch = matches!(
             &command,
             HostCommand::Ticket {
-                command: hosted::Command::Start { .. } | hosted::Command::Continue { .. },
+                command: hosted::Command::Start { .. }
+                    | hosted::Command::StartRequest { .. }
+                    | hosted::Command::Continue { .. }
+                    | hosted::Command::Handover { .. }
+                    | hosted::Command::Reconcile { .. },
                 ..
             }
         );
@@ -183,6 +194,11 @@ impl App {
         hosted::selected_session(&self.state.workflow, &ticket.id(), &task.id)
     }
     pub fn begin_agent(&mut self, new: bool) {
+        if self.hosted.pending_launch.is_some() {
+            self.hosted.dialog = Some(Dialog::RetryStart { scroll: 0 });
+            return;
+        }
+
         if !new && let Some(record) = self.focused_record().cloned() {
             let (rows, cols) = self.hosted_dimensions();
             self.session_command(hosted::Command::Continue {
@@ -208,6 +224,7 @@ impl App {
                     editing: false,
                     scroll: 0,
                     from_session: None,
+                    request_id: crate::copilot::new_session_id(),
                 })
             }
             Err(error) => self.say(format!("{error:#}"), true),
@@ -233,6 +250,31 @@ impl App {
             match dialog {
                 Dialog::Start { .. } => {
                     self.brief_dialog_key(dialog, key);
+                }
+                Dialog::Reconcile(session) if confirmed => {
+                    self.session_command(hosted::Command::Reconcile { session })
+                }
+                Dialog::RetryStart { mut scroll } => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => return true,
+                        KeyCode::Char('y') if confirmed => {
+                            if let Some(command) = self.hosted.pending_launch.clone() {
+                                self.session_command(command);
+                            }
+                            return true;
+                        }
+                        KeyCode::Char('f') if key.modifiers == KeyModifiers::NONE => {
+                            self.hosted.pending_launch = None;
+                            self.say("Local retry reminder cleared; saved conversations and running work remain unchanged",false);
+                            return true;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
+                        KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+                        KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                        _ => {}
+                    }
+                    self.hosted.dialog = Some(Dialog::RetryStart { scroll });
                 }
                 Dialog::Diagnostics { mut scroll } => {
                     match key.code {
@@ -266,7 +308,7 @@ impl App {
                             }
                             return true;
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
                             if let Some(record) = records.get(cursor) {
                                 let (rows, cols) = self.hosted_dimensions();
                                 self.session_command(hosted::Command::Continue {
@@ -528,6 +570,7 @@ impl App {
                         .workflow
                         .sessions
                         .insert(record.id.clone(), record.clone());
+                    if self.hosted.pending_launch.as_ref().is_some_and(|command| matches!(command,hosted::Command::StartRequest {request_id,..} if request_id==&record.id)) { self.hosted.pending_launch=None; }
                     self.hosted.record = Some(record.clone());
                     self.hosted.input = false;
                     self.hosted.terminal = None;
@@ -621,6 +664,7 @@ impl App {
             mut editing,
             mut scroll,
             from_session,
+            request_id,
         } = dialog
         else {
             return;
@@ -668,19 +712,25 @@ impl App {
                             from_session,
                             ticket,
                             task,
+                            expected_brief: Some(draft_brief(&brief, &handoff.value)),
                             handoff: handoff.value,
                             rows,
                             cols,
                         }
                     } else {
-                        hosted::Command::Start {
+                        hosted::Command::StartRequest {
+                            request_id,
                             ticket,
                             task,
+                            expected_brief: Some(draft_brief(&brief, &handoff.value)),
                             handoff: handoff.value,
                             rows,
                             cols,
                         }
                     };
+                    if matches!(&command, hosted::Command::StartRequest { .. }) {
+                        self.hosted.pending_launch = Some(command.clone());
+                    }
                     self.session_command(command);
                     return;
                 }
@@ -695,6 +745,7 @@ impl App {
             editing,
             scroll,
             from_session,
+            request_id,
         });
     }
     pub fn begin_handover(&mut self) {
@@ -716,6 +767,23 @@ impl App {
         self.begin_agent(true);
         if let Some(Dialog::Start { from_session, .. }) = &mut self.hosted.dialog {
             *from_session = Some(owner.id);
+        }
+    }
+    pub fn reconcile_agent_dialog(&mut self) {
+        if let Some(record) = self.focused_record() {
+            self.hosted.dialog = Some(Dialog::Reconcile(record.id.clone()));
+        } else {
+            self.say(
+                "Select a recorded conversation before examining its execution",
+                true,
+            );
+        }
+    }
+    pub fn retry_agent_dialog(&mut self) {
+        if self.hosted.pending_launch.is_some() {
+            self.hosted.dialog = Some(Dialog::RetryStart { scroll: 0 });
+        } else {
+            self.say("There is no unresolved local launch request", false);
         }
     }
     pub fn stop_agent_dialog(&mut self) {

@@ -41,6 +41,7 @@ fn app() -> App {
         input_token: Some(5),
         provider_session_id: Some("ead8e737-ac4f-48fd-83f4-c33b0ad5f5c2".into()),
         attention: treerail::copilot::Attention::default(),
+        execution_group: None,
     });
     app.hosted.token = Some(5);
     app.project = Some(treerail::git::Project {
@@ -174,7 +175,7 @@ fn brief_review_scrolls_and_handoff_is_explicit_multiline_without_replaying_nati
     app.key(key(KeyCode::Tab, KeyModifiers::NONE));
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(
-        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::Start{handoff,..},..})if handoff=="Review handoff\nPreserve identityy")
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartRequest{handoff,..},..})if handoff=="Review handoff\nPreserve identityy")
     );
     assert!(
         app.hosted
@@ -213,7 +214,9 @@ fn handover_is_previewed_and_session_selection_never_continues_implicitly() {
     assert!(app.hosted.queue.iter().all(|command| !matches!(
         command,
         HostCommand::Ticket {
-            command: hosted::Command::Start { .. } | hosted::Command::Continue { .. },
+            command: hosted::Command::Start { .. }
+                | hosted::Command::StartRequest { .. }
+                | hosted::Command::Continue { .. },
             ..
         }
     )));
@@ -384,4 +387,80 @@ fn full_handoff_can_be_edited_and_stopped_sessions_do_not_keep_input_authority()
     app.accept_host(Response::Terminal(ended));
     assert!(!app.hosted.input);
     assert!(app.hosted.token.is_none());
+}
+
+#[test]
+fn unresolved_launch_retries_same_identity_and_reviewed_brief_without_automatic_replay() {
+    use treerail::app::hosted_ui::Dialog;
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app();
+    with_ticket(&mut app, temp.path());
+    app.begin_agent(true);
+    app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    let command = app
+        .hosted
+        .pending_launch
+        .clone()
+        .expect("captured pending request");
+    let hosted::Command::StartRequest {
+        request_id,
+        expected_brief: Some(expected),
+        ..
+    } = &command
+    else {
+        panic!()
+    };
+    assert!(treerail::copilot::is_uuid(request_id));
+    assert!(expected.contains("requirement-line-119"));
+    let identity = request_id.clone();
+    let captured = expected.clone();
+    app.hosted.queue.clear();
+    app.hosted_request_failed("Host reply lost after send".into());
+    assert!(app.hosted.queue.is_empty());
+    app.begin_agent(true);
+    assert!(matches!(app.hosted.dialog, Some(Dialog::RetryStart { .. })));
+    assert!(app.hosted.queue.is_empty());
+    app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartRequest{request_id,expected_brief:Some(brief),..},..})if request_id==&identity && brief==&captured)
+    );
+    // An unrelated response cannot discard the unresolved request identity.
+    let mut response = app.state.workflow.sessions["record-1"].clone();
+    app.accept_host(Response::Ticket(Box::new(hosted::Event::Started(
+        response.clone(),
+    ))));
+    assert!(app.hosted.pending_launch.is_some());
+    response.id = identity;
+    app.accept_host(Response::Ticket(Box::new(hosted::Event::Started(response))));
+    assert!(app.hosted.pending_launch.is_none());
+}
+#[test]
+fn reconciliation_is_an_explicit_inspection_and_never_a_continue_action() {
+    use treerail::app::hosted_ui::Dialog;
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = app();
+    with_ticket(&mut app, temp.path());
+    app.state
+        .workflow
+        .sessions
+        .get_mut("record-1")
+        .unwrap()
+        .health = hosted::Health::Interrupted;
+    app.reconcile_agent_dialog();
+    assert!(matches!(app.hosted.dialog, Some(Dialog::Reconcile(_))));
+    assert!(app.hosted.queue.is_empty());
+    assert!(rendered(&app).0.contains("without restarting an agent"));
+    app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::Reconcile{session},..})if session=="record-1")
+    );
+    assert!(app.hosted.queue.iter().all(|command| !matches!(
+        command,
+        HostCommand::Ticket {
+            command: hosted::Command::Continue { .. }
+                | hosted::Command::Start { .. }
+                | hosted::Command::StartRequest { .. },
+            ..
+        }
+    )));
 }

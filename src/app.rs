@@ -2137,6 +2137,8 @@ impl App {
         }
         match key.code {
             KeyCode::Char('b') => self.begin_handover(),
+            KeyCode::Char('r') => self.reconcile_agent_dialog(),
+            KeyCode::Char('u') => self.retry_agent_dialog(),
             KeyCode::Char('s') => self.begin_agent(false),
             KeyCode::Char('n') => self.begin_agent(true),
             KeyCode::Char('x') => self.stop_agent_dialog(),

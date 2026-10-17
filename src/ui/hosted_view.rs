@@ -312,6 +312,23 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
             );
             return;
         }
+        Dialog::RetryStart { scroll } => {
+            let details = match &app.hosted.pending_launch {
+                Some(crate::hosted::Command::StartRequest {
+                    ticket,
+                    task,
+                    request_id,
+                    expected_brief,
+                    ..
+                }) => format!(
+                    "Launch response is unresolved for {ticket} · {task}.\nRetrying uses the same request identity {request_id} and discovers existing work before any new start.\n\nCaptured starting brief:\n{}",
+                    expected_brief.as_deref().unwrap_or("No captured brief")
+                ),
+                _ => "No unresolved local launch request.".into(),
+            };
+            frame.render_widget(Paragraph::new(details).scroll((*scroll,0)).wrap(Wrap{trim:false}).block(border(" Unresolved launch · y retry same request · f forget local reminder · Esc close ",true,app)),area);
+            return;
+        }
         Dialog::Diagnostics { scroll } => {
             let mut lines = app.hosted.errors.iter().rev().cloned().collect::<Vec<_>>();
             for summary in &app.hosted.summaries {
@@ -352,6 +369,7 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
         _ => {}
     }
     let (title,text):(String,String)=match dialog {
+        Dialog::Reconcile(_)=>("Examine recorded execution? · y reconcile · Esc cancel".into(),"Inspect the exact saved conversation and native execution without restarting an agent. Uncertain execution remains Interrupted and continues blocking checkout ownership until verified. Resume stays an explicit action after reconciliation.".into()),
         Dialog::Stop(_)=>("Stop agent session? · y confirm · any other key cancel".into(),"Stop the managed process and its descendants. The recorded conversation and branch remain available. This is separate from detaching the interface.".into()),
         Dialog::StopHost=>("Stop session host? · y confirm · any other key cancel".into(),"The host refuses to stop while agents are alive. Stop each session explicitly first.".into()),
         Dialog::Takeover=>("Take terminal control? · y confirm · any other key cancel".into(),"This revokes the previous UI client's keyboard and resize authority.".into()),
