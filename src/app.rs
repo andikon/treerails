@@ -792,10 +792,7 @@ impl App {
                     .unwrap_or(0);
                 self.say(
                     if warnings.is_empty() {
-                        format!(
-                            "{} projects · Enter to explore · ? for help",
-                            self.projects.len()
-                        )
+                        format!("{} projects · ? actions", self.projects.len())
                     } else {
                         format!("{} projects · {}", self.projects.len(), warnings.join("; "))
                     },
@@ -1093,11 +1090,7 @@ impl App {
                 )
             })
             .collect();
-        self.picker(
-            "Pull requests · Enter review · a enter number/URL",
-            PickerKind::Prs,
-            entries,
-        );
+        self.picker("Pull requests", PickerKind::Prs, entries);
     }
     fn review_form(&mut self, number: String) {
         self.modal = Some(Modal::Form(Form {
@@ -1587,11 +1580,7 @@ impl App {
                         )
                     })
                     .collect();
-                self.picker(
-                    "Branches · Enter worktree · a new branch · d delete local",
-                    PickerKind::Branches,
-                    entries,
-                );
+                self.picker("Branches", PickerKind::Branches, entries);
             }
             "o" | "launch" => {
                 let name = self
@@ -2250,7 +2239,7 @@ impl App {
                         .map(|s| (s.clone(), s))
                         .collect();
                     self.picker(
-                        "Inspect explicit Tasks · Enter import selected · Esc cancel",
+                        "Inspect explicit Tasks",
                         PickerKind::TicketImport(ticket.id()),
                         entries,
                     );
@@ -2274,7 +2263,7 @@ impl App {
                         })
                         .collect();
                     self.picker(
-                        "Adopt registered worktree · Enter confirm association",
+                        "Adopt registered worktree",
                         PickerKind::TicketAdopt(ticket.id()),
                         entries,
                     );

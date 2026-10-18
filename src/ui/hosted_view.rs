@@ -105,17 +105,15 @@ pub fn terminal(frame: &mut Frame, app: &App, area: Rect) {
     {
         frame.set_cursor_position((inner.x + snapshot.cursor.1, inner.y + snapshot.cursor.0));
     }
-    let exit = app
-        .config
-        .keys
-        .iter()
-        .find(|(_, action)| action.as_str() == "agent_navigation")
-        .map(|(key, _)| key.as_str())
-        .unwrap_or("ctrl+]");
     let others = attention_text(app, true);
     frame.render_widget(
         Paragraph::new(format!(
-            "{exit} navigation · d detach · x stop · E diagnostics\n{}\n{}",
+            "{}\n{}\n{}",
+            if app.hosted.input {
+                "Keys go to Copilot"
+            } else {
+                "Tree Rail controls the keyboard"
+            },
             if snapshot.attention.healthy {
                 ""
             } else {
@@ -235,11 +233,7 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(text)
                     .scroll((*scroll, 0))
                     .wrap(Wrap { trim: false })
-                    .block(border(
-                        " Exact starting brief · PgUp/PgDn scroll ",
-                        false,
-                        app,
-                    )),
+                    .block(border(" Exact starting brief ", false, app)),
                 rows[1],
             );
             let block = border(
@@ -274,9 +268,9 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
             }
             frame.render_widget(
                 Paragraph::new(if *editing {
-                    "Enter newline · Ctrl+u clear · Tab/Esc return to review (does not start)"
+                    "Ctrl+u clear handoff · Tab/Esc return to review (does not start)"
                 } else {
-                    "Tab edit handoff · j/k/PgUp/PgDn read · y confirm launch · Esc cancel"
+                    "Tab edit handoff · y confirm launch"
                 })
                 .wrap(Wrap { trim: false }),
                 rows[3],
@@ -302,7 +296,7 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(border(
-                        " Conversations · Enter select only · c Continue · Esc cancel ",
+                        " Conversations · Enter selects only · c continues ",
                         true,
                         app,
                     ))
@@ -357,11 +351,7 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(lines.join("\n\n"))
                     .scroll((*scroll, 0))
                     .wrap(Wrap { trim: false })
-                    .block(border(
-                        " Host and notification diagnostics · j/k/PgUp/PgDn scroll · Esc close ",
-                        true,
-                        app,
-                    )),
+                    .block(border(" Host and notification diagnostics ", true, app)),
                 area,
             );
             return;

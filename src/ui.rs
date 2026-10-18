@@ -8,6 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 mod hosted_view;
+mod legend;
 
 fn color(value: &str, fallback: Color) -> Color {
     value.parse().unwrap_or(fallback)
@@ -124,24 +125,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         rows[2],
     );
-    let hints = if app.settings_open
-        && app
-            .settings
-            .as_ref()
-            .is_some_and(|draft| draft.input.is_some())
-    {
-        " Tab next field · Ctrl+u clear · Enter accept · Ctrl+s apply · Esc explorer (keeps draft) "
-    } else if app.settings_open {
-        " 1/2/3/4 sections · h/l switch · Enter edit · Ctrl+s apply · Esc explorer · D discard "
-    } else if app.project.is_none() {
-        " j/k navigate   / search   Enter tickets   w worktrees   , settings   R reload   i output · H history   ? help   q quit "
-    } else if app.ticket_mode {
-        " s Continue · n new · Enter input · b handover · r reconcile · u retry · x stop · d detach · g sessions · E errors · D cleanup · w basic "
+    let hints = legend::footer(app, rows[3].width);
+    let footer_color = if app.hosted.input && app.hosted.dialog.is_none() {
+        color(&app.config.theme.modified, Color::Yellow)
     } else {
-        " T tickets · a worktree  b branches  o Copilot  O profiles  s/u stage  c commit  p/P push/pull  , settings  i output · H history  ? help "
+        accent(app)
     };
     frame.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(accent(app))),
+        Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(footer_color)),
         rows[3],
     );
     if let Some(modal) = &app.modal {
@@ -547,10 +538,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             let rect = centered(area, 112, area.height);
             frame.render_widget(Clear, rect);
             let block = border(
-                format!(
-                    " Operation #{} · j/k scroll · g/G first/last · Esc close ",
-                    record.id
-                ),
+                format!(" Operation #{} · G follow output · H history ", record.id),
                 true,
                 app,
             );
@@ -574,7 +562,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                     if record.truncated {
                         "Earlier output discarded (64 KiB limit)."
                     } else {
-                        "H history · g full paths/result · session only"
+                        "Output retained for this UI session only"
                     }
                 )),
                 rows[0],
@@ -589,15 +577,12 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
             );
         }
         Modal::Help => {
-            let rect = centered(area, 94, 28);
+            let help = legend::help(app, area.width.min(104).saturating_sub(2));
+            let rect = centered(area, 104, (help.lines().count() + 2) as u16);
             frame.render_widget(Clear, rect);
-            let help = format!(
-                "\n  NAVIGATION\n  j/k or arrows · gg/G first/last · Ctrl+u/d half-page\n  h/l or Tab focus panes · Ctrl+w then h/j/k/l focus panes\n  / search · n/N next/previous result · Esc back · q back/quit\n\n  WORKTREES & GIT\n  a new worktree · b branch picker (a new branch, d delete)\n  Space mark files · s stage · u unstage · t staged/unstaged diff\n  c commit · f fetch · P fast-forward pull · p push/publish\n  d remove clean worktree (branch retained)\n  r pull requests · v PR comparison · w open PR in browser\n\n  i live details · H session history · j/k scroll · G follow\n\n  TOOLS & SETTINGS\n  o launch default · O choose profile · R refresh · , settings\n  Settings: 1/2/3 sections · h/l switch · a add · Enter edit\n  Sources: d remove · r recursive · fields: Tab move, Ctrl+u clear\n  Ctrl+s apply · Esc explorer (keeps draft) · D discard\n  Forms: Tab next field · Ctrl+b base picker · Ctrl+s submit\n  Pickers: j/k navigate · / filter · arrows or Ctrl+n/p move\n\n  Config: {}\n  Press Esc, q, Enter or ? to close.",
-                app.config_path.display()
-            );
             frame.render_widget(
                 Paragraph::new(help)
-                    .block(border(" Tree Rail · keyboard guide ", true, app))
+                    .block(border(" Tree Rail · actions · ? close ", true, app))
                     .wrap(Wrap { trim: false }),
                 rect,
             );
@@ -661,7 +646,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 rows[1],
                 &mut state,
             );
-            let hint = " j/k move · / filter · Enter select · Esc back";
+            let hint = legend::picker_hint(&picker.kind);
             frame.render_widget(
                 Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
                 rows[2],
@@ -711,10 +696,7 @@ fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
                 }
             }
             frame.render_widget(
-                Paragraph::new(
-                    " Tab next field · Ctrl+b starting point · Ctrl+s submit · Esc cancel",
-                )
-                .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(legend::form_hint(form)).style(Style::default().fg(Color::DarkGray)),
                 rows[form.fields.len()],
             );
         }
@@ -790,11 +772,7 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(ticket.issue.body.clone())
                 .scroll((app.ticket_scroll, 0))
                 .wrap(Wrap { trim: false })
-                .block(border(
-                    " GitHub requirements · PgUp/PgDn scroll ",
-                    false,
-                    app,
-                )),
+                .block(border(" GitHub requirements ", false, app)),
             rows[1],
         );
         let items: Vec<ListItem> = ticket
@@ -821,11 +799,7 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             .collect();
         frame.render_stateful_widget(
             List::new(items)
-                .block(border(
-                    " Tasks · Enter select · p change progress ",
-                    true,
-                    app,
-                ))
+                .block(border(" Tasks ", true, app))
                 .highlight_style(Style::default().bg(Color::DarkGray)),
             rows[2],
             &mut ListState::default().with_selected(Some(app.task_cursor)),
@@ -845,9 +819,9 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
             List::new(items)
                 .block(border(
                     if app.issue_warning.is_empty() {
-                        " GitHub tickets · Enter inspect · w basic worktrees "
+                        " GitHub tickets "
                     } else {
-                        " Cached GitHub tickets · stale · Enter inspect · w basic "
+                        " Cached GitHub tickets · stale "
                     },
                     true,
                     app,
@@ -866,11 +840,7 @@ fn requirements_review(
     area: Rect,
 ) {
     frame.render_widget(Clear, area);
-    let block = border(
-        " Issue requirements · j/k/PgUp/PgDn scroll · Esc cancel ",
-        true,
-        app,
-    );
+    let block = border(" Issue requirements ", true, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
@@ -907,11 +877,7 @@ fn cleanup_preview(
     area: Rect,
 ) {
     frame.render_widget(Clear, area);
-    let block = border(
-        " Ticket worktree cleanup · Esc cancel · j/k scroll ",
-        true,
-        app,
-    );
+    let block = border(" Ticket worktree cleanup ", true, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut lines = vec![format!("{} · {}", preview.checkout.branch, preview.checkout.path.display()),

@@ -62,6 +62,13 @@ Press `H` for recent Git operations from this session. The list shows each actio
 
 ## Keyboard controls
 
+The bottom legend shows workflow actions for the active view and focused pane.
+Routine navigation, search and entering input are omitted. Press `?` for the
+current workflow's action guide, including recovery and cleanup commands. Narrow
+legends keep complete hints and the action-guide shortcut instead of clipping keys.
+In agent-input mode the legend shows only the configured shortcut back to Tree Rail;
+other keys go to Copilot. Existing key bindings are unchanged.
+
 ### Ticket sessions
 
 Ticket browsing requires authenticated `gh`; native hosted sessions additionally

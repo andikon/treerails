@@ -124,6 +124,40 @@ fn native_screen_modes_and_background_attention_are_visible_without_focus_change
     assert!(app.state.workflow.sessions.contains_key("record-1"));
 }
 
+#[test]
+fn agent_input_legend_only_advertises_its_actual_escape_binding() {
+    let mut app = app();
+    app.hosted.input = true;
+    let (screen, _) = rendered(&app);
+    assert!(screen.contains("Ctrl+] Tree Rail navigation"));
+    assert!(screen.contains("Keys go to Copilot"));
+    for inactive in [
+        "d detach",
+        "x stop",
+        "E diagnostics",
+        "s continue",
+        "Enter input",
+    ] {
+        assert!(
+            !screen.contains(inactive),
+            "Agent mode advertised {inactive}"
+        );
+    }
+    app.config
+        .keys
+        .insert("ctrl+g".into(), "agent_navigation".into());
+    let (screen, _) = rendered(&app);
+    assert!(screen.contains("Ctrl+g Tree Rail navigation"));
+    assert!(!screen.contains("Ctrl+]"));
+    let mut terminal = Terminal::new(TestBackend::new(20, 35)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+    let footer = terminal.backend().buffer().content[34 * 20..]
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(footer.contains("Ctrl+g navigation"));
+}
+
 fn with_ticket(app: &mut App, directory: &std::path::Path) {
     let ticket: treerail::workflow::TicketRecord = serde_json::from_value(serde_json::json!({
         "repository":"owner/repo", "project":directory, "issue":{"number":1,"title":"Long issue","body":(0..120).map(|n|format!("requirement-line-{n:03}\n")).collect::<String>(),"state":"OPEN","url":"https://github.com/owner/repo/issues/1"},
