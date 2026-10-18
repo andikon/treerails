@@ -45,7 +45,7 @@ fn global_defaults_apply_to_the_next_worktree_form_without_restart() {
         path: project.clone(),
         name: "app".into(),
     });
-    app.open_project();
+    app.open_basic_project();
     app.key(key(','));
     app.key(key('2'));
     assert!(render(&app).contains("Worktrees"));
@@ -101,7 +101,7 @@ fn project_defaults_merge_by_identity_and_field_while_preserving_other_projects(
         path: first.clone(),
         name: "first".into(),
     });
-    app.open_project();
+    app.open_basic_project();
     app.key(key(','));
     app.key(key('2'));
     app.key(key('j'));
@@ -338,7 +338,7 @@ fn inline_project_defaults_keep_comments_and_deleted_project_defaults_restore_al
             path: project.clone(),
             name: "project".into(),
         });
-        app.open_project();
+        app.open_basic_project();
         app.key(key(','));
         app.key(key('2'));
         app.key(key('j'));

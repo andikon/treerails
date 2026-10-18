@@ -22,6 +22,9 @@ use treerail::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if treerail::host::entry::dispatch().await? {
+        return Ok(());
+    }
     let options = Options::parse();
     let listing = options.list;
     if !listing {

@@ -4,6 +4,8 @@
 # [state] and [state.bases] automatically when saving the current session.
 project_roots = []
 recursive = false
+# Optional host-delivered notifications for input requests and session failures.
+desktop_notifications = false
 default_profile = 'copilot'
 
 [worktrees]
@@ -37,6 +39,7 @@ modified = '#fde68a'
 # Navigation-context key overrides. Examples:
 # 'alt+o' = 'profiles'
 # 'ctrl+n' = 'down'
+# 'ctrl+g' = 'agent_navigation' # replaces Ctrl+] in hosted agent-input mode
 
 # Project settings take precedence over global defaults and remembered bases.
 # [[projects]]

@@ -557,6 +557,24 @@ pub async fn commit(path: &Path, subject: &str, body: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().into())
 }
 pub async fn remove_worktree(project: &Path, path: &Path) -> Result<()> {
+    let lease = crate::host::CheckoutLease::acquire(path).await?;
+    remove_worktree_leased(project, path, &lease).await
+}
+/// The caller retains physical execution exclusion until removal completes.
+pub(crate) async fn remove_worktree_leased(
+    project: &Path,
+    path: &Path,
+    lease: &crate::host::CheckoutLease,
+) -> Result<()> {
+    let metadata = std::fs::canonicalize(
+        text(path, &["rev-parse", "--absolute-git-dir"])
+            .await?
+            .trim(),
+    )?;
+    anyhow::ensure!(
+        crate::config::same_path(&metadata, lease.metadata_directory()),
+        "Cleanup lease belongs to another checkout"
+    );
     let trees = worktrees(project).await?;
     let wt = trees
         .iter()

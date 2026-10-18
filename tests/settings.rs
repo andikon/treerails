@@ -232,7 +232,7 @@ async fn applying_settings_ignores_stale_discovery_and_preserves_valid_project_a
             vec![],
         )),
     });
-    app.open_project();
+    app.open_basic_project();
     app.accept(Completion {
         epoch: app.epoch,
         token: "trees".into(),
@@ -410,7 +410,7 @@ fn long_project_conflicts_keep_resolution_choices_visible_at_eighty_columns() {
         path: project,
         name: "project".into(),
     });
-    app.open_project();
+    app.open_basic_project();
     for c in [',', '2', 'j'] {
         app.key(key(c));
     }

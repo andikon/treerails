@@ -55,7 +55,7 @@ async fn explorer(temp: &TempDir, path: &Path) -> App {
         false,
     );
     app.projects.push(git::project(path).await.unwrap());
-    app.open_project();
+    app.open_basic_project();
     app.trees = git::worktrees(path).await.unwrap();
     // Git reports registered paths canonically (including /private on macOS
     // and long-path aliases on Windows); status belongs to that selected path.
@@ -102,7 +102,7 @@ async fn commit_hook_output_is_visible_before_exit_and_commit_stdin_is_preserved
         false,
     );
     app.projects.push(git::project(&path).await.unwrap());
-    app.open_project();
+    app.open_basic_project();
     app.trees = git::worktrees(&path).await.unwrap();
     app.action("commit");
     app.paste("Keep subject");

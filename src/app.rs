@@ -5,7 +5,9 @@ use crate::{
     git::{self, Branch, ChangedFile, Project, PullRequest, Snapshot, Worktree},
     launch,
     settings::{self, Draft},
+    workflow::{self, Command as WorkflowCommand, Event as WorkflowEvent, TicketRecord},
 };
+pub mod hosted_ui;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -37,6 +39,8 @@ pub enum Operation {
 }
 #[derive(Debug)]
 pub enum Job {
+    Host(PathBuf, crate::host::runtime::HostCommand),
+    Workflow(PathBuf, PathBuf, WorkflowCommand),
     Discover(Vec<PathBuf>, bool),
     Trees(PathBuf),
     Status(PathBuf),
@@ -51,8 +55,12 @@ pub enum Job {
         op: Operation,
     },
 }
+// Workflow snapshots deliberately cross the job boundary by value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
+    Host(crate::host::runtime::Response),
+    Workflow(WorkflowEvent),
     Projects(Vec<Project>, Vec<String>),
     Trees(PathBuf, Vec<Worktree>, String),
     Status(PathBuf, Snapshot),
@@ -69,6 +77,8 @@ pub struct Completion {
 impl Job {
     pub fn token(&self) -> String {
         match self {
+            Self::Host(..) => "host".into(),
+            Self::Workflow(..) => "workflow".into(),
             Self::Status(p) => format!("status:{}", p.display()),
             Self::Diff(p, f, s) => diff_key(p, &f.path, *s),
             Self::ReviewDiff(p, _) => format!("review:{}", p.display()),
@@ -91,6 +101,14 @@ impl Job {
     }
     pub async fn execute(self) -> Result<Payload> {
         match self {
+            Self::Host(config, command) => {
+                Ok(Payload::Host(hosted_ui::request(config, command).await?))
+            }
+            Self::Workflow(config, project, command) => Ok(Payload::Workflow(
+                workflow::Workflow::new(config)
+                    .execute(&project, command)
+                    .await?,
+            )),
             Self::Discover(roots, recursive) => {
                 let (p, w) = discover::discover(roots, recursive).await?;
                 Ok(Payload::Projects(p, w))
@@ -202,6 +220,7 @@ pub fn diff_key(path: &std::path::Path, file: &std::path::Path, staged: bool) ->
 
 #[derive(Debug, Clone)]
 pub enum FormKind {
+    TicketCreate(String),
     Create { existing: bool },
     Branch,
     Commit,
@@ -238,6 +257,8 @@ pub struct Form {
 }
 #[derive(Debug, Clone)]
 pub enum PickerKind {
+    TicketAdopt(String),
+    TicketImport(String),
     Operations,
     Branches,
     Base(Form),
@@ -264,6 +285,8 @@ impl Picker {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
+    Cleanup(Box<workflow::CleanupPreview>),
+    Requirements(Box<workflow::RequirementsReview>),
     OperationDetails,
     Form(Form),
     Picker(Picker),
@@ -272,6 +295,16 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub hosted: hosted_ui::HostedUi,
+    pub ticket_mode: bool,
+    pub issues: Vec<workflow::Issue>,
+    pub issue_cursor: usize,
+    pub ticket: Option<TicketRecord>,
+    pub task_cursor: usize,
+    pub ticket_scroll: u16,
+    pub issue_warning: String,
+    pub pending_revision: Option<workflow::RevisionRequest>,
+    pub pending_cleanup_stop: Option<String>,
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
@@ -344,6 +377,16 @@ impl App {
             .cloned()
             .collect();
         Self {
+            hosted: hosted_ui::HostedUi::default(),
+            ticket_mode: true,
+            issues: vec![],
+            issue_cursor: 0,
+            ticket: None,
+            task_cursor: 0,
+            ticket_scroll: 0,
+            issue_warning: String::new(),
+            pending_revision: None,
+            pending_cleanup_stop: None,
             config,
             state,
             config_path,
@@ -463,6 +506,19 @@ impl App {
             .selected_tree()
             .map(|t| t.path.clone())
             .unwrap_or(project.path.clone());
+        if let Operation::Remove(target) = &op {
+            match workflow::Workflow::new(&self.config_path).snapshot() {
+                Ok(state) if workflow::deletion_owner(&state, target).is_none() => {}
+                Ok(_) => {
+                    self.say("Managed session has not been verified stopped; use ticket cleanup to stop it explicitly", true);
+                    return;
+                }
+                Err(error) => {
+                    self.say(format!("Cannot verify managed ownership: {error:#}"), true);
+                    return;
+                }
+            }
+        }
         self.busy = true;
         self.epoch += 1;
         let id = self.next_operation_id;
@@ -639,12 +695,17 @@ impl App {
             self.refresh_operation_picker();
             self.busy = false;
             self.epoch += 1;
-        } else if done.epoch != self.epoch {
+        } else if done.epoch != self.epoch && done.token != "host" {
             return;
         }
         match done.result {
+            Ok(Payload::Host(response)) => self.accept_host(response),
             Err(error) => {
-                self.say(format!("{error:#}"), true);
+                if done.token == "host" {
+                    self.hosted_request_failed(format!("{error:#}"));
+                } else {
+                    self.say(format!("{error:#}"), true);
+                }
                 if operation && let Some(form) = self.recover_form.take() {
                     if self.modal.is_none() {
                         self.modal = Some(Modal::Form(form));
@@ -655,6 +716,57 @@ impl App {
                     }
                 }
             }
+            Ok(Payload::Workflow(event)) => match event {
+                WorkflowEvent::Issues(issues) => {
+                    self.issue_warning.clear();
+                    self.issues = issues;
+                    self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
+                    self.say("Select a GitHub issue · w basic worktrees", false);
+                }
+                WorkflowEvent::CachedIssues { issues, warning } => {
+                    self.issues = issues;
+                    self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
+                    self.issue_warning = warning.clone();
+                    self.say(warning, true);
+                }
+                WorkflowEvent::CleanupPreview(preview) => {
+                    self.ticket_scroll = 0;
+                    self.modal = Some(Modal::Cleanup(Box::new(preview)));
+                }
+                WorkflowEvent::Requirements(review) => {
+                    self.ticket_scroll = 0;
+                    self.modal = Some(Modal::Requirements(Box::new(review)));
+                }
+                WorkflowEvent::RevisionRequested(request) => {
+                    self.pending_revision = Some(request);
+                    self.say(
+                        "Revised requirements approved; awaiting the selected live session",
+                        false,
+                    );
+                }
+                WorkflowEvent::Ticket(ticket) => {
+                    if self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id()) {
+                        self.task_cursor = ticket
+                            .tasks
+                            .iter()
+                            .position(|task| Some(&task.id) == ticket.selected_task.as_ref())
+                            .unwrap_or(0);
+                        self.ticket_scroll = 0;
+                    }
+                    let warning = ticket.github_error.clone();
+                    let updated = ticket.issue_updated();
+                    self.ticket = Some(ticket);
+                    let unavailable = warning.is_some();
+                    let message = warning.unwrap_or_else(|| {
+                        if updated {
+                            "Issue updated · v inspect requirements · R refresh".into()
+                        } else {
+                            "Ticket ready · c create or a adopt shared worktree · i import tasks · R refresh".into()
+                        }
+                    });
+                    self.say(message, unavailable);
+                }
+            },
             Ok(Payload::Projects(projects, warnings)) => {
                 self.discovery_warnings = warnings.clone();
                 if let Some(draft) = &mut self.settings {
@@ -680,10 +792,7 @@ impl App {
                     .unwrap_or(0);
                 self.say(
                     if warnings.is_empty() {
-                        format!(
-                            "{} projects · Enter to explore · ? for help",
-                            self.projects.len()
-                        )
+                        format!("{} projects · ? actions", self.projects.len())
                     } else {
                         format!("{} projects · {}", self.projects.len(), warnings.join("; "))
                     },
@@ -779,6 +888,13 @@ impl App {
             }
         }
     }
+    pub fn open_basic_project(&mut self) {
+        self.open_project();
+        self.ticket_mode = false;
+        self.jobs.retain(|job| !matches!(job, Job::Workflow(..)));
+        self.inflight.remove("workflow");
+        self.say("Basic worktrees · T tickets", false);
+    }
     pub fn open_project(&mut self) {
         if let Some(project) = self
             .visible_projects()
@@ -801,7 +917,11 @@ impl App {
             self.diff.clear();
             self.enqueue(Job::Trees(project.path.clone()));
             self.enqueue(Job::Branches(project.path));
-            self.say("Loading worktrees…", false);
+            self.ticket = None;
+            self.issues.clear();
+            self.ticket_mode = true;
+            self.workflow_command(WorkflowCommand::List);
+            self.say("Loading GitHub tickets… · w basic worktrees", false);
         }
     }
     pub fn selection_changed(&mut self) {
@@ -843,6 +963,7 @@ impl App {
         }
     }
     pub fn tick(&mut self) {
+        self.hosted_tick();
         if self
             .prefix
             .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
@@ -969,11 +1090,7 @@ impl App {
                 )
             })
             .collect();
-        self.picker(
-            "Pull requests · Enter review · a enter number/URL",
-            PickerKind::Prs,
-            entries,
-        );
+        self.picker("Pull requests", PickerKind::Prs, entries);
     }
     fn review_form(&mut self, number: String) {
         self.modal = Some(Modal::Form(Form {
@@ -986,6 +1103,9 @@ impl App {
     }
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.hosted_key(key) {
             return;
         }
         let repeating = key.kind == KeyEventKind::Repeat;
@@ -1063,6 +1183,17 @@ impl App {
             }
             return;
         }
+        if self.ticket_mode
+            && self.project.is_some()
+            && (!repeating
+                || matches!(
+                    key.code,
+                    KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
+                ))
+            && self.ticket_key(key)
+        {
+            return;
+        }
         if self.searching {
             match key.code {
                 KeyCode::Esc => {
@@ -1087,6 +1218,9 @@ impl App {
                 _ => {}
             }
             self.request_diff(false);
+            return;
+        }
+        if self.ticket_mode && self.project.is_some() && repeating {
             return;
         }
         let action = self.config.keys.get(&key_name(key)).cloned();
@@ -1417,12 +1551,19 @@ impl App {
             return;
         }
         if self.project.is_none() {
+            if action == "w" || action == "basic_worktrees" {
+                self.open_basic_project();
+            }
             return;
         }
         let Some(project) = self.project.clone() else {
             return;
         };
         match action {
+            "T" | "tickets" => {
+                self.ticket_mode = true;
+                self.workflow_command(WorkflowCommand::List);
+            }
             "a" | "create_worktree" => self.create_form(String::new(), false, false),
             "b" | "branches" => {
                 let entries = self
@@ -1439,11 +1580,7 @@ impl App {
                         )
                     })
                     .collect();
-                self.picker(
-                    "Branches · Enter worktree · a new branch · d delete local",
-                    PickerKind::Branches,
-                    entries,
-                );
+                self.picker("Branches", PickerKind::Branches, entries);
             }
             "o" | "launch" => {
                 let name = self
@@ -1597,6 +1734,8 @@ impl App {
             return;
         }
         match modal {
+            Modal::Cleanup(preview) => self.cleanup_key(key, preview),
+            Modal::Requirements(review) => self.requirements_key(key, review),
             Modal::OperationDetails => {
                 let count = self
                     .inspected_operation()
@@ -1747,7 +1886,9 @@ impl App {
                     && key.code == KeyCode::Char('b')
                     && matches!(
                         form.kind,
-                        FormKind::Create { existing: false } | FormKind::Branch
+                        FormKind::Create { existing: false }
+                            | FormKind::Branch
+                            | FormKind::TicketCreate(_)
                     )
                 {
                     let entries = self
@@ -1778,7 +1919,10 @@ impl App {
                         }
                         if active == 0
                             && !form.path_custom
-                            && matches!(form.kind, FormKind::Create { .. })
+                            && matches!(
+                                form.kind,
+                                FormKind::Create { .. } | FormKind::TicketCreate(_)
+                            )
                             && let Some(p) = &self.project
                         {
                             let destination =
@@ -1793,6 +1937,9 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.hosted_paste(text) {
+            return;
+        }
         if self.settings_open {
             if let Some(draft) = &mut self.settings {
                 draft.paste(text);
@@ -1813,7 +1960,10 @@ impl App {
             field.cursor += value.len();
             if form.active == 0
                 && !form.path_custom
-                && matches!(form.kind, FormKind::Create { .. })
+                && matches!(
+                    form.kind,
+                    FormKind::Create { .. } | FormKind::TicketCreate(_)
+                )
                 && let Some(p) = &self.project
             {
                 form.fields[2].value = self
@@ -1834,6 +1984,16 @@ impl App {
     }
     fn choose(&mut self, kind: PickerKind, value: String) {
         match kind {
+            PickerKind::TicketAdopt(ticket) => self.workflow_command(WorkflowCommand::Prepare {
+                ticket,
+                preparation: workflow::Preparation::Adopt { path: value.into() },
+            }),
+            PickerKind::TicketImport(ticket) => {
+                self.workflow_command(WorkflowCommand::ImportTasks {
+                    ticket,
+                    titles: vec![value],
+                })
+            }
             PickerKind::Operations => {
                 if let Ok(id) = value.parse() {
                     self.inspected_operation_id = Some(id);
@@ -1884,7 +2044,30 @@ impl App {
             .iter()
             .map(|f| f.value.trim().to_owned())
             .collect();
+        if let FormKind::TicketCreate(ticket) = &form.kind {
+            if values.iter().take(3).any(|v| v.is_empty()) {
+                self.say("Branch, starting point and directory are required", true);
+                self.modal = Some(Modal::Form(form));
+                return;
+            }
+            if let Some(p) = &self.project {
+                self.state
+                    .bases
+                    .insert(p.path.to_string_lossy().into_owned(), values[1].clone());
+            }
+            self.workflow_command(WorkflowCommand::Prepare {
+                ticket: ticket.clone(),
+                preparation: workflow::Preparation::Create {
+                    branch: values[0].clone(),
+                    base: values[1].clone(),
+                    destination: values[2].clone().into(),
+                    fetch: matches!(values[3].to_lowercase().as_str(), "yes" | "y" | "true"),
+                },
+            });
+            return;
+        }
         let operation = match form.kind {
+            FormKind::TicketCreate(_) => unreachable!(),
             FormKind::Create { existing } => {
                 if values[0].is_empty() || values[1].is_empty() || values[2].is_empty() {
                     self.say("Branch, starting point, and directory are required", true);
@@ -1928,7 +2111,261 @@ impl App {
         self.recover_form = Some(recovery);
         self.operation(operation);
     }
+    pub fn workflow_command(&mut self, command: WorkflowCommand) {
+        if let Some(project) = &self.project {
+            self.enqueue(Job::Workflow(
+                self.config_path.clone(),
+                project.path.clone(),
+                command,
+            ));
+        }
+    }
+    fn ticket_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('b') => self.begin_handover(),
+            KeyCode::Char('r') => self.reconcile_agent_dialog(),
+            KeyCode::Char('u') => self.retry_agent_dialog(),
+            KeyCode::Char('s') => self.begin_agent(false),
+            KeyCode::Char('n') => self.begin_agent(true),
+            KeyCode::Char('x') => self.stop_agent_dialog(),
+            KeyCode::Char('X') => self.hosted.dialog = Some(hosted_ui::Dialog::StopHost),
+            KeyCode::Char('d') => self.detach_agent(),
+            KeyCode::Char('!') => self.hosted.dialog = Some(hosted_ui::Dialog::Takeover),
+            KeyCode::Char('g') => self.show_sessions(),
+            KeyCode::Char('w') => {
+                self.ticket_mode = false;
+                self.say("Basic worktrees · T tickets", false);
+            }
+            KeyCode::Char('q') | KeyCode::Esc => match self.ticket.take() {
+                Some(_) => {}
+                None => {
+                    self.project = None;
+                    self.epoch += 1;
+                }
+            },
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(ticket) = &self.ticket {
+                    self.task_cursor = step(self.task_cursor, 1, ticket.tasks.len());
+                } else {
+                    self.issue_cursor = step(self.issue_cursor, 1, self.issues.len());
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(ticket) = &self.ticket {
+                    self.task_cursor = step(self.task_cursor, -1, ticket.tasks.len());
+                } else {
+                    self.issue_cursor = step(self.issue_cursor, -1, self.issues.len());
+                }
+            }
+            KeyCode::Enter => {
+                if self.hosted.terminal.is_some()
+                    && self.hosted.token.is_some()
+                    && self.hosted.record.as_ref().is_some_and(|record| {
+                        self.ticket.as_ref().is_some_and(|ticket| {
+                            ticket.id() == record.ticket
+                                && ticket
+                                    .tasks
+                                    .get(self.task_cursor)
+                                    .is_some_and(|task| task.id == record.task)
+                        })
+                    })
+                {
+                    self.hosted.input = true;
+                    return true;
+                }
+                if let Some(ticket) = &self.ticket {
+                    if let Some(task) = ticket.tasks.get(self.task_cursor) {
+                        self.workflow_command(WorkflowCommand::SelectTask {
+                            ticket: ticket.id(),
+                            task: task.id.clone(),
+                        });
+                    }
+                } else if let Some(issue) = self.issues.get(self.issue_cursor) {
+                    self.task_cursor = 0;
+                    self.workflow_command(WorkflowCommand::Open {
+                        number: issue.number,
+                    });
+                }
+            }
+            KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
+            KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
+            KeyCode::Char('R') => {
+                let command = self
+                    .ticket
+                    .as_ref()
+                    .map(|record| WorkflowCommand::Refresh {
+                        ticket: record.id(),
+                    })
+                    .unwrap_or(WorkflowCommand::List);
+                self.workflow_command(command);
+            }
+            KeyCode::Char('D') => {
+                if let Some(ticket) = &self.ticket {
+                    self.workflow_command(WorkflowCommand::PreviewCleanup {
+                        ticket: ticket.id(),
+                    });
+                }
+            }
+            KeyCode::Char('v') => {
+                if let Some(ticket) = &self.ticket {
+                    self.workflow_command(WorkflowCommand::InspectUpdate {
+                        ticket: ticket.id(),
+                    });
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(ticket) = &self.ticket
+                    && let Some(task) = ticket.tasks.get(self.task_cursor)
+                {
+                    let progress = match task.progress {
+                        workflow::Progress::Pending => workflow::Progress::InProgress,
+                        workflow::Progress::InProgress => workflow::Progress::Done,
+                        workflow::Progress::Done => workflow::Progress::Pending,
+                    };
+                    self.workflow_command(WorkflowCommand::SetProgress {
+                        ticket: ticket.id(),
+                        task: task.id.clone(),
+                        progress,
+                    });
+                }
+            }
+            KeyCode::Char('i') => {
+                if let Some(ticket) = &self.ticket {
+                    let entries = workflow::import_candidates(&ticket.issue.body)
+                        .into_iter()
+                        .map(|s| (s.clone(), s))
+                        .collect();
+                    self.picker(
+                        "Inspect explicit Tasks",
+                        PickerKind::TicketImport(ticket.id()),
+                        entries,
+                    );
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(ticket) = &self.ticket {
+                    let entries = self
+                        .trees
+                        .iter()
+                        .map(|wt| {
+                            (
+                                format!(
+                                    "{} · {}{}",
+                                    wt.branch,
+                                    wt.path.display(),
+                                    if wt.original { " [original]" } else { "" }
+                                ),
+                                wt.path.display().to_string(),
+                            )
+                        })
+                        .collect();
+                    self.picker(
+                        "Adopt registered worktree",
+                        PickerKind::TicketAdopt(ticket.id()),
+                        entries,
+                    );
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(ticket) = self.ticket.clone() {
+                    if ticket.worktree.is_some() {
+                        self.say("This ticket already has a shared worktree", false);
+                    } else {
+                        self.create_form(format!("ticket/{}", ticket.issue.number), false, false);
+                        if let Some(Modal::Form(form)) = &mut self.modal {
+                            form.kind = FormKind::TicketCreate(ticket.id());
+                            form.title = "Prepare ticket shared worktree".into();
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(',') | KeyCode::Char('?') => return false,
+            _ => {}
+        }
+        true
+    }
+    fn requirements_key(&mut self, key: KeyEvent, review: Box<workflow::RequirementsReview>) {
+        match key.code {
+            KeyCode::Char('q') => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
+            KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
+            KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
+                self.workflow_command(WorkflowCommand::ApplyTaskMerge {
+                    ticket: review.ticket,
+                    expected_issue: review.current,
+                });
+                return;
+            }
+            KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
+                if let Some(task) = self
+                    .ticket
+                    .as_ref()
+                    .filter(|ticket| ticket.id() == review.ticket)
+                    .and_then(|ticket| ticket.selected_task.clone())
+                {
+                    self.workflow_command(WorkflowCommand::ReviseInstructions {
+                        ticket: review.ticket,
+                        task,
+                        expected_issue: review.current,
+                    });
+                    return;
+                }
+                self.say("Select a task before sending revised requirements", true);
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::Requirements(review));
+    }
+    fn cleanup_key(&mut self, key: KeyEvent, preview: Box<workflow::CleanupPreview>) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('n') => return,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('y') if key.kind == KeyEventKind::Press && preview.can_remove() => {
+                self.workflow_command(WorkflowCommand::Cleanup {
+                    ticket: preview.ticket,
+                    expected_checkout: preview.checkout,
+                });
+                return;
+            }
+            KeyCode::Char('x') if key.kind == KeyEventKind::Press => {
+                if let Some(owner) = &preview.owner {
+                    self.pending_cleanup_stop = Some(owner.id.clone());
+                    self.say(
+                        "Explicit session stop requested; reopen cleanup after verified stop",
+                        false,
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.modal = Some(Modal::Cleanup(preview));
+    }
     pub fn save(&mut self) -> Result<()> {
+        if let (Some(snapshot), Some(token)) = (&self.hosted.terminal, self.hosted.token) {
+            // Detach relinquishes keyboard control; it never stops the process.
+            if let Ok(client) = crate::host::runtime::Client::for_config(&self.config_path) {
+                let _ = client.execute(crate::host::runtime::HostCommand::Detach {
+                    session: snapshot.session.clone(),
+                    client: self.hosted.client.clone(),
+                    token,
+                });
+            }
+        }
         self.state
             .save(&self.config_path)
             .context("Save remembered selections")
