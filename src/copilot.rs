@@ -10,7 +10,34 @@ use std::{
 };
 
 pub const EXTENSION_SOURCE: &str = include_str!("copilot/extension.mjs");
+const PREVIOUS_EXTENSION_SOURCE: &str = include_str!("copilot/extension-v1.mjs");
 pub const TESTED_COPILOT_VERSION: &str = "1.0.94";
+// Flip only alongside recorded native compatibility evidence, never from fake-provider tests.
+pub const DOCUMENT_DELIVERY_VERIFIED: bool = false;
+
+/// Extension prompt delivery is version-bound; unfamiliar CLIs require validation first.
+pub async fn verify_document_provider() -> Result<()> {
+    if !DOCUMENT_DELIVERY_VERIFIED {
+        bail!(
+            "Complete discussion delivery awaits native Copilot compatibility verification. The approved document is retained; existing conversations can Continue. No agent has been started with partial context."
+        );
+    }
+    let output = tokio::process::Command::new("copilot")
+        .args(["--no-auto-update", "--version"])
+        .output()
+        .await?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !version
+            .lines()
+            .any(|line| line.trim() == format!("GitHub Copilot CLI {TESTED_COPILOT_VERSION}."))
+    {
+        bail!(
+            "Complete discussion delivery is validated for Copilot {TESTED_COPILOT_VERSION}; install that supported version or validate this provider before starting. Existing conversations can still Continue."
+        );
+    }
+    Ok(())
+}
 
 /// Install only the observer's own entrypoint outside managed Git checkouts.
 /// Other Copilot sessions discover it too, but it exits immediately without host context.
@@ -37,6 +64,12 @@ pub fn install_observer(copilot_home: &Path) -> Result<PathBuf> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(&entry)?;
+            if metadata.file_type().is_file()
+                && fs::read(&entry)? == PREVIOUS_EXTENSION_SOURCE.as_bytes()
+            {
+                crate::config::atomic_write(&entry, EXTENSION_SOURCE.as_bytes())?;
+                return Ok(entry);
+            }
             if !metadata.file_type().is_file()
                 || metadata.len() != EXTENSION_SOURCE.len() as u64
                 || fs::read(&entry)? != EXTENSION_SOURCE.as_bytes()

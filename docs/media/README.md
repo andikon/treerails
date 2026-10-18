@@ -16,6 +16,13 @@ Temporary repository paths are normalized to `C:\Code` before rendering. A termi
 | `launch-profiles.png` | Copilot, editor, and terminal profile selection |
 | `demo.gif` | Inline animated walkthrough, approximately 24 seconds |
 | `demo.mp4` | Higher-resolution H.264 walkthrough with playback controls |
+| `ticket-browser-wide.png` | Split ticket browser with Active work, named labels and a discussion preview |
+| `ticket-browser-narrow.png` | Focused discussion pane in a narrow terminal |
+
+The ticket-browser captures use the actual Ratatui renderer with explicitly
+constructed sample issue/discussion data. They do not show live GitHub requests,
+posted comments or running agents. Source links and counts in those fixtures are
+illustrative. The screenshots were visually checked at wide and narrow sizes.
 
 ## Regenerate
 

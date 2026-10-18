@@ -159,6 +159,7 @@ fn agent_input_legend_only_advertises_its_actual_escape_binding() {
 }
 
 fn with_ticket(app: &mut App, directory: &std::path::Path) {
+    app.config_path = directory.join("config.toml");
     let ticket: treerail::workflow::TicketRecord = serde_json::from_value(serde_json::json!({
         "repository":"owner/repo", "project":directory, "issue":{"number":1,"title":"Long issue","body":(0..120).map(|n|format!("requirement-line-{n:03}\n")).collect::<String>(),"state":"OPEN","url":"https://github.com/owner/repo/issues/1"},
         "fetched_at":1,"tasks":[{"id":"task-1","title":"Implement","progress":"pending"}],"next_task_id":2,"selected_task":"task-1","worktree":{"path":directory,"branch":"ticket/1","original":false}
@@ -172,6 +173,40 @@ fn with_ticket(app: &mut App, directory: &std::path::Path) {
         record.checkout = directory.into();
     }
 }
+struct SnapshotCleanup(std::path::PathBuf);
+impl Drop for SnapshotCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        if let Some(directory) = self.0.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+fn approve_discussion(app: &mut App) -> SnapshotCleanup {
+    let (task, handoff) = match app.hosted.dialog.as_ref().unwrap() {
+        treerail::app::hosted_ui::Dialog::Start { task, handoff, .. } => {
+            (task.clone(), handoff.value.clone())
+        }
+        _ => panic!("Expected starting document review"),
+    };
+    let ticket = app.ticket.as_ref().unwrap();
+    let discussion = treerail::ticket_browser::Discussion {
+        card: ticket.issue.clone().into(),
+        comments: vec![],
+        complete: true,
+        fetched_at: 1,
+        warning: None,
+    };
+    let context = hosted::discussion_context(ticket, &task, &handoff).unwrap();
+    let approval =
+        treerail::discussion_snapshot::retain(&app.config_path, &discussion, context).unwrap();
+    let cleanup = SnapshotCleanup(approval.snapshot.path.clone());
+    app.accept_host(Response::Ticket(Box::new(
+        hosted::Event::DiscussionCaptured(approval),
+    )));
+    app.hosted.queue.clear();
+    cleanup
+}
 #[test]
 fn brief_review_scrolls_and_handoff_is_explicit_multiline_without_replaying_native_input() {
     use treerail::app::hosted_ui::{Dialog, draft_brief};
@@ -180,15 +215,22 @@ fn brief_review_scrolls_and_handoff_is_explicit_multiline_without_replaying_nati
     with_ticket(&mut app, temp.path());
     app.begin_agent(true);
     assert!(matches!(app.hosted.dialog, Some(Dialog::Start { .. })));
-    assert!(app.hosted.queue.is_empty());
+    assert!(matches!(
+        app.hosted.queue.back(),
+        Some(HostCommand::Ticket {
+            command: hosted::Command::CaptureDiscussion { .. },
+            ..
+        })
+    ));
+    let _artifact = approve_discussion(&mut app);
     let (first, _) = rendered(&app);
-    assert!(first.contains("requirement-line-000"));
+    assert!(first.contains("Retained document"));
     assert!(!first.contains("requirement-line-050"));
     for _ in 0..5 {
         app.key(key(KeyCode::PageDown, KeyModifiers::NONE));
     }
     let (scrolled, _) = rendered(&app);
-    assert!(scrolled.contains("requirement-line-04") || scrolled.contains("requirement-line-05"));
+    assert!(scrolled.contains("requirement-line-0"));
     app.key(key(KeyCode::Tab, KeyModifiers::NONE));
     app.paste("Review handoff\nPreserve identity");
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
@@ -207,8 +249,17 @@ fn brief_review_scrolls_and_handoff_is_explicit_multiline_without_replaying_nati
     assert!(app.hosted.queue.is_empty());
     app.key(key(KeyCode::Tab, KeyModifiers::NONE));
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(matches!(
+        app.hosted.queue.back(),
+        Some(HostCommand::Ticket {
+            command: hosted::Command::CaptureDiscussion { .. },
+            ..
+        })
+    ));
+    let _artifact = approve_discussion(&mut app);
+    app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(
-        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartRequest{handoff,..},..})if handoff=="Review handoff\nPreserve identityy")
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartDocument{handoff,..},..})if handoff=="Review handoff\nPreserve identityy")
     );
     assert!(
         app.hosted
@@ -227,10 +278,10 @@ fn handover_is_previewed_and_session_selection_never_continues_implicitly() {
     assert!(
         matches!(&app.hosted.dialog,Some(Dialog::Start{from_session:Some(owner),..})if owner=="record-1")
     );
-    assert!(app.hosted.queue.is_empty());
+    let _artifact = approve_discussion(&mut app);
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(
-        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::Handover{from_session,..},..})if from_session=="record-1")
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartDocument{from_session:Some(from_session),..},..})if from_session=="record-1")
     );
     app.hosted.queue.clear();
     let mut second = app.state.workflow.sessions["record-1"].clone();
@@ -429,24 +480,29 @@ fn unresolved_launch_retries_same_identity_and_reviewed_brief_without_automatic_
     let mut app = app();
     with_ticket(&mut app, temp.path());
     app.begin_agent(true);
+    let _artifact = approve_discussion(&mut app);
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     let command = app
         .hosted
         .pending_launch
         .clone()
         .expect("captured pending request");
-    let hosted::Command::StartRequest {
+    let hosted::Command::StartDocument {
         request_id,
-        expected_brief: Some(expected),
+        approval,
         ..
     } = &command
     else {
         panic!()
     };
     assert!(treerail::copilot::is_uuid(request_id));
-    assert!(expected.contains("requirement-line-119"));
+    assert!(
+        std::fs::read_to_string(&approval.snapshot.path)
+            .unwrap()
+            .contains("requirement-line-119")
+    );
     let identity = request_id.clone();
-    let captured = expected.clone();
+    let captured = approval.clone();
     app.hosted.queue.clear();
     app.hosted_request_failed("Host reply lost after send".into());
     assert!(app.hosted.queue.is_empty());
@@ -455,7 +511,7 @@ fn unresolved_launch_retries_same_identity_and_reviewed_brief_without_automatic_
     assert!(app.hosted.queue.is_empty());
     app.key(key(KeyCode::Char('y'), KeyModifiers::NONE));
     assert!(
-        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartRequest{request_id,expected_brief:Some(brief),..},..})if request_id==&identity && brief==&captured)
+        matches!(app.hosted.queue.back(),Some(HostCommand::Ticket{command:hosted::Command::StartDocument{request_id,approval,..},..})if request_id==&identity && approval==&captured)
     );
     // An unrelated response cannot discard the unresolved request identity.
     let mut response = app.state.workflow.sessions["record-1"].clone();

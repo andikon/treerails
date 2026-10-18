@@ -7,6 +7,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
+mod browser_view;
+mod comment_view;
 mod hosted_view;
 mod legend;
 
@@ -135,6 +137,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(footer_color)),
         rows[3],
     );
+    if app.comment_editor.is_some() {
+        comment_view::draw(frame, app);
+    }
     if let Some(modal) = &app.modal {
         let history =
             matches!(modal, Modal::Picker(picker) if matches!(picker.kind, PickerKind::Operations));
@@ -712,6 +717,10 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         area
     };
+    if app.ticket.is_none() {
+        browser_view::draw(frame, app, area);
+        return;
+    }
     if let Some(ticket) = &app.ticket {
         let rows = Layout::vertical([
             Constraint::Length(6),

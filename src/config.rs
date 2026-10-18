@@ -266,6 +266,8 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    pub browser: crate::ticket_browser::BrowserState,
+    pub comment_drafts: BTreeMap<String, crate::ticket_comments::Draft>,
     pub workflow: crate::workflow::WorkflowState,
     pub bases: BTreeMap<String, String>,
     pub last_project: Option<PathBuf>,

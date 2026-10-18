@@ -1,8 +1,11 @@
 // Native Copilot observer. The CLI resolves its own bundled SDK import.
-// No prompts, tools, permission callbacks or automated responses are registered.
+// Observes attention; an explicitly approved new-document start is admitted once.
+// No tools, permission approvals or automated replies are registered.
 import { joinSession } from "@github/copilot-sdk/extension";
 import net from "node:net";
 import path from "node:path";
+import fs from "node:fs";
+import crypto from "node:crypto";
 const endpoint = process.env.TREERAIL_HOST_ENDPOINT;
 const localSession = process.env.TREERAIL_HOST_SESSION;
 const token = process.env.TREERAIL_HOST_TOKEN;
@@ -73,3 +76,30 @@ for (const kind of ["assistant.turn_start", "session.idle", "session.error", "pe
     session.on(kind, event => { if (!event.agentId) send(kind, event.data?.requestId, event.data?.cwd); });
 }
 setInterval(() => send("bridge.heartbeat"), 1000);
+
+// A document start launches with no automatic CLI prompt. Admission happens here,
+// through the native session API, only after verifying the complete retained bytes.
+// Claim before send: a lost response/reloaded extension must never replay context.
+const documentPath = process.env.TREERAIL_DISCUSSION_PATH;
+if (documentPath) {
+    const expectedHash = process.env.TREERAIL_DISCUSSION_SHA256;
+    const expectedBytes = process.env.TREERAIL_DISCUSSION_BYTES;
+    const metadata = fs.lstatSync(documentPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("Approved discussion document is missing or redirected");
+    const bytes = fs.readFileSync(documentPath);
+    if (String(bytes.length) !== expectedBytes || crypto.createHash("sha256").update(bytes).digest("hex") !== expectedHash) {
+        throw new Error("Approved discussion document changed; capture and review again");
+    }
+    const marker = `${documentPath}.${expected}.delivery`;
+    let claim;
+    try { claim = fs.openSync(marker, "wx"); }
+    catch (error) {
+        if (error.code === "EEXIST") throw new Error("Discussion delivery was already attempted; inspect the recorded conversation and Continue without replaying it");
+        throw error;
+    }
+    fs.writeSync(claim, "confirmation unknown\n");
+    fs.fsyncSync(claim);
+    fs.closeSync(claim);
+    const messageId = await session.send({ prompt: bytes.toString("utf8") });
+    fs.writeFileSync(marker, `admitted ${messageId}\n`);
+}

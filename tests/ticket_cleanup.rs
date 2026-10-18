@@ -98,6 +98,7 @@ fn session(ticket: &workflow::TicketRecord, health: Health) -> SessionRecord {
         branch: None,
         pending_start: None,
         start_intent: None,
+        discussion_snapshot: None,
         execution_group: None,
         health,
         current: true,

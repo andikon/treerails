@@ -7,6 +7,8 @@ use crate::{
     settings::{self, Draft},
     workflow::{self, Command as WorkflowCommand, Event as WorkflowEvent, TicketRecord},
 };
+mod browser_ui;
+mod comment_ui;
 pub mod hosted_ui;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -39,6 +41,8 @@ pub enum Operation {
 }
 #[derive(Debug)]
 pub enum Job {
+    LocalWorkflow(PathBuf),
+    OpenIssue(PathBuf, u64),
     Host(PathBuf, crate::host::runtime::HostCommand),
     Workflow(PathBuf, PathBuf, WorkflowCommand),
     Discover(Vec<PathBuf>, bool),
@@ -59,6 +63,8 @@ pub enum Job {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
+    LocalWorkflow(workflow::WorkflowState),
+    BrowserOpened,
     Host(crate::host::runtime::Response),
     Workflow(WorkflowEvent),
     Projects(Vec<Project>, Vec<String>),
@@ -77,7 +83,14 @@ pub struct Completion {
 impl Job {
     pub fn token(&self) -> String {
         match self {
+            Self::LocalWorkflow(_) => "local-workflow".into(),
+            Self::OpenIssue(project, number) => {
+                format!("open-issue:{}:{number}", project.display())
+            }
             Self::Host(..) => "host".into(),
+            Self::Workflow(_, project, WorkflowCommand::Browser(command)) => {
+                browser_ui::token(project, command)
+            }
             Self::Workflow(..) => "workflow".into(),
             Self::Status(p) => format!("status:{}", p.display()),
             Self::Diff(p, f, s) => diff_key(p, &f.path, *s),
@@ -101,6 +114,18 @@ impl Job {
     }
     pub async fn execute(self) -> Result<Payload> {
         match self {
+            Self::LocalWorkflow(path) => Ok(Payload::LocalWorkflow(
+                workflow::Workflow::new(path).snapshot()?,
+            )),
+            Self::OpenIssue(project, number) => {
+                let status = tokio::process::Command::new("gh")
+                    .current_dir(project)
+                    .args(["issue", "view", &number.to_string(), "--web"])
+                    .status()
+                    .await?;
+                anyhow::ensure!(status.success(), "GitHub could not open the issue");
+                Ok(Payload::BrowserOpened)
+            }
             Self::Host(config, command) => {
                 Ok(Payload::Host(hosted_ui::request(config, command).await?))
             }
@@ -295,6 +320,8 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub comment_editor: Option<crate::ticket_comments::Editor>,
+    pub browser: crate::browser::Browser,
     pub hosted: hosted_ui::HostedUi,
     pub ticket_mode: bool,
     pub issues: Vec<workflow::Issue>,
@@ -378,6 +405,8 @@ impl App {
             .collect();
         Self {
             hosted: hosted_ui::HostedUi::default(),
+            comment_editor: None,
+            browser: crate::browser::Browser::default(),
             ticket_mode: true,
             issues: vec![],
             issue_cursor: 0,
@@ -699,8 +728,21 @@ impl App {
             return;
         }
         match done.result {
+            Ok(Payload::LocalWorkflow(state)) => self.state.workflow = state,
+            Ok(Payload::BrowserOpened) => self.say("Opened ticket in GitHub", false),
             Ok(Payload::Host(response)) => self.accept_host(response),
             Err(error) => {
+                if done.token == "workflow"
+                    && let Some(editor) = &mut self.comment_editor
+                {
+                    editor.posting = false;
+                    editor.status = format!("{error:#}");
+                }
+                if done.token.starts_with("browser:")
+                    && !self.browser_failed(&done.token, format!("{error:#}"))
+                {
+                    return;
+                }
                 if done.token == "host" {
                     self.hosted_request_failed(format!("{error:#}"));
                 } else {
@@ -717,6 +759,8 @@ impl App {
                 }
             }
             Ok(Payload::Workflow(event)) => match event {
+                WorkflowEvent::Comment(event) => self.accept_comment(event),
+                WorkflowEvent::Browser(event) => self.accept_browser(event),
                 WorkflowEvent::Issues(issues) => {
                     self.issue_warning.clear();
                     self.issues = issues;
@@ -755,6 +799,10 @@ impl App {
                     }
                     let warning = ticket.github_error.clone();
                     let updated = ticket.issue_updated();
+                    self.state
+                        .workflow
+                        .tickets
+                        .insert(ticket.id(), ticket.clone());
                     self.ticket = Some(ticket);
                     let unavailable = warning.is_some();
                     let message = warning.unwrap_or_else(|| {
@@ -920,7 +968,8 @@ impl App {
             self.ticket = None;
             self.issues.clear();
             self.ticket_mode = true;
-            self.workflow_command(WorkflowCommand::List);
+            self.browser = crate::browser::Browser::default();
+            self.load_browser();
             self.say("Loading GitHub tickets… · w basic worktrees", false);
         }
     }
@@ -963,6 +1012,7 @@ impl App {
         }
     }
     pub fn tick(&mut self) {
+        self.browser_tick();
         self.hosted_tick();
         if self
             .prefix
@@ -1103,6 +1153,13 @@ impl App {
     }
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.comment_key(key) {
+            return;
+        }
+        if self.ticket_mode && self.ticket.is_none() && self.browser.editor.is_some() {
+            self.browser_editor_key(key);
             return;
         }
         if self.hosted_key(key) {
@@ -1562,7 +1619,7 @@ impl App {
         match action {
             "T" | "tickets" => {
                 self.ticket_mode = true;
-                self.workflow_command(WorkflowCommand::List);
+                self.load_browser();
             }
             "a" | "create_worktree" => self.create_form(String::new(), false, false),
             "b" | "branches" => {
@@ -1937,6 +1994,21 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.comment_paste(text) {
+            return;
+        }
+        if let Some(editor) = self.browser.editor.as_mut() {
+            match editor {
+                crate::browser::Editor::Filters { fields, cursor } => {
+                    fields[*cursor].push_str(&text.replace(['\r', '\n'], " "))
+                }
+                crate::browser::Editor::Name { text: value, .. } => {
+                    value.push_str(&text.replace(['\r', '\n'], " "))
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.hosted_paste(text) {
             return;
         }
@@ -2121,6 +2193,9 @@ impl App {
         }
     }
     fn ticket_key(&mut self, key: KeyEvent) -> bool {
+        if self.ticket.is_none() && self.browser_key(key) {
+            return true;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
         }

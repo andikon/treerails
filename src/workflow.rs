@@ -16,6 +16,7 @@ use std::{
 pub struct WorkflowState {
     pub tickets: BTreeMap<String, TicketRecord>,
     pub sessions: BTreeMap<String, crate::hosted::SessionRecord>,
+    pub approved_discussions: BTreeMap<String, crate::discussion_snapshot::Approval>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Issue {
@@ -90,6 +91,8 @@ pub enum Preparation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    Browser(crate::ticket_browser::Command),
+    Comment(crate::ticket_comments::Command),
     List,
     Open {
         number: u64,
@@ -141,6 +144,8 @@ pub enum Command {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
+    Browser(crate::ticket_browser::Event),
+    Comment(crate::ticket_comments::Event),
     Issues(Vec<Issue>),
     Ticket(TicketRecord),
     CachedIssues { issues: Vec<Issue>, warning: String },
@@ -244,13 +249,65 @@ pub fn deletion_owner<'a>(
 /// Inject GitHub transport without substituting workflow policy in tests.
 #[allow(async_fn_in_trait)]
 pub trait IssueSource {
+    async fn card(&self, project: &Path, number: u64) -> Result<crate::ticket_browser::IssueCard> {
+        Ok(self.get(project, number).await?.into())
+    }
+    async fn filter_metadata(
+        &self,
+        _project: &Path,
+    ) -> Result<crate::ticket_browser::FilterMetadata> {
+        Ok(Default::default())
+    }
     async fn repository(&self, project: &Path) -> Result<String>;
     async fn list(&self, project: &Path) -> Result<Vec<Issue>>;
     async fn get(&self, project: &Path, number: u64) -> Result<Issue>;
+    async fn repository_identity(&self, project: &Path) -> Result<String> {
+        Ok(crate::ticket_browser::normalize_repository(
+            &self.repository(project).await?,
+        ))
+    }
+    async fn current_login(&self, _project: &Path) -> Result<String> {
+        anyhow::bail!("Identity unavailable")
+    }
+    async fn post_comment(
+        &self,
+        _project: &Path,
+        _number: u64,
+        _body: &str,
+    ) -> Result<crate::ticket_browser::Comment> {
+        anyhow::bail!("Comment posting unsupported")
+    }
+    async fn browser_page(
+        &self,
+        project: &Path,
+        _repository: &str,
+        filter: &crate::ticket_browser::Filter,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Page> {
+        crate::ticket_browser::fallback_page(self.list(project).await?, filter, page)
+    }
+    async fn discussion_page(
+        &self,
+        project: &Path,
+        number: u64,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Discussion> {
+        anyhow::ensure!(page == 1, "No further discussion pages");
+        Ok(crate::ticket_browser::Discussion {
+            card: self.get(project, number).await?.into(),
+            comments: vec![],
+            complete: true,
+            fetched_at: crate::ticket_browser::now(),
+            warning: None,
+        })
+    }
 }
 pub struct Github;
 impl Github {
-    async fn json<T: serde::de::DeserializeOwned>(project: &Path, args: &[&str]) -> Result<T> {
+    pub(crate) async fn json<T: serde::de::DeserializeOwned>(
+        project: &Path,
+        args: &[&str],
+    ) -> Result<T> {
         let mut command = tokio::process::Command::new("gh");
         command
             .args(args)
@@ -270,6 +327,50 @@ impl Github {
     }
 }
 impl IssueSource for Github {
+    async fn card(&self, project: &Path, number: u64) -> Result<crate::ticket_browser::IssueCard> {
+        crate::ticket_browser::github_card(project, number).await
+    }
+    async fn filter_metadata(
+        &self,
+        project: &Path,
+    ) -> Result<crate::ticket_browser::FilterMetadata> {
+        crate::ticket_browser::github_metadata(project).await
+    }
+    async fn repository_identity(&self, project: &Path) -> Result<String> {
+        let value: serde_json::Value =
+            Self::json(project, &["repo", "view", "--json", "url"]).await?;
+        Ok(crate::ticket_browser::normalize_repository(
+            value["url"].as_str().context("Repository URL missing")?,
+        ))
+    }
+    async fn current_login(&self, project: &Path) -> Result<String> {
+        crate::ticket_comments::github_current_login(project).await
+    }
+    async fn post_comment(
+        &self,
+        project: &Path,
+        number: u64,
+        body: &str,
+    ) -> Result<crate::ticket_browser::Comment> {
+        crate::ticket_comments::github_post(project, number, body).await
+    }
+    async fn browser_page(
+        &self,
+        project: &Path,
+        repository: &str,
+        filter: &crate::ticket_browser::Filter,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Page> {
+        crate::ticket_browser::github_page(project, repository, filter, page).await
+    }
+    async fn discussion_page(
+        &self,
+        project: &Path,
+        number: u64,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Discussion> {
+        crate::ticket_browser::github_discussion(project, number, page).await
+    }
     async fn repository(&self, project: &Path) -> Result<String> {
         #[derive(Deserialize)]
         struct Repo {
@@ -335,6 +436,16 @@ impl Workflow {
         source: &impl IssueSource,
     ) -> Result<Event> {
         match command {
+            Command::Browser(command) => {
+                crate::ticket_browser::execute(&self.config_path, project, command, source)
+                    .await
+                    .map(Event::Browser)
+            }
+            Command::Comment(command) => {
+                crate::ticket_comments::execute(&self.config_path, project, command, source)
+                    .await
+                    .map(Event::Comment)
+            }
             Command::List => match source.list(project).await {
                 Ok(issues) => Ok(Event::Issues(issues)),
                 Err(error) => {

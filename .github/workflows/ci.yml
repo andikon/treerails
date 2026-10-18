@@ -27,6 +27,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: node scripts/copilot_bridge_smoke.mjs
+      - run: node scripts/discussion_delivery_smoke.mjs
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

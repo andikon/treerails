@@ -73,12 +73,41 @@ pub fn picker_hint(kind: &PickerKind) -> &'static str {
 }
 
 fn actions(app: &App) -> Vec<String> {
+    if let Some(editor) = &app.comment_editor {
+        return if editor.posting {
+            vec![]
+        } else if editor.review.is_some() {
+            fixed(&["y post comment"])
+        } else if editor.draft.pending.is_some() {
+            fixed(&["R verify discussion", "p confirm posted", "t review retry"])
+        } else {
+            fixed(&["Ctrl+s review comment", "Ctrl+d discard draft"])
+        };
+    }
+    if let Some(editor) = &app.browser.editor {
+        return match editor {
+            crate::browser::Editor::Filters { .. } => {
+                fixed(&["Ctrl+s apply and save", "Ctrl+u clear field"])
+            }
+            crate::browser::Editor::Views { .. } => {
+                fixed(&["n new view", "d duplicate", "r rename", "x delete view"])
+            }
+            crate::browser::Editor::Name { .. } => vec![],
+        };
+    }
     if let Some(dialog) = &app.hosted.dialog {
         return match dialog {
             Dialog::Start { editing: true, .. } => {
                 fixed(&["Tab review brief", "Ctrl+u clear handoff"])
             }
-            Dialog::Start { .. } => fixed(&["y confirm launch", "Tab edit handoff"]),
+            Dialog::Start { .. } => fixed(&[
+                if app.hosted.discussion_approval.is_some() {
+                    "y approve & start"
+                } else {
+                    "y capture discussion"
+                },
+                "Tab edit handoff",
+            ]),
             Dialog::Sessions { .. } => fixed(&["c continue conversation", "Enter select only"]),
             Dialog::RetryStart { .. } => fixed(&["y retry same request", "f forget reminder"]),
             Dialog::Diagnostics { .. } => vec![],
@@ -149,6 +178,11 @@ fn actions(app: &App) -> Vec<String> {
     if app.ticket_mode {
         let Some(ticket) = &app.ticket else {
             return fixed(&[
+                "f filters",
+                "v saved views",
+                "c comment",
+                "o GitHub",
+                "a active work",
                 "w basic worktrees",
                 "R refresh tickets",
                 ", settings",
@@ -291,6 +325,8 @@ pub fn help(app: &App, width: u16) -> String {
     let body = if app.settings_open {
         "SETTINGS\n1 Sources · 2 Worktrees · 3 Profiles · 4 Notifications\na add source, project defaults or profile\nSources: d remove source · r recursive discovery\nCtrl+s validate, save and apply · D discard draft\nEsc returns to explorer and keeps unfinished edits\n\nEDITING\nCtrl+u clears text before the cursor\nFinal-field acceptance updates the draft, not the file\nConflicts: m keep mine · e keep external values"
             .into()
+    } else if app.project.is_some() && app.ticket_mode && app.ticket.is_none() {
+        "TICKET BROWSER\nf edit filters · v saved views\nc compose / restore comment · o open GitHub\na collapse / expand active work · R refresh\n\nSAVED VIEWS\nApply saves changes to the current view\nDuplicate a view before experimenting\nFilters combine across categories; labels support All or Any\nActive work remains visible independently of filters\n\nDISCUSSION\nComments are oldest first; incomplete and stale content is marked\nComment review freezes the issue, identity and exact text\nOnly y on the review screen posts a comment\nUnknown sends require explicit verification or retry\n\nw basic worktrees · , settings".into()
     } else if app.project.is_some() && app.ticket_mode {
         format!(
             "TICKET WORKFLOW\nc create shared checkout · a adopt worktree\ni import explicit tasks · p cycle task progress\nR refresh GitHub · v inspect issue changes\nRequirements review: m merge tasks · s send revision\n\nAGENT CONVERSATIONS\ns continue selected conversation · n new conversation\ng recorded conversations: select only, or c continue\nb handover checkout (stops its current owner first)\nd detach view · x stop selected task's session\n{} returns from agent input to Tree Rail\n\nRECOVERY & CLEANUP\nr reconcile execution · u retry unresolved launch\n! take input control · X stop host (no live agents)\nE diagnostics · D preview optional checkout cleanup\n\nw basic worktrees · , settings\nReady means finished responding; task progress is manual.",
