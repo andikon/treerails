@@ -388,15 +388,31 @@ async fn terminal_default_browsing_and_basic_escape_share_production_events() {
     app.jobs.clear();
     app.open_project();
     assert!(app.ticket_mode);
-    assert!(
-        app.jobs
-            .iter()
-            .any(|job| matches!(job, Job::Workflow(_, _, Command::List)))
-    );
+    let job = app
+        .jobs
+        .iter()
+        .find(|job| {
+            matches!(
+                job,
+                Job::Workflow(
+                    _,
+                    _,
+                    Command::Browser(treerail::ticket_browser::Command::Load { .. })
+                )
+            )
+        })
+        .unwrap();
+    let Job::Workflow(_, _, browse) = &job else {
+        unreachable!()
+    };
+    let result = Workflow::new(&path)
+        .execute_with(&project, browse.clone(), &Source)
+        .await
+        .unwrap();
     app.accept(Completion {
         epoch: app.epoch,
-        token: "workflow".into(),
-        result: Ok(Payload::Workflow(Event::Issues(vec![issue(1)]))),
+        token: job.token(),
+        result: Ok(Payload::Workflow(result)),
     });
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(
@@ -421,9 +437,11 @@ async fn terminal_default_browsing_and_basic_escape_share_production_events() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(text.contains("Ticket overview"));
-    assert!(text.contains("Acceptance criteria"));
-    assert!(text.contains("No shared worktree"));
+    assert!(text.contains("Task workspace"));
+    assert!(text.contains("Deliver 1"));
+    assert!(text.contains("No checkout"));
+    assert!(text.contains("4 Discussion"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
     assert!(!app.ticket_mode);
     app.key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));

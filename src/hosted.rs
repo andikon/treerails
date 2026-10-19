@@ -43,6 +43,8 @@ pub struct SessionRecord {
     pub execution_group: Option<String>,
     #[serde(default)]
     pub start_intent: Option<StartIntent>,
+    #[serde(default)]
+    pub discussion_snapshot: Option<crate::discussion_snapshot::Approval>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartIntent {
@@ -61,6 +63,21 @@ pub struct PendingStart {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    CaptureDiscussion {
+        ticket: String,
+        task: String,
+        handoff: String,
+    },
+    StartDocument {
+        request_id: String,
+        ticket: String,
+        task: String,
+        handoff: String,
+        rows: u16,
+        cols: u16,
+        approval: crate::discussion_snapshot::Approval,
+        from_session: Option<String>,
+    },
     Workflow {
         project: PathBuf,
         command: workflow::Command,
@@ -119,6 +136,7 @@ pub enum Command {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
+    DiscussionCaptured(crate::discussion_snapshot::Approval),
     Workflow(Box<workflow::Event>),
     State(workflow::WorkflowState),
     Started(SessionRecord),
@@ -156,6 +174,33 @@ pub fn starting_brief(ticket: &TicketRecord, task: &str, handoff: &str) -> Resul
     ))
 }
 
+pub fn discussion_context(ticket: &TicketRecord, task: &str, handoff: &str) -> Result<String> {
+    let objective = ticket
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == task)
+        .context("Unknown task")?;
+    let checkout = ticket
+        .worktree
+        .as_ref()
+        .context("Prepare or adopt this ticket's shared worktree first")?;
+    ensure!(
+        checkout.path.is_dir(),
+        "Ticket checkout is missing; reconcile it before starting work"
+    );
+    Ok(format!(
+        "GitHub ticket: {}\n{}\nTask: {} ({})\nWorktree: {}\nBranch: {}\nLocal requirements SHA-256: {}\nExplicit handoff:\n{}",
+        ticket.issue.url,
+        ticket.issue.title,
+        objective.title,
+        objective.id,
+        checkout.path.display(),
+        checkout.branch,
+        crate::discussion_snapshot::digest(ticket.issue.body.as_bytes()),
+        handoff
+    ))
+}
+
 pub fn selected_session<'a>(
     state: &'a workflow::WorkflowState,
     ticket: &str,
@@ -170,6 +215,12 @@ pub fn selected_session<'a>(
 
 /// A narrow command/event seam also used by controlled provider lifecycle tests.
 trait SessionRuntime {
+    fn verify_document_delivery(&self) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn require_discussion(&self) -> bool {
+        false
+    }
     fn execution_identity(&self, host: &str, request: &str) -> Result<Option<String>> {
         Ok(Some(crate::host::execution::execution_group_identity(
             host, request,
@@ -190,6 +241,12 @@ trait SessionRuntime {
     }
 }
 impl SessionRuntime for crate::host::runtime::Host {
+    fn verify_document_delivery(&self) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+        Box::pin(crate::copilot::verify_document_provider())
+    }
+    fn require_discussion(&self) -> bool {
+        true
+    }
     fn request(
         &mut self,
         command: crate::host::runtime::HostCommand,
@@ -230,15 +287,13 @@ fn choose(state: &mut workflow::WorkflowState, session: &str) -> Result<SessionR
     {
         record.current = record.id == session;
     }
-    state
-        .tickets
-        .get_mut(&chosen.ticket)
-        .context("Recorded ticket is missing")?
-        .selected_task = Some(chosen.task.clone());
+    crate::workspace::select(state, &chosen.ticket, &chosen.task)?;
     Ok(state.sessions.get(session).unwrap().clone())
 }
 /// Validate the physical checkout rather than trusting its remembered path/label.
-async fn verify_ticket_checkout(ticket: &TicketRecord) -> Result<workflow::Checkout> {
+async fn verify_workspace_checkout(
+    ticket: &crate::workspace::Workspace,
+) -> Result<workflow::Checkout> {
     let checkout = ticket
         .worktree
         .as_ref()
@@ -288,21 +343,18 @@ async fn verify_ticket_checkout(ticket: &TicketRecord) -> Result<workflow::Check
     let mut owner = String::new();
     file.take(4097).read_to_string(&mut owner)?;
     ensure!(
-        owner == ticket.id(),
+        owner == ticket.id,
         "Physical checkout association belongs to another ticket; reconcile it before starting"
     );
     Ok(checkout.clone())
 }
 async fn verify_checkout(state: &workflow::WorkflowState, record: &SessionRecord) -> Result<()> {
-    let ticket = state
-        .tickets
-        .get(&record.ticket)
-        .context("Recorded ticket is missing")?;
+    let ticket = crate::workspace::resolve(state, &record.ticket)?;
     ensure!(
         ticket.tasks.iter().any(|task| task.id == record.task),
         "Recorded task is missing; reconcile it first"
     );
-    let checkout = verify_ticket_checkout(ticket).await?;
+    let checkout = verify_workspace_checkout(&ticket).await?;
     ensure!(
         record
             .checkout
@@ -352,9 +404,127 @@ async fn execute_with(
     config_path: PathBuf,
     command: Command,
 ) -> Result<Event> {
+    execute_with_approval(runtime, config_path, command, None).await
+}
+async fn execute_with_approval(
+    runtime: &mut impl SessionRuntime,
+    config_path: PathBuf,
+    command: Command,
+    approved_document: Option<crate::discussion_snapshot::Approval>,
+) -> Result<Event> {
     use crate::host::runtime::{HostCommand, Response};
     let workflow = workflow::Workflow::new(&config_path);
     match command {
+        Command::CaptureDiscussion {
+            ticket,
+            task,
+            handoff,
+        } => {
+            let state = workflow.snapshot()?;
+            let target = crate::workspace::resolve(&state, &ticket)?;
+            verify_workspace_checkout(&target).await?;
+            let context = crate::workspace::context(&state, &ticket, &task, &handoff)?;
+            let approval = if let Some(issue) = &target.issue {
+                let discussion = crate::ticket_browser::complete_discussion(
+                    &target.project,
+                    &workflow::Github,
+                    issue.number,
+                )
+                .await?;
+                ensure!(
+                    discussion.card.issue.number == issue.number
+                        && discussion.card.issue.url == issue.url,
+                    "Repository or source issue changed during capture"
+                );
+                crate::discussion_snapshot::retain(&config_path, &discussion, context)?
+            } else {
+                crate::discussion_snapshot::retain_local(&config_path, context)?
+            };
+            ensure!(
+                crate::workspace::context(&workflow.snapshot()?, &ticket, &task, &handoff)?
+                    == approval.context,
+                "Task or checkout changed during capture; capture and review again"
+            );
+            Ok(Event::DiscussionCaptured(approval))
+        }
+        Command::StartDocument {
+            request_id,
+            ticket,
+            task,
+            handoff,
+            rows,
+            cols,
+            approval,
+            from_session,
+        } => {
+            ensure!(
+                crate::copilot::is_uuid(&request_id),
+                "Start request requires a stable UUID"
+            );
+            ensure!(
+                approval.short_prompt.len() <= 48 * 1024,
+                "Starting prompt exceeds the hosted limit; capture and review again"
+            );
+            approval.validate(&config_path)?;
+            let state = workflow.snapshot()?;
+            if !state.sessions.contains_key(&request_id) {
+                let target = crate::workspace::resolve(&state, &ticket)?;
+                ensure!(
+                    approval.snapshot.issue_url
+                        == target
+                            .issue
+                            .as_ref()
+                            .map(|issue| issue.url.as_str())
+                            .unwrap_or_default(),
+                    "Approved discussion belongs to another ticket; capture and review this ticket"
+                );
+                verify_workspace_checkout(&target).await?;
+                ensure!(
+                    crate::workspace::context(&state, &ticket, &task, &handoff)?
+                        == approval.context,
+                    "Task, issue or checkout changed after discussion review; capture and review again"
+                );
+                // Approval survives a failed provider preflight without creating a conversation/owner.
+                workflow.update(|state| {
+                    state
+                        .approved_discussions
+                        .insert(approval.snapshot.id.clone(), approval.clone());
+                    Ok(())
+                })?;
+                runtime.verify_document_delivery().await?;
+                if let Some(from) = from_session {
+                    ensure!(
+                        state
+                            .sessions
+                            .get(&from)
+                            .is_some_and(|record| record.ticket == ticket),
+                        "Handover must remain inside this ticket"
+                    );
+                    Box::pin(execute_with(
+                        runtime,
+                        config_path.clone(),
+                        Command::Stop { session: from },
+                    ))
+                    .await?;
+                }
+            }
+            let short = approval.short_prompt.clone();
+            Box::pin(execute_with_approval(
+                runtime,
+                config_path,
+                Command::StartRequest {
+                    request_id,
+                    ticket,
+                    task,
+                    handoff,
+                    rows,
+                    cols,
+                    expected_brief: Some(short),
+                },
+                Some(approval),
+            ))
+            .await
+        }
         Command::Workflow { project, command } => Ok(Event::Workflow(Box::new(
             workflow.execute(&project, command).await?,
         ))),
@@ -399,10 +569,18 @@ async fn execute_with(
             expected_brief,
         } => {
             ensure!(
+                !runtime.require_discussion() || approved_document.is_some(),
+                "New conversations require a fresh complete discussion: capture and approve the discussion document first"
+            );
+            ensure!(
                 crate::copilot::is_uuid(&request_id),
                 "Start request requires a stable UUID"
             );
             if let Some(record) = workflow.snapshot()?.sessions.get(&request_id).cloned() {
+                ensure!(
+                    record.discussion_snapshot == approved_document,
+                    "Start retry differs from the exact approved discussion document"
+                );
                 ensure!(
                     record.ticket == ticket && record.task == task,
                     "Start request UUID was reused for a different target"
@@ -428,15 +606,19 @@ async fn execute_with(
                 return reconcile(runtime, &workflow, &record.id).await;
             }
             let before = workflow.snapshot()?;
-            let ticket_before = before.tickets.get(&ticket).context("Unknown ticket")?;
-            let verified_checkout = verify_ticket_checkout(ticket_before).await?;
+            let ticket_before = crate::workspace::resolve(&before, &ticket)?;
+            let verified_checkout = verify_workspace_checkout(&ticket_before).await?;
             let verified_project = ticket_before.project.clone();
             let host_instance = instance(runtime).await?;
             let execution_group = runtime.execution_identity(&host_instance, &request_id)?;
             let record = workflow.update(|state| {
-                let ticket_record = state.tickets.get(&ticket).context("Unknown ticket")?;
+                let ticket_record = crate::workspace::resolve(state, &ticket)?;
                 ensure!(ticket_record.worktree.as_ref()==Some(&verified_checkout) && ticket_record.project==verified_project,"Ticket checkout association changed during verification; review it before starting");
-                let brief = starting_brief(ticket_record, &task, &handoff)?;
+                let brief = if let Some(approval) = &approved_document {
+                    approval.validate(&config_path)?;
+                    ensure!(crate::workspace::context(state,&ticket,&task,&handoff)? == approval.context,"Task or checkout changed after discussion review");
+                    approval.short_prompt.clone()
+                } else if let Some(record) = state.tickets.get(&ticket) { starting_brief(record, &task, &handoff)? } else { crate::workspace::context(state, &ticket, &task, &handoff)? };
                 if let Some(expected) = &expected_brief { ensure!(expected == &brief, "Issue, task or workspace changed after brief review; inspect it again before starting"); }
                 ensure!(brief.len() <= 48 * 1024, "Starting brief exceeds the hosted limit; refine the ticket before starting");
                 let checkout = ticket_record.worktree.as_ref().unwrap();
@@ -450,6 +632,7 @@ async fn execute_with(
                     pending_start: Some(PendingStart {request_id: id.clone(),host_instance:host_instance.clone(),resume:false,rows,cols}),
                     execution_group: execution_group.clone(),
                     start_intent:Some(StartIntent{handoff:handoff.clone(),rows,cols}),
+                    discussion_snapshot: approved_document.clone(),
                 };
                 state.sessions.insert(record.id.clone(), record.clone()); choose(state, &record.id)
             })?;
@@ -460,6 +643,10 @@ async fn execute_with(
                     provider_session_id: record.provider_session_id.clone(),
                     resume: false,
                     brief: Some(record.starting_brief.clone()),
+                    document: record
+                        .discussion_snapshot
+                        .as_ref()
+                        .map(|approval| approval.snapshot.clone()),
                     rows,
                     cols,
                 })
@@ -586,6 +773,7 @@ async fn execute_with(
                     provider_session_id: record.provider_session_id.clone(),
                     resume: true,
                     brief: None,
+                    document: None,
                     rows,
                     cols,
                 })
@@ -630,6 +818,10 @@ async fn execute_with(
             rows,
             cols,
         } => {
+            ensure!(
+                !runtime.require_discussion(),
+                "Handover requires a fresh approved full-discussion document; capture it before stopping the current agent"
+            );
             let state = workflow.snapshot()?;
             let previous = state
                 .sessions
@@ -639,9 +831,13 @@ async fn execute_with(
                 previous.ticket == ticket,
                 "Handover must remain inside this ticket"
             );
-            let target = state.tickets.get(&ticket).context("Unknown ticket")?;
-            verify_ticket_checkout(target).await?;
-            let brief = starting_brief(target, &task, &handoff)?;
+            let target = crate::workspace::resolve(&state, &ticket)?;
+            verify_workspace_checkout(&target).await?;
+            let brief = if let Some(record) = state.tickets.get(&ticket) {
+                starting_brief(record, &task, &handoff)?
+            } else {
+                crate::workspace::context(&state, &ticket, &task, &handoff)?
+            };
             if let Some(expected) = &expected_brief {
                 ensure!(
                     expected == &brief,
@@ -1092,6 +1288,8 @@ mod tests {
         instance: String,
         terminals: BTreeMap<String, TerminalSnapshot>,
         launches: Vec<(String, bool, Option<String>)>,
+        documents: Vec<Option<crate::discussion_snapshot::Snapshot>>,
+        document_supported: bool,
         fail_stop: bool,
         fail_setup: bool,
         lose_reply: bool,
@@ -1099,6 +1297,15 @@ mod tests {
         starts: BTreeMap<String, String>,
     }
     impl SessionRuntime for Runtime {
+        fn verify_document_delivery(&self) -> Pin<Box<dyn Future<Output = Result<()>> + '_>> {
+            Box::pin(async move {
+                ensure!(
+                    self.document_supported,
+                    "Native document compatibility verification is pending"
+                );
+                Ok(())
+            })
+        }
         fn execution_stopped(&self, _: &str) -> Result<bool> {
             Ok(self.execution_free)
         }
@@ -1124,8 +1331,10 @@ mod tests {
                         provider_session_id,
                         resume,
                         brief,
+                        document,
                         ..
                     } => {
+                        self.documents.push(document);
                         let id = format!("terminal-{}", self.launches.len());
                         self.starts.insert(request_id.clone(), id.clone());
                         self.launches
@@ -1264,6 +1473,8 @@ mod tests {
                 instance: "host-one".into(),
                 terminals: BTreeMap::new(),
                 launches: vec![],
+                documents: vec![],
+                document_supported: true,
                 fail_stop: false,
                 fail_setup: false,
                 lose_reply: false,
@@ -1299,6 +1510,151 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn local_tasks_use_frozen_documents_and_link_without_losing_conversations() {
+        let mut f = Fixture::new().await;
+        let workflow = workflow::Workflow::new(&f.path);
+        let original = f.state().tickets["owner/repo#1"].clone();
+        let checkout = original.worktree.as_ref().unwrap().path.clone();
+        std::fs::remove_file(workflow::claim_path(&checkout).await.unwrap()).unwrap();
+        workflow
+            .update(|state| {
+                state.tickets.clear();
+                Ok(())
+            })
+            .unwrap();
+        let first = match workflow
+            .execute(
+                &checkout,
+                workflow::Command::CreateLocal {
+                    path: checkout.clone(),
+                    objective: "Investigate failure\nKeep the full objective and second line."
+                        .into(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            workflow::Event::Workspace(work) => work,
+            _ => panic!(),
+        };
+        let first_task = first.selected_task.clone().unwrap();
+        let second = match workflow
+            .execute(
+                &checkout,
+                workflow::Command::CreateLocal {
+                    path: checkout.clone(),
+                    objective: "Review investigation".into(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            workflow::Event::Workspace(work) => work,
+            _ => panic!(),
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.tasks.len(), 2);
+        assert!(second.issue.is_none());
+        let approval = match f
+            .command(Command::CaptureDiscussion {
+                ticket: first.id.clone(),
+                task: first_task.clone(),
+                handoff: "Local handoff".into(),
+            })
+            .await
+            .unwrap()
+        {
+            Event::DiscussionCaptured(approval) => approval,
+            _ => panic!(),
+        };
+        assert!(
+            std::fs::read_to_string(&approval.snapshot.path)
+                .unwrap()
+                .contains("Keep the full objective and second line.")
+        );
+        assert!(approval.snapshot.issue_url.is_empty());
+        let started = match f
+            .command(Command::StartDocument {
+                request_id: crate::copilot::new_session_id(),
+                ticket: first.id.clone(),
+                task: first_task.clone(),
+                handoff: "Local handoff".into(),
+                rows: 30,
+                cols: 100,
+                approval: approval.clone(),
+                from_session: None,
+            })
+            .await
+            .unwrap()
+        {
+            Event::Started(record) => record,
+            _ => panic!(),
+        };
+        assert_eq!(started.discussion_snapshot, Some(approval.clone()));
+        workflow
+            .update(|state| {
+                let mut ticket = original.clone();
+                ticket.worktree = None;
+                state.tickets.insert(ticket.id(), ticket);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            workflow
+                .execute(
+                    &checkout,
+                    workflow::Command::LinkLocal {
+                        local: first.id.clone(),
+                        ticket: original.id()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        f.command(Command::Stop {
+            session: started.id.clone(),
+        })
+        .await
+        .unwrap();
+        workflow
+            .execute(
+                &checkout,
+                workflow::Command::LinkLocal {
+                    local: first.id.clone(),
+                    ticket: original.id(),
+                },
+            )
+            .await
+            .unwrap();
+        let state = f.state();
+        assert!(!state.local_work.contains_key(&first.id));
+        assert!(
+            state.tickets[&original.id()]
+                .tasks
+                .iter()
+                .any(|task| task.id == first_task)
+        );
+        assert_eq!(state.sessions[&started.id].ticket, original.id());
+        assert_eq!(
+            state.sessions[&started.id].discussion_snapshot,
+            Some(approval)
+        );
+        assert!(
+            crate::workspace::context(&state, &original.id(), &first_task, "")
+                .unwrap()
+                .contains("Keep the full objective and second line.")
+        );
+        f.command(Command::Continue {
+            session: started.id.clone(),
+            rows: 30,
+            cols: 100,
+        })
+        .await
+        .unwrap();
+        assert!(f.runtime.launches.last().unwrap().1);
+    }
+
     #[tokio::test]
     async fn implementation_handover_review_and_exact_resume_preserve_conversations() {
         let mut f = Fixture::new().await;
@@ -1912,5 +2268,180 @@ mod tests {
                 assert!(f.runtime.launches.is_empty());
             }
         }
+    }
+
+    fn approved_document(f: &Fixture, task: &str) -> crate::discussion_snapshot::Approval {
+        let state = f.state();
+        let ticket = &state.tickets["owner/repo#1"];
+        let discussion = crate::ticket_browser::Discussion {
+            card: ticket.issue.clone().into(),
+            comments: vec![crate::ticket_browser::Comment {
+                body: format!("{}\nLAST-COMMENT", "Complete discussion ".repeat(6000)),
+                ..Default::default()
+            }],
+            complete: true,
+            fetched_at: 50,
+            warning: None,
+        };
+        crate::discussion_snapshot::retain(
+            &f.path,
+            &discussion,
+            discussion_context(ticket, task, "").unwrap(),
+        )
+        .unwrap()
+    }
+    fn document_start(
+        approval: crate::discussion_snapshot::Approval,
+        request_id: String,
+    ) -> Command {
+        Command::StartDocument {
+            request_id,
+            ticket: "owner/repo#1".into(),
+            task: "implementation".into(),
+            handoff: String::new(),
+            rows: 30,
+            cols: 100,
+            approval,
+            from_session: None,
+        }
+    }
+    #[tokio::test]
+    async fn document_start_keeps_large_bodies_out_of_host_messages_and_never_replays_on_continue()
+    {
+        let mut f = Fixture::new().await;
+        let approval = approved_document(&f, "implementation");
+        assert!(approval.snapshot.bytes > 48 * 1024);
+        let id = crate::copilot::new_session_id();
+        let command = document_start(approval.clone(), id.clone());
+        assert!(serde_json::to_vec(&command).unwrap().len() < 4096);
+        let Event::Started(record) = f.command(command.clone()).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(record.discussion_snapshot, Some(approval.clone()));
+        assert_eq!(f.runtime.documents, vec![Some(approval.snapshot.clone())]);
+        assert!(
+            !f.runtime.launches[0]
+                .2
+                .as_ref()
+                .unwrap()
+                .contains("LAST-COMMENT")
+        );
+        // A retry discovers the accepted operation; neither a new prompt nor artifact is supplied again.
+        f.command(command).await.unwrap();
+        assert_eq!(f.runtime.launches.len(), 1);
+        f.command(Command::Stop {
+            session: id.clone(),
+        })
+        .await
+        .unwrap();
+        f.command(Command::Continue {
+            session: id,
+            rows: 30,
+            cols: 100,
+        })
+        .await
+        .unwrap();
+        assert_eq!(f.runtime.documents.last(), Some(&None));
+        assert_eq!(f.runtime.launches.last().unwrap().2, None);
+        assert_eq!(
+            f.state().sessions[&record.id].discussion_snapshot,
+            Some(approval)
+        );
+    }
+    #[tokio::test]
+    async fn changed_document_or_task_rejects_start_without_acquiring_checkout_ownership() {
+        let mut f = Fixture::new().await;
+        let approval = approved_document(&f, "implementation");
+        workflow::Workflow::new(&f.path)
+            .update(|state| {
+                state.tickets.get_mut("owner/repo#1").unwrap().tasks[0].title =
+                    "Changed objective".into();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            f.command(document_start(
+                approval.clone(),
+                crate::copilot::new_session_id()
+            ))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed")
+        );
+        assert!(f.runtime.launches.is_empty());
+        std::fs::write(&approval.snapshot.path, "changed document").unwrap();
+        assert!(
+            f.command(document_start(approval, crate::copilot::new_session_id()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
+        assert!(f.state().sessions.is_empty());
+    }
+    #[tokio::test]
+    async fn handover_document_preflight_preserves_owner_and_approval_when_provider_is_unverified()
+    {
+        let mut f = Fixture::new().await;
+        let owner = f.start("implementation").await;
+        let approval = approved_document(&f, "review");
+        let command = |approval: crate::discussion_snapshot::Approval, request_id: String| {
+            Command::StartDocument {
+                request_id,
+                ticket: owner.ticket.clone(),
+                task: "review".into(),
+                handoff: String::new(),
+                rows: 30,
+                cols: 100,
+                approval,
+                from_session: Some(owner.id.clone()),
+            }
+        };
+        assert!(
+            f.command(command(approval.clone(), "invalid-request".into()))
+                .await
+                .is_err()
+        );
+        let mut oversized = approval.clone();
+        oversized.short_prompt = "x".repeat(48 * 1024 + 1);
+        assert!(
+            f.command(command(oversized, crate::copilot::new_session_id()))
+                .await
+                .is_err()
+        );
+        let mut crossed = approval.clone();
+        crossed.context.push_str("Different context");
+        assert!(
+            f.command(command(crossed, crate::copilot::new_session_id()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("context")
+        );
+        let mut wrong_source = approval.clone();
+        wrong_source.snapshot.issue_url = "https://github.com/other/repo/issues/1".into();
+        assert!(
+            f.command(command(wrong_source, crate::copilot::new_session_id()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another ticket")
+        );
+        f.runtime.document_supported = false;
+        assert!(
+            f.command(command(approval.clone(), crate::copilot::new_session_id()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pending")
+        );
+        assert_eq!(f.state().sessions[&owner.id], owner);
+        assert_eq!(f.runtime.terminals.len(), 1);
+        assert_eq!(f.runtime.launches.len(), 1);
+        assert_eq!(
+            f.state().approved_discussions.get(&approval.snapshot.id),
+            Some(&approval)
+        );
     }
 }

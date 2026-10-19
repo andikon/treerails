@@ -7,7 +7,10 @@ use crate::{
     settings::{self, Draft},
     workflow::{self, Command as WorkflowCommand, Event as WorkflowEvent, TicketRecord},
 };
+mod browser_ui;
+mod comment_ui;
 pub mod hosted_ui;
+pub mod workspace_ui;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -39,6 +42,8 @@ pub enum Operation {
 }
 #[derive(Debug)]
 pub enum Job {
+    LocalWorkflow(PathBuf),
+    OpenIssue(PathBuf, u64),
     Host(PathBuf, crate::host::runtime::HostCommand),
     Workflow(PathBuf, PathBuf, WorkflowCommand),
     Discover(Vec<PathBuf>, bool),
@@ -49,6 +54,7 @@ pub enum Job {
     Prs(PathBuf),
     ReviewDiff(PathBuf, String),
     Operation {
+        config_path: PathBuf,
         id: u64,
         project: PathBuf,
         path: PathBuf,
@@ -59,6 +65,8 @@ pub enum Job {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
+    LocalWorkflow(workflow::WorkflowState),
+    BrowserOpened,
     Host(crate::host::runtime::Response),
     Workflow(WorkflowEvent),
     Projects(Vec<Project>, Vec<String>),
@@ -77,7 +85,14 @@ pub struct Completion {
 impl Job {
     pub fn token(&self) -> String {
         match self {
+            Self::LocalWorkflow(_) => "local-workflow".into(),
+            Self::OpenIssue(project, number) => {
+                format!("open-issue:{}:{number}", project.display())
+            }
             Self::Host(..) => "host".into(),
+            Self::Workflow(_, project, WorkflowCommand::Browser(command)) => {
+                browser_ui::token(project, command)
+            }
             Self::Workflow(..) => "workflow".into(),
             Self::Status(p) => format!("status:{}", p.display()),
             Self::Diff(p, f, s) => diff_key(p, &f.path, *s),
@@ -101,6 +116,18 @@ impl Job {
     }
     pub async fn execute(self) -> Result<Payload> {
         match self {
+            Self::LocalWorkflow(path) => Ok(Payload::LocalWorkflow(
+                workflow::Workflow::new(path).snapshot()?,
+            )),
+            Self::OpenIssue(project, number) => {
+                let status = tokio::process::Command::new("gh")
+                    .current_dir(project)
+                    .args(["issue", "view", &number.to_string(), "--web"])
+                    .status()
+                    .await?;
+                anyhow::ensure!(status.success(), "GitHub could not open the issue");
+                Ok(Payload::BrowserOpened)
+            }
             Self::Host(config, command) => {
                 Ok(Payload::Host(hosted_ui::request(config, command).await?))
             }
@@ -139,8 +166,21 @@ impl Job {
                 Ok(Payload::Diff(key, git::review_diff(&path, &branch).await?))
             }
             Self::Operation {
-                project, path, op, ..
+                config_path,
+                project,
+                path,
+                op,
+                ..
             } => {
+                if matches!(&op, Operation::Pull | Operation::Remove(_)) {
+                    let state = workflow::Workflow::new(&config_path).snapshot()?;
+                    let target = if let Operation::Remove(target) = &op {
+                        target
+                    } else {
+                        &path
+                    };
+                    crate::work::mutation_guard(&state, target)?;
+                }
                 let (mut selected, mut message) = (None, "Completed".to_owned());
                 match op {
                     Operation::Stage(files, undo) => {
@@ -159,7 +199,7 @@ impl Job {
                         git::run(&path, ["fetch", "--progress", "--all", "--prune"]).await?;
                     }
                     Operation::Pull => {
-                        git::run(&path, ["pull", "--progress", "--ff-only"]).await?;
+                        git::pull(&path).await?;
                     }
                     Operation::Push => {
                         git::push(&path).await?;
@@ -220,6 +260,7 @@ pub fn diff_key(path: &std::path::Path, file: &std::path::Path, staged: bool) ->
 
 #[derive(Debug, Clone)]
 pub enum FormKind {
+    LocalTask(PathBuf),
     TicketCreate(String),
     Create { existing: bool },
     Branch,
@@ -257,6 +298,7 @@ pub struct Form {
 }
 #[derive(Debug, Clone)]
 pub enum PickerKind {
+    LinkWork(String),
     TicketAdopt(String),
     TicketImport(String),
     Operations,
@@ -295,6 +337,15 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub workspace: Option<crate::workspace::Workspace>,
+    pub workspace_open: bool,
+    pub workspace_start_pending: bool,
+    pub workspace_tab: workspace_ui::WorkspaceTab,
+    pub work_mode: bool,
+    pub work_cursor: usize,
+    pub comment_editor: Option<crate::ticket_comments::Editor>,
+    pub browser: crate::browser::Browser,
+    pub browser_return: Option<workspace_ui::BrowserPreview>,
     pub hosted: hosted_ui::HostedUi,
     pub ticket_mode: bool,
     pub issues: Vec<workflow::Issue>,
@@ -377,7 +428,16 @@ impl App {
             .cloned()
             .collect();
         Self {
+            workspace: None,
+            workspace_open: false,
+            workspace_start_pending: false,
+            workspace_tab: workspace_ui::WorkspaceTab::Overview,
+            work_mode: false,
+            work_cursor: 0,
             hosted: hosted_ui::HostedUi::default(),
+            comment_editor: None,
+            browser: crate::browser::Browser::default(),
+            browser_return: None,
             ticket_mode: true,
             issues: vec![],
             issue_cursor: 0,
@@ -495,6 +555,16 @@ impl App {
         }
     }
     pub fn operation(&mut self, op: Operation) {
+        if self.workspace_open
+            && self.workspace_tab == workspace_ui::WorkspaceTab::Changes
+            && !self.workspace_changes_ready()
+        {
+            self.say(
+                "Workspace checkout is unavailable; Git action refused",
+                true,
+            );
+            return;
+        }
         if self.busy {
             self.say("A Git operation is already running", true);
             return;
@@ -569,6 +639,7 @@ impl App {
         self.refresh_operation_picker();
         self.say("Running Git operation…", false);
         self.jobs.push(Job::Operation {
+            config_path: self.config_path.clone(),
             id,
             project: project.path,
             path,
@@ -699,8 +770,24 @@ impl App {
             return;
         }
         match done.result {
+            Ok(Payload::LocalWorkflow(state)) => self.state.workflow = state,
+            Ok(Payload::BrowserOpened) => self.say("Opened ticket in GitHub", false),
             Ok(Payload::Host(response)) => self.accept_host(response),
             Err(error) => {
+                if done.token == "workflow" {
+                    self.workspace_start_pending = false;
+                }
+                if done.token == "workflow"
+                    && let Some(editor) = &mut self.comment_editor
+                {
+                    editor.posting = false;
+                    editor.status = format!("{error:#}");
+                }
+                if done.token.starts_with("browser:")
+                    && !self.browser_failed(&done.token, format!("{error:#}"))
+                {
+                    return;
+                }
                 if done.token == "host" {
                     self.hosted_request_failed(format!("{error:#}"));
                 } else {
@@ -717,6 +804,48 @@ impl App {
                 }
             }
             Ok(Payload::Workflow(event)) => match event {
+                WorkflowEvent::Workspace(workspace) => {
+                    if let Ok(state) = workflow::Workflow::new(&self.config_path).snapshot() {
+                        self.state.workflow = state;
+                    }
+                    // A completed save remains durable after navigation, but must
+                    // not reopen an unrelated workspace or launch its review.
+                    let same_checkout = workspace.worktree.as_ref().is_some_and(|checkout| {
+                        self.current_workspace()
+                            .and_then(|w| w.worktree)
+                            .map(|current| same_path(&current.path, &checkout.path))
+                            .unwrap_or_else(|| {
+                                self.selected_tree()
+                                    .is_some_and(|tree| same_path(&tree.path, &checkout.path))
+                            })
+                    });
+                    if !self.workspace_open
+                        || !same_checkout
+                        || self
+                            .project
+                            .as_ref()
+                            .is_none_or(|project| !same_path(&project.path, &workspace.project))
+                    {
+                        self.workspace_start_pending = false;
+                        return;
+                    }
+                    self.task_cursor = workspace
+                        .tasks
+                        .iter()
+                        .position(|task| Some(&task.id) == workspace.selected_task.as_ref())
+                        .unwrap_or(0);
+                    self.ticket = self.state.workflow.tickets.get(&workspace.id).cloned();
+                    self.workspace = Some(workspace);
+                    self.workspace_open = true;
+                    self.sync_workspace_checkout();
+                    if self.workspace_start_pending {
+                        self.workspace_start_pending = false;
+                        self.workspace_tab = workspace_ui::WorkspaceTab::Agent;
+                        self.begin_agent(false);
+                    }
+                }
+                WorkflowEvent::Comment(event) => self.accept_comment(event),
+                WorkflowEvent::Browser(event) => self.accept_browser(event),
                 WorkflowEvent::Issues(issues) => {
                     self.issue_warning.clear();
                     self.issues = issues;
@@ -745,6 +874,11 @@ impl App {
                     );
                 }
                 WorkflowEvent::Ticket(ticket) => {
+                    if !self.workspace_open
+                        || self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id())
+                    {
+                        self.workspace_tab = workspace_ui::WorkspaceTab::Overview;
+                    }
                     if self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id()) {
                         self.task_cursor = ticket
                             .tasks
@@ -755,7 +889,15 @@ impl App {
                     }
                     let warning = ticket.github_error.clone();
                     let updated = ticket.issue_updated();
+                    self.state
+                        .workflow
+                        .tickets
+                        .insert(ticket.id(), ticket.clone());
+                    let id = ticket.id();
                     self.ticket = Some(ticket);
+                    self.workspace = crate::workspace::resolve(&self.state.workflow, &id).ok();
+                    self.workspace_open = true;
+                    self.sync_workspace_checkout();
                     let unavailable = warning.is_some();
                     let message = warning.unwrap_or_else(|| {
                         if updated {
@@ -916,12 +1058,29 @@ impl App {
             self.prs.clear();
             self.diff.clear();
             self.enqueue(Job::Trees(project.path.clone()));
-            self.enqueue(Job::Branches(project.path));
+            self.enqueue(Job::Branches(project.path.clone()));
             self.ticket = None;
+            self.workspace = None;
+            self.workspace_open = false;
+            self.work_mode = false;
             self.issues.clear();
             self.ticket_mode = true;
-            self.workflow_command(WorkflowCommand::List);
-            self.say("Loading GitHub tickets… · w basic worktrees", false);
+            self.browser = crate::browser::Browser::default();
+            let entry = self
+                .state
+                .workspace_views
+                .get(&project.path.to_string_lossy().to_string())
+                .cloned()
+                .unwrap_or_else(|| "tickets".into());
+            self.switch_entry(&entry);
+            self.say(
+                match entry.as_str() {
+                    "work" => "Project work · T tickets · w worktrees",
+                    "worktrees" => "Worktrees · W work · T tickets",
+                    _ => "Loading GitHub tickets… · W work · w worktrees",
+                },
+                false,
+            );
         }
     }
     pub fn selection_changed(&mut self) {
@@ -963,6 +1122,7 @@ impl App {
         }
     }
     pub fn tick(&mut self) {
+        self.browser_tick();
         self.hosted_tick();
         if self
             .prefix
@@ -1105,6 +1265,13 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if self.comment_key(key) {
+            return;
+        }
+        if self.ticket_mode && self.ticket.is_none() && self.browser.editor.is_some() {
+            self.browser_editor_key(key);
+            return;
+        }
         if self.hosted_key(key) {
             return;
         }
@@ -1183,7 +1350,11 @@ impl App {
             }
             return;
         }
-        if self.ticket_mode
+        if self.workspace_key(key) {
+            return;
+        }
+        if !self.workspace_open
+            && self.ticket_mode
             && self.project.is_some()
             && (!repeating
                 || matches!(
@@ -1220,7 +1391,7 @@ impl App {
             self.request_diff(false);
             return;
         }
-        if self.ticket_mode && self.project.is_some() && repeating {
+        if self.ticket_mode && !self.workspace_open && self.project.is_some() && repeating {
             return;
         }
         let action = self.config.keys.get(&key_name(key)).cloned();
@@ -1337,7 +1508,11 @@ impl App {
     fn change_focus(&mut self, delta: isize) {
         if self.project.is_some() {
             self.clear_filter();
-            self.focus = (self.focus as isize + delta).rem_euclid(3) as usize;
+            self.focus = if self.workspace_open {
+                1 + (self.focus as isize - 1 + delta).rem_euclid(2) as usize
+            } else {
+                (self.focus as isize + delta).rem_euclid(3) as usize
+            };
             self.request_diff(false);
         }
     }
@@ -1562,7 +1737,7 @@ impl App {
         match action {
             "T" | "tickets" => {
                 self.ticket_mode = true;
-                self.workflow_command(WorkflowCommand::List);
+                self.load_browser();
             }
             "a" | "create_worktree" => self.create_form(String::new(), false, false),
             "b" | "branches" => {
@@ -1937,6 +2112,21 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.comment_paste(text) {
+            return;
+        }
+        if let Some(editor) = self.browser.editor.as_mut() {
+            match editor {
+                crate::browser::Editor::Filters { fields, cursor } => {
+                    fields[*cursor].push_str(&text.replace(['\r', '\n'], " "))
+                }
+                crate::browser::Editor::Name { text: value, .. } => {
+                    value.push_str(&text.replace(['\r', '\n'], " "))
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.hosted_paste(text) {
             return;
         }
@@ -1984,6 +2174,10 @@ impl App {
     }
     fn choose(&mut self, kind: PickerKind, value: String) {
         match kind {
+            PickerKind::LinkWork(local) => self.workflow_command(WorkflowCommand::LinkLocal {
+                local,
+                ticket: value,
+            }),
             PickerKind::TicketAdopt(ticket) => self.workflow_command(WorkflowCommand::Prepare {
                 ticket,
                 preparation: workflow::Preparation::Adopt { path: value.into() },
@@ -2044,6 +2238,19 @@ impl App {
             .iter()
             .map(|f| f.value.trim().to_owned())
             .collect();
+        if let FormKind::LocalTask(path) = &form.kind {
+            if values[0].is_empty() {
+                self.say("A task objective is required", true);
+                self.modal = Some(Modal::Form(form));
+                return;
+            }
+            self.workspace_start_pending = true;
+            self.workflow_command(WorkflowCommand::CreateLocal {
+                path: path.clone(),
+                objective: values[0].clone(),
+            });
+            return;
+        }
         if let FormKind::TicketCreate(ticket) = &form.kind {
             if values.iter().take(3).any(|v| v.is_empty()) {
                 self.say("Branch, starting point and directory are required", true);
@@ -2067,7 +2274,7 @@ impl App {
             return;
         }
         let operation = match form.kind {
-            FormKind::TicketCreate(_) => unreachable!(),
+            FormKind::TicketCreate(_) | FormKind::LocalTask(_) => unreachable!(),
             FormKind::Create { existing } => {
                 if values[0].is_empty() || values[1].is_empty() || values[2].is_empty() {
                     self.say("Branch, starting point, and directory are required", true);
@@ -2121,6 +2328,9 @@ impl App {
         }
     }
     fn ticket_key(&mut self, key: KeyEvent) -> bool {
+        if self.ticket.is_none() && self.browser_key(key) {
+            return true;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
         }

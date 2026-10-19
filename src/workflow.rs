@@ -15,7 +15,10 @@ use std::{
 #[serde(default)]
 pub struct WorkflowState {
     pub tickets: BTreeMap<String, TicketRecord>,
+    pub local_work: BTreeMap<String, crate::workspace::LocalWorkRecord>,
+    pub task_objectives: BTreeMap<String, String>,
     pub sessions: BTreeMap<String, crate::hosted::SessionRecord>,
+    pub approved_discussions: BTreeMap<String, crate::discussion_snapshot::Approval>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Issue {
@@ -90,6 +93,16 @@ pub enum Preparation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    CreateLocal {
+        path: PathBuf,
+        objective: String,
+    },
+    LinkLocal {
+        local: String,
+        ticket: String,
+    },
+    Browser(crate::ticket_browser::Command),
+    Comment(crate::ticket_comments::Command),
     List,
     Open {
         number: u64,
@@ -141,6 +154,9 @@ pub enum Command {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
+    Workspace(crate::workspace::Workspace),
+    Browser(crate::ticket_browser::Event),
+    Comment(crate::ticket_comments::Event),
     Issues(Vec<Issue>),
     Ticket(TicketRecord),
     CachedIssues { issues: Vec<Issue>, warning: String },
@@ -244,13 +260,65 @@ pub fn deletion_owner<'a>(
 /// Inject GitHub transport without substituting workflow policy in tests.
 #[allow(async_fn_in_trait)]
 pub trait IssueSource {
+    async fn card(&self, project: &Path, number: u64) -> Result<crate::ticket_browser::IssueCard> {
+        Ok(self.get(project, number).await?.into())
+    }
+    async fn filter_metadata(
+        &self,
+        _project: &Path,
+    ) -> Result<crate::ticket_browser::FilterMetadata> {
+        Ok(Default::default())
+    }
     async fn repository(&self, project: &Path) -> Result<String>;
     async fn list(&self, project: &Path) -> Result<Vec<Issue>>;
     async fn get(&self, project: &Path, number: u64) -> Result<Issue>;
+    async fn repository_identity(&self, project: &Path) -> Result<String> {
+        Ok(crate::ticket_browser::normalize_repository(
+            &self.repository(project).await?,
+        ))
+    }
+    async fn current_login(&self, _project: &Path) -> Result<String> {
+        anyhow::bail!("Identity unavailable")
+    }
+    async fn post_comment(
+        &self,
+        _project: &Path,
+        _number: u64,
+        _body: &str,
+    ) -> Result<crate::ticket_browser::Comment> {
+        anyhow::bail!("Comment posting unsupported")
+    }
+    async fn browser_page(
+        &self,
+        project: &Path,
+        _repository: &str,
+        filter: &crate::ticket_browser::Filter,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Page> {
+        crate::ticket_browser::fallback_page(self.list(project).await?, filter, page)
+    }
+    async fn discussion_page(
+        &self,
+        project: &Path,
+        number: u64,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Discussion> {
+        anyhow::ensure!(page == 1, "No further discussion pages");
+        Ok(crate::ticket_browser::Discussion {
+            card: self.get(project, number).await?.into(),
+            comments: vec![],
+            complete: true,
+            fetched_at: crate::ticket_browser::now(),
+            warning: None,
+        })
+    }
 }
 pub struct Github;
 impl Github {
-    async fn json<T: serde::de::DeserializeOwned>(project: &Path, args: &[&str]) -> Result<T> {
+    pub(crate) async fn json<T: serde::de::DeserializeOwned>(
+        project: &Path,
+        args: &[&str],
+    ) -> Result<T> {
         let mut command = tokio::process::Command::new("gh");
         command
             .args(args)
@@ -270,6 +338,50 @@ impl Github {
     }
 }
 impl IssueSource for Github {
+    async fn card(&self, project: &Path, number: u64) -> Result<crate::ticket_browser::IssueCard> {
+        crate::ticket_browser::github_card(project, number).await
+    }
+    async fn filter_metadata(
+        &self,
+        project: &Path,
+    ) -> Result<crate::ticket_browser::FilterMetadata> {
+        crate::ticket_browser::github_metadata(project).await
+    }
+    async fn repository_identity(&self, project: &Path) -> Result<String> {
+        let value: serde_json::Value =
+            Self::json(project, &["repo", "view", "--json", "url"]).await?;
+        Ok(crate::ticket_browser::normalize_repository(
+            value["url"].as_str().context("Repository URL missing")?,
+        ))
+    }
+    async fn current_login(&self, project: &Path) -> Result<String> {
+        crate::ticket_comments::github_current_login(project).await
+    }
+    async fn post_comment(
+        &self,
+        project: &Path,
+        number: u64,
+        body: &str,
+    ) -> Result<crate::ticket_browser::Comment> {
+        crate::ticket_comments::github_post(project, number, body).await
+    }
+    async fn browser_page(
+        &self,
+        project: &Path,
+        repository: &str,
+        filter: &crate::ticket_browser::Filter,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Page> {
+        crate::ticket_browser::github_page(project, repository, filter, page).await
+    }
+    async fn discussion_page(
+        &self,
+        project: &Path,
+        number: u64,
+        page: u32,
+    ) -> Result<crate::ticket_browser::Discussion> {
+        crate::ticket_browser::github_discussion(project, number, page).await
+    }
     async fn repository(&self, project: &Path) -> Result<String> {
         #[derive(Deserialize)]
         struct Repo {
@@ -335,6 +447,70 @@ impl Workflow {
         source: &impl IssueSource,
     ) -> Result<Event> {
         match command {
+            Command::CreateLocal { path, objective } => {
+                crate::workspace::create_local(self, project, &path, objective)
+                    .await
+                    .map(Event::Workspace)
+            }
+            Command::LinkLocal { local, ticket } => {
+                crate::workspace::link_local(self, project, &local, &ticket)
+                    .await
+                    .map(Event::Workspace)
+            }
+            Command::SelectTask { ticket, task }
+                if self.snapshot()?.local_work.contains_key(&ticket) =>
+            {
+                self.update(|state| {
+                    let record = state
+                        .local_work
+                        .get_mut(&ticket)
+                        .context("Unknown local work")?;
+                    ensure!(
+                        config::same_path(project, &record.project),
+                        "Work belongs to another project"
+                    );
+                    ensure!(
+                        record.tasks.iter().any(|candidate| candidate.id == task),
+                        "Unknown task"
+                    );
+                    record.selected_task = Some(task);
+                    crate::workspace::resolve(state, &ticket)
+                })
+                .map(Event::Workspace)
+            }
+            Command::SetProgress {
+                ticket,
+                task,
+                progress,
+            } if self.snapshot()?.local_work.contains_key(&ticket) => self
+                .update(|state| {
+                    let record = state
+                        .local_work
+                        .get_mut(&ticket)
+                        .context("Unknown local work")?;
+                    ensure!(
+                        config::same_path(project, &record.project),
+                        "Work belongs to another project"
+                    );
+                    record
+                        .tasks
+                        .iter_mut()
+                        .find(|candidate| candidate.id == task)
+                        .context("Unknown task")?
+                        .progress = progress;
+                    crate::workspace::resolve(state, &ticket)
+                })
+                .map(Event::Workspace),
+            Command::Browser(command) => {
+                crate::ticket_browser::execute(&self.config_path, project, command, source)
+                    .await
+                    .map(Event::Browser)
+            }
+            Command::Comment(command) => {
+                crate::ticket_comments::execute(&self.config_path, project, command, source)
+                    .await
+                    .map(Event::Comment)
+            }
             Command::List => match source.list(project).await {
                 Ok(issues) => Ok(Event::Issues(issues)),
                 Err(error) => {
@@ -800,7 +976,7 @@ fn patch(target: &mut toml_edit::Item, before: &toml_edit::Item, incoming: &toml
         }
     }
 }
-fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<()> {
+pub(crate) fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<()> {
     for (id, record) in &state.tickets {
         if id != ticket && !record.issue.state.eq_ignore_ascii_case("closed") {
             ensure!(
@@ -811,6 +987,12 @@ fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<
                 "Worktree already belongs to active ticket {id}"
             );
         }
+    }
+    for (id, record) in &state.local_work {
+        ensure!(
+            id == ticket || !config::same_path(path, &record.worktree.path),
+            "Worktree already belongs to local work {id}"
+        );
     }
     Ok(())
 }
@@ -897,7 +1079,7 @@ async fn verify_claim(worktree: &Path, ticket: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-async fn preparation_lock(project: &Path) -> Result<std::fs::File> {
+pub(crate) async fn preparation_lock(project: &Path) -> Result<std::fs::File> {
     let directory = PathBuf::from(
         git::text(
             project,

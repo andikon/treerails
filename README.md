@@ -15,11 +15,58 @@ Find a project, choose a starting branch, and open your tools in the right works
 
 ![Tree Rail showing four parallel worktrees, colored file status, and an inline Git diff](docs/media/workspace.png)
 
+## One workspace for your work
+
+Each project has three entry points into the same workflow: **Work** (`W`) collects
+local and ticket tasks with attention and recovery first; **Tickets** (`T`) finds
+GitHub issues through saved views; **Worktrees** (`w` from either browser) shows
+physical checkouts. These entry shortcuts also work inside a workspace.
+Tree Rail remembers the last entry point per project; new
+projects start in Tickets. Browsing alone never creates tasks or starts an agent.
+
+Opening a task or worktree reaches a shared workspace: **1 Overview**, **2 Changes**,
+**3 Agent**, **4 Discussion**, **5 Activity**. Stage and commit in Changes, read or
+comment on the linked issue in Discussion, and inspect checkout operations in
+Activity. The branch, checkout and task remain attached as you switch sections.
+
+From an existing worktree, `S` creates a local task with an explicit objective and
+opens agent context review; GitHub is optional. `A` adds another local task.
+Ticket work uses the same hosted sessions and Git actions. Each checkout has one
+managed owner, including while an agent is Ready or needs recovery. External tool
+launches remain separate from managed sessions.
+
+`L` links local work to an already opened GitHub ticket after agents are stopped
+and reconciled. Tasks, conversation identities, objectives and checkout branches
+are retained; conflicting checkout associations are rejected. New ticket-backed
+conversations capture the full fresh discussion, while local conversations capture
+their objective and handoff. Continue resumes the same conversation without
+replaying either document. `Esc` returns to the entry browser.
+
 ## Ticket workflow
 
 Enter a project to browse its existing GitHub issues (requires authenticated `gh`).
-Select an issue to inspect its requirements and persisted local tasks; browsing does
-not launch an agent or create a checkout. Each issue initially has one task. Press
+The ticket column shows **Active** work above the selected saved view, beside a
+Markdown preview of the issue and its chronological comments. Cards show issue
+state and named labels. Previewing creates no local tasks, checkout or agent;
+Enter explicitly opens the selected ticket's task workspace.
+
+Use `f` for guided filters (state, assignees, All/Any/excluded labels, text scope
+and order), `v` to manage named views, `a` to collapse Active, `R` to refresh and
+`o` to open GitHub. Applied filters and the last selected view persist per GitHub
+repository across clones. Matching pages load automatically; incomplete, stale,
+unavailable and search-limited results are identified. Cached views and discussion
+remain readable offline. Active keeps local in-progress tasks and live/recoverable
+agents reachable independently of filters, including closed issues.
+
+In the browser, `c` composes a persistent per-issue comment draft. `Ctrl+s` reviews
+the exact target, posting account and text; only `y` from review posts. Esc keeps
+the draft, and `Ctrl+d` explicitly discards it in the editor. A lost response stays
+**confirmation unknown** across restart: refresh and inspect candidate comments,
+then explicitly verify success or review a retry. Tree Rail never reposts it
+automatically. While editing, letters and paste belong to the editor.
+
+Inside the ticket workspace, inspect requirements and persisted local tasks.
+Each newly opened issue initially has one task. Press
 `i` to inspect and explicitly import checklist items under a Markdown heading named
 `Tasks`; other headings, acceptance criteria, prose and code fences are excluded.
 Importing the same title again keeps its original task identity. Select a task with
@@ -70,7 +117,14 @@ session host.
 
 After preparing the shared worktree, `s` continues the selected task or offers its
 first session. `n` creates a separate conversation after you inspect its starting
-brief and optional handoff. The native Copilot terminal appears inside Tree Rail;
+brief and optional handoff. New conversation review now captures the complete
+accessible discussion into a retained Markdown document; later comments cannot
+change an approved snapshot. Documents live outside worktrees and survive checkout
+cleanup. Complete-document native delivery is verified on Windows with Copilot
+1.0.94 using its offline mode and a local test provider. Other platforms or CLI
+versions remain gated; existing conversations can still Continue. See
+[discussion delivery status](docs/native-discussion-delivery.md).
+The native Copilot terminal appears inside Tree Rail;
 Enter switches to **AGENT INPUT**, and `Ctrl+]` returns to **NAVIGATION**. The two
 modes have different colors and labels. Escape and Ctrl+C reach Copilot while its
 terminal owns input. Override the return shortcut with a key mapped to

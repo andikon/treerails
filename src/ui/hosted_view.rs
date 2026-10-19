@@ -227,8 +227,8 @@ pub fn dialog(frame: &mut Frame, app: &App, area: Rect) {
                 Constraint::Length(2),
             ])
             .split(inner);
-            frame.render_widget(Paragraph::new(from_session.as_ref().map(|owner|format!("Explicit handover from {owner}: verify stop before starting the selected task. A failed stop keeps checkout ownership.")).unwrap_or_else(||"No agent starts until y confirms this brief.".into())).wrap(Wrap{trim:false}),rows[0]);
-            let text = crate::app::hosted_ui::draft_brief(brief, &handoff.value);
+            frame.render_widget(Paragraph::new(if app.hosted.discussion_approval.is_some() {from_session.as_ref().map(|owner|format!("y approves this exact document and hands over from {owner}; failed stop retains ownership.")).unwrap_or_else(||"y approves this exact complete document and starts a new conversation.".into())} else {"Discussion is not approved. y captures fresh full discussion; inspect it before confirming. Editing the handoff requires a fresh review.".into()}).wrap(Wrap{trim:false}),rows[0]);
+            let text = brief.clone();
             frame.render_widget(
                 Paragraph::new(text)
                     .scroll((*scroll, 0))

@@ -18,6 +18,7 @@ pub struct HostedUi {
     pub summary_poll: Instant,
     pub errors: VecDeque<String>,
     pub pending_launch: Option<hosted::Command>,
+    pub discussion_approval: Option<crate::discussion_snapshot::Approval>,
     notifications_enabled: Option<bool>,
     configured_sessions: BTreeSet<String>,
     notification_retry: Instant,
@@ -39,6 +40,7 @@ impl Default for HostedUi {
             summary_poll: Instant::now(),
             errors: VecDeque::new(),
             pending_launch: None,
+            discussion_approval: None,
             notifications_enabled: None,
             configured_sessions: BTreeSet::new(),
             notification_retry: Instant::now(),
@@ -80,6 +82,8 @@ pub async fn request(config: PathBuf, command: HostCommand) -> Result<Response> 
             &command,
             HostCommand::Ticket {
                 command: hosted::Command::Start { .. }
+                    | hosted::Command::CaptureDiscussion { .. }
+                    | hosted::Command::StartDocument { .. }
                     | hosted::Command::StartRequest { .. }
                     | hosted::Command::Continue { .. }
                     | hosted::Command::Handover { .. }
@@ -189,9 +193,9 @@ impl App {
         (rows.min((20_000 / u32::from(cols)) as u16), cols)
     }
     fn focused_record(&self) -> Option<&hosted::SessionRecord> {
-        let ticket = self.ticket.as_ref()?;
+        let ticket = self.current_workspace()?;
         let task = ticket.tasks.get(self.task_cursor)?;
-        hosted::selected_session(&self.state.workflow, &ticket.id(), &task.id)
+        hosted::selected_session(&self.state.workflow, &ticket.id, &task.id)
     }
     pub fn begin_agent(&mut self, new: bool) {
         if self.hosted.pending_launch.is_some() {
@@ -208,16 +212,22 @@ impl App {
             });
             return;
         }
-        let Some(ticket) = self.ticket.as_ref() else {
+        let Some(ticket) = self.current_workspace() else {
             return;
         };
         let Some(task) = ticket.tasks.get(self.task_cursor) else {
             return;
         };
-        match hosted::starting_brief(ticket, &task.id, "") {
+        match crate::workspace::context(&self.state.workflow, &ticket.id, &task.id, "") {
             Ok(brief) => {
+                let capture = hosted::Command::CaptureDiscussion {
+                    ticket: ticket.id.clone(),
+                    task: task.id.clone(),
+                    handoff: String::new(),
+                };
+                self.hosted.discussion_approval = None;
                 self.hosted.dialog = Some(Dialog::Start {
-                    ticket: ticket.id(),
+                    ticket: ticket.id.clone(),
                     task: task.id.clone(),
                     brief,
                     handoff: Field::new("Optional handoff", String::new(), true),
@@ -225,7 +235,8 @@ impl App {
                     scroll: 0,
                     from_session: None,
                     request_id: crate::copilot::new_session_id(),
-                })
+                });
+                self.session_command(capture);
             }
             Err(error) => self.say(format!("{error:#}"), true),
         }
@@ -333,7 +344,11 @@ impl App {
             return true;
         }
         if !self.hosted.input {
-            if key.code == KeyCode::Char('E') && key.modifiers == KeyModifiers::NONE {
+            if key.code == KeyCode::Char('E')
+                && key.modifiers == KeyModifiers::NONE
+                && !(self.workspace_open
+                    && self.workspace_tab == super::workspace_ui::WorkspaceTab::Activity)
+            {
                 self.hosted_diagnostics();
                 return true;
             }
@@ -386,6 +401,7 @@ impl App {
         }) = &mut self.hosted.dialog
         {
             if *editing {
+                self.hosted.discussion_approval = None;
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if handoff.value.len() + text.len() <= 48 * 1024 {
                     handoff.value.insert_str(handoff.cursor, &text);
@@ -570,18 +586,21 @@ impl App {
                         .workflow
                         .sessions
                         .insert(record.id.clone(), record.clone());
-                    if self.hosted.pending_launch.as_ref().is_some_and(|command| matches!(command,hosted::Command::StartRequest {request_id,..} if request_id==&record.id)) { self.hosted.pending_launch=None; }
-                    self.hosted.record = Some(record.clone());
-                    self.hosted.input = false;
-                    self.hosted.terminal = None;
-                    self.hosted.token = None;
-                    self.hosted.queue.retain(|command| {
-                        !matches!(
-                            command,
-                            HostCommand::Input { .. } | HostCommand::Resize { .. }
-                        )
-                    });
-                    self.attach_agent(false);
+                    if self.hosted.pending_launch.as_ref().is_some_and(|command| matches!(command,hosted::Command::StartRequest {request_id,..}|hosted::Command::StartDocument {request_id,..} if request_id==&record.id)) { self.hosted.pending_launch=None; }
+                    let selected = self.workspace_session_matches(&record);
+                    if selected {
+                        self.hosted.record = Some(record.clone());
+                        self.hosted.input = false;
+                        self.hosted.terminal = None;
+                        self.hosted.token = None;
+                        self.hosted.queue.retain(|command| {
+                            !matches!(
+                                command,
+                                HostCommand::Input { .. } | HostCommand::Resize { .. }
+                            )
+                        });
+                        self.attach_agent(false);
+                    }
                     if let Some(id) = record.host_session {
                         self.queue_host(HostCommand::ConfigureSession {
                             session: id,
@@ -589,7 +608,11 @@ impl App {
                             desktop_notifications: self.config.desktop_notifications,
                         });
                     }
-                    self.say("Conversation attached · Enter agent input · Ctrl+] navigation · x stop · d detach",false);
+                    if selected {
+                        self.say("Conversation attached · Enter agent input · Ctrl+] navigation · x stop · d detach",false);
+                    } else {
+                        self.say("Conversation started in background · W Work", false);
+                    }
                 }
                 hosted::Event::Stopped(record) => {
                     self.state
@@ -615,6 +638,48 @@ impl App {
                     false,
                 ),
                 hosted::Event::Workflow(_) => {}
+                hosted::Event::DiscussionCaptured(approval) => {
+                    if let Some(Dialog::Start {
+                        ticket,
+                        task,
+                        handoff,
+                        brief,
+                        scroll,
+                        ..
+                    }) = &mut self.hosted.dialog
+                    {
+                        let matching = crate::workspace::context(
+                            &self.state.workflow,
+                            ticket,
+                            task,
+                            &handoff.value,
+                        )
+                        .is_ok_and(|context| context == approval.context);
+                        if matching {
+                            match approval
+                                .snapshot
+                                .validate(&self.config_path)
+                                .and_then(|()| {
+                                    std::fs::read_to_string(&approval.snapshot.path)
+                                        .map_err(Into::into)
+                                }) {
+                                Ok(document) => {
+                                    *brief = format!(
+                                        "{} comments · {} bytes\nRetained document: {}\nSHA-256: {}\n\n{}",
+                                        approval.snapshot.comments,
+                                        approval.snapshot.bytes,
+                                        approval.snapshot.path.display(),
+                                        approval.snapshot.sha256,
+                                        document
+                                    );
+                                    *scroll = 0;
+                                    self.hosted.discussion_approval = Some(approval);
+                                }
+                                Err(error) => self.record_hosted_error(format!("{error:#}")),
+                            }
+                        }
+                    }
+                }
             },
             Response::Terminal(snapshot) => {
                 if self
@@ -670,6 +735,7 @@ impl App {
             return;
         };
         if editing {
+            self.hosted.discussion_approval = None;
             match key.code {
                 KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab => editing = false,
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -697,7 +763,19 @@ impl App {
             }
         } else {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => return,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.hosted.discussion_approval = None;
+                    self.hosted.queue.retain(|command| {
+                        !matches!(
+                            command,
+                            HostCommand::Ticket {
+                                command: hosted::Command::CaptureDiscussion { .. },
+                                ..
+                            }
+                        )
+                    });
+                    return;
+                }
                 KeyCode::Tab | KeyCode::BackTab => editing = true,
                 KeyCode::Char('j') | KeyCode::Down => scroll = scroll.saturating_add(1),
                 KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
@@ -706,32 +784,27 @@ impl App {
                 KeyCode::Home => scroll = 0,
                 KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
                     let (rows, cols) = self.hosted_dimensions();
-                    let command = if let Some(from_session) = from_session {
-                        hosted::Command::Handover {
-                            from_session,
-                            ticket,
-                            task,
-                            expected_brief: Some(draft_brief(&brief, &handoff.value)),
-                            handoff: handoff.value,
-                            rows,
-                            cols,
-                        }
-                    } else {
-                        hosted::Command::StartRequest {
+                    if let Some(approval) = self.hosted.discussion_approval.take() {
+                        let command = hosted::Command::StartDocument {
                             request_id,
                             ticket,
                             task,
-                            expected_brief: Some(draft_brief(&brief, &handoff.value)),
                             handoff: handoff.value,
                             rows,
                             cols,
-                        }
-                    };
-                    if matches!(&command, hosted::Command::StartRequest { .. }) {
+                            approval,
+                            from_session,
+                        };
                         self.hosted.pending_launch = Some(command.clone());
+                        self.session_command(command);
+                        return;
                     }
-                    self.session_command(command);
-                    return;
+                    self.session_command(hosted::Command::CaptureDiscussion {
+                        ticket: ticket.clone(),
+                        task: task.clone(),
+                        handoff: handoff.value.clone(),
+                    });
+                    self.say("Fetching complete fresh discussion; inspect the resulting document before confirming",false);
                 }
                 _ => {}
             }
@@ -748,7 +821,7 @@ impl App {
         });
     }
     pub fn begin_handover(&mut self) {
-        let Some(ticket) = self.ticket.as_ref() else {
+        let Some(ticket) = self.current_workspace() else {
             return;
         };
         let Some(checkout) = &ticket.worktree else {
@@ -791,7 +864,9 @@ impl App {
         }
     }
     pub fn show_sessions(&mut self) {
-        let Some(ticket) = &self.ticket else { return };
+        let Some(ticket) = self.current_workspace() else {
+            return;
+        };
         let Some(task) = ticket.tasks.get(self.task_cursor) else {
             return;
         };
@@ -800,7 +875,7 @@ impl App {
             .workflow
             .sessions
             .values()
-            .filter(|record| record.ticket == ticket.id() && record.task == task.id)
+            .filter(|record| record.ticket == ticket.id && record.task == task.id)
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));

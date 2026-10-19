@@ -40,6 +40,8 @@ pub enum HostCommand {
         provider_session_id: String,
         resume: bool,
         brief: Option<String>,
+        #[serde(default)]
+        document: Option<crate::discussion_snapshot::Snapshot>,
         rows: u16,
         cols: u16,
     },
@@ -288,6 +290,7 @@ struct Provider {
 struct LaunchContext {
     local_id: String,
     provider: Provider,
+    document: Option<crate::discussion_snapshot::Snapshot>,
 }
 struct Session {
     provider: Option<Provider>,
@@ -390,9 +393,25 @@ impl Host {
                 provider_session_id,
                 resume,
                 brief,
+                document,
                 rows,
                 cols,
             } => {
+                ensure!(
+                    !(resume && document.is_some()),
+                    "Resume cannot replay a discussion document"
+                );
+                if let Some(document) = &document {
+                    crate::copilot::verify_document_provider().await?;
+                    let contents = std::fs::read(&document.path)
+                        .context("Approved discussion document is missing")?;
+                    ensure!(
+                        document.complete
+                            && contents.len() as u64 == document.bytes
+                            && crate::discussion_snapshot::digest(&contents) == document.sha256,
+                        "Approved discussion document changed; capture and review again"
+                    );
+                }
                 if let Some((session, process_id)) = self.starts.get(&request_id) {
                     ensure!(
                         self.fingerprints.get(&request_id) == fingerprint.as_ref(),
@@ -433,12 +452,17 @@ impl Host {
                     } else {
                         crate::copilot::LaunchMode::New
                     },
-                    brief.as_deref(),
+                    if document.is_some() {
+                        None
+                    } else {
+                        brief.as_deref()
+                    },
                 )?;
                 crate::copilot::install_observer(&home)?;
                 let local_id = format!("session-{}", uuid::Uuid::new_v4());
                 self.launch_context = Some(LaunchContext {
                     local_id,
+                    document,
                     provider: Provider {
                         checkout: std::fs::canonicalize(&checkout)
                             .context("Resolve Copilot checkout")?,
@@ -640,6 +664,11 @@ impl Host {
                     builder.env("TREERAIL_HOST_SESSION", &context.local_id);
                     builder.env("TREERAIL_HOST_TOKEN", &context.provider.token);
                     builder.env("TREERAIL_COPILOT_SESSION", &context.provider.session_id);
+                    if let Some(document) = &context.document {
+                        builder.env("TREERAIL_DISCUSSION_PATH", &document.path);
+                        builder.env("TREERAIL_DISCUSSION_SHA256", &document.sha256);
+                        builder.env("TREERAIL_DISCUSSION_BYTES", document.bytes.to_string());
+                    }
                 }
                 let mut child = pair.slave.spawn_command(builder)?;
                 let group = match super::execution::ExecutionGroup::assign(

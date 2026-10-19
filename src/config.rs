@@ -219,6 +219,7 @@ impl Config {
             config.default_profile
         );
         config.state.original_bases = config.state.bases.clone();
+        config.state.original_workspace_views = config.state.workspace_views.clone();
         Ok(config)
     }
     pub fn project(&self, path: &Path) -> Option<&ProjectConfig> {
@@ -266,12 +267,17 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    pub browser: crate::ticket_browser::BrowserState,
+    pub comment_drafts: BTreeMap<String, crate::ticket_comments::Draft>,
     pub workflow: crate::workflow::WorkflowState,
     pub bases: BTreeMap<String, String>,
+    pub workspace_views: BTreeMap<String, String>,
     pub last_project: Option<PathBuf>,
     pub last_worktree: Option<PathBuf>,
     #[serde(skip)]
     original_bases: BTreeMap<String, String>,
+    #[serde(skip)]
+    original_workspace_views: BTreeMap<String, String>,
 }
 impl State {
     pub fn load(path: &Path) -> Result<Self> {
@@ -282,20 +288,30 @@ impl State {
             if doc.get("state").is_none() {
                 doc["state"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
-            if doc["state"].get("bases").is_none() {
-                doc["state"]["bases"] = toml_edit::Item::Table(toml_edit::Table::new());
-            }
-            for key in self.bases.keys().chain(self.original_bases.keys()) {
-                if self.bases.get(key) != self.original_bases.get(key) {
-                    if let Some(value) = self.bases.get(key) {
+            for (name, current, previous) in [
+                ("bases", &self.bases, &self.original_bases),
+                (
+                    "workspace_views",
+                    &self.workspace_views,
+                    &self.original_workspace_views,
+                ),
+            ] {
+                if doc["state"].get(name).is_none() {
+                    doc["state"][name] = toml_edit::table();
+                }
+                for key in current.keys().chain(previous.keys()) {
+                    if current.get(key) == previous.get(key) {
+                        continue;
+                    }
+                    if let Some(value) = current.get(key) {
                         replace_value(
-                            &mut doc["state"]["bases"][key],
+                            &mut doc["state"][name][key],
                             toml_edit::Value::from(value.as_str()),
                         );
                     } else {
-                        doc["state"]["bases"]
+                        doc["state"][name]
                             .as_table_like_mut()
-                            .context("Invalid state.bases table")?
+                            .context("Invalid remembered-state table")?
                             .remove(key);
                     }
                 }
@@ -319,6 +335,7 @@ impl State {
             Ok(())
         })?;
         self.original_bases = self.bases.clone();
+        self.original_workspace_views = self.workspace_views.clone();
         Ok(())
     }
 }

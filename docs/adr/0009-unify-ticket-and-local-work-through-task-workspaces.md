@@ -1,0 +1,5 @@
+# Unify ticket and local work through task workspaces
+
+Work, Tickets and Worktrees feed one workspace with common task, Git and hosted-agent actions. Tasks can be local or linked to a GitHub issue; opening a checkout for ordinary Git work creates no task or agent, while starting an agent explicitly selects or creates a task and reviews its context. This supersedes ADR 0003's requirement that every task belongs to an issue and extends ADR 0005's hosted-agent scope beyond ticket navigation, because separate workflow capabilities made the same checkout feel like different tools depending on its entry view.
+
+A ticket remains a real GitHub issue. Its tasks continue to share one checkout under ADR 0004, with the same physical ownership protections applying to local work. Linking local work to a ticket is explicit, preserves task and conversation identity, and rejects conflicting checkouts or unresolved execution rather than resetting branches or rewriting approved context. ADRs 0006–0008 continue to govern the persistent host, no-replay behavior and retained context; local starts capture their objective instead of requiring a fabricated issue or GitHub connectivity.

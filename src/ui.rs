@@ -7,8 +7,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
+mod browser_view;
+mod comment_view;
 mod hosted_view;
 mod legend;
+mod workspace_view;
 
 fn color(value: &str, fallback: Color) -> Color {
     value.parse().unwrap_or(fallback)
@@ -46,6 +49,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(location, Style::default().fg(Color::White)),
+            Span::styled(app.project.as_ref().map(|project| { let rows=crate::work::rows_with_attention(&app.state.workflow,&project.path,&app.hosted.summaries); let active=rows.iter().filter(|row|row.active).count(); let attention=rows.iter().filter(|row|row.rank==0).count(); format!("  W Work {active} active / {attention} attention  T Tickets  w Worktrees") }).unwrap_or_default(),Style::default().fg(Color::Cyan)),
             Span::styled(
                 if app.busy { "   RUNNING" } else { "" },
                 Style::default().fg(Color::Yellow),
@@ -103,6 +107,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         settings_view(frame, app, rows[1]);
     } else if app.project.is_none() {
         projects(frame, app, rows[1]);
+    } else if app.workspace_open {
+        workspace_view::draw(frame, app, rows[1]);
+    } else if app.work_mode {
+        workspace_view::work(frame, app, rows[1]);
     } else if app.ticket_mode {
         tickets(frame, app, rows[1]);
     } else {
@@ -135,6 +143,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(footer_color)),
         rows[3],
     );
+    if app.comment_editor.is_some() {
+        comment_view::draw(frame, app);
+    }
     if let Some(modal) = &app.modal {
         let history =
             matches!(modal, Modal::Picker(picker) if matches!(picker.kind, PickerKind::Operations));
@@ -350,7 +361,11 @@ fn projects(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 fn workspace(frame: &mut Frame, app: &App, area: Rect) {
-    let panes = if area.width >= 110 {
+    let panes = if app.workspace_open {
+        let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area);
+        vec![Rect::default(), columns[0], columns[1]]
+    } else if area.width >= 110 {
         Layout::horizontal([
             Constraint::Percentage(29),
             Constraint::Percentage(28),
@@ -361,7 +376,7 @@ fn workspace(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         vec![area; 3]
     };
-    if area.width >= 110 || app.focus == 0 {
+    if !app.workspace_open && (area.width >= 110 || app.focus == 0) {
         let items: Vec<ListItem> = app
             .visible_trees()
             .iter()
@@ -425,7 +440,7 @@ fn workspace(frame: &mut Frame, app: &App, area: Rect) {
             &mut state,
         );
     }
-    if area.width >= 110 || app.focus == 1 {
+    if app.workspace_open || area.width >= 110 || app.focus == 1 {
         let items: Vec<ListItem> = app
             .visible_files()
             .iter()
@@ -469,7 +484,7 @@ fn workspace(frame: &mut Frame, app: &App, area: Rect) {
             &mut state,
         );
     }
-    if area.width >= 110 || app.focus == 2 {
+    if app.workspace_open || area.width >= 110 || app.focus == 2 {
         let lines: Vec<Line> = app
             .diff
             .lines()
@@ -712,6 +727,10 @@ fn tickets(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         area
     };
+    if app.ticket.is_none() {
+        browser_view::draw(frame, app, area);
+        return;
+    }
     if let Some(ticket) = &app.ticket {
         let rows = Layout::vertical([
             Constraint::Length(6),
