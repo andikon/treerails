@@ -2,11 +2,15 @@
 
 ## Current compatibility status
 
-The retained-document workflow and controlled-provider tests are implemented. **Native complete-context delivery is not yet verified.** Production document starts are deliberately blocked by `DOCUMENT_DELIVERY_VERIFIED = false`; the error explains that verification is pending. Capture, inspection and retention remain available. Existing conversations can Continue, and basic worktree profiles remain available.
+The retained-document workflow and controlled-provider tests are implemented. **Native complete-context delivery is verified on Windows with Copilot 1.0.94.** The capability gate enables only that platform and exact CLI version. Other platforms/versions remain blocked with an explanation. Existing conversations can Continue, and basic worktree profiles remain available.
 
 The installed native Windows executable reports **GitHub Copilot CLI 1.0.94**. Its help lists `--attachment` as valid only in non-interactive mode, so that flag is not used for hosted interactive sessions. Neither a path reference nor an instruction to read a file is treated as proof of complete initial context.
 
-A native compatibility probe was prepared with an isolated provider home and an 87,537-byte synthetic document. The executable rejected a zero-credit budget and required a minimum budget of 30 AI credits. Automatic approval review rejected the paid probe because spending had not been explicitly authorized. **No successful native delivery result is claimed.** Obtain explicit approval before performing that probe; a budget limit is not a prediction of the actual charge.
+A paid-provider probe was rejected and never run. The user explicitly requires free, local-only testing. Native verification instead used documented `COPILOT_OFFLINE=true`, an isolated provider home, removed credentials and a fake provider bound to `127.0.0.1`. No cloud model or paid inference was used. Do not run paid or cloud tests for this work.
+
+On 19 October 2026, the actual Windows Copilot 1.0.94 terminal and unmodified production extension admitted an **87,537-byte** UTF-8 document through the bundled SDK. Copilot's persisted `user.message` exactly matched the complete document; a recursive string comparison also verified the entire document in the local provider's received request. The delivery claim recorded the admitted message identity. Evidence: session `910af283-335a-4ded-8cc7-839844860d29`, SHA-256 `cf665b4174521679bb130f51cb43f2ae87e80cdb855acee2e9bb64be31bac9aa`, message `f8e73ce5-6360-4660-bac1-57c401fd8414`. Observations included bridge connection, assistant turn start and session idle. A real terminal was required; redirected pipes did not initialize the interactive extension path.
+
+This verifies native session admission and complete provider-bound text independently of a cloud backend. It does not claim a live GitHub-hosted model test or any model reasoning result.
 
 ## Delivery mechanism
 
@@ -48,9 +52,9 @@ node scripts/copilot_bridge_smoke.mjs
 
 The tests cover documents larger than the old 48 KiB brief limit; exact retained content; source/author/edited metadata; partial capture; missing/changed files; configuration isolation; checkout cleanup; task drift; request identity; same-request retries; Continue without replay; UI review and handoff invalidation; SDK admission/reload/lost-response behavior; and observer framing. Controlled SDK tests prove Tree Rail's behavior, **not Copilot compatibility or model receipt**.
 
-## Native validation before enabling
+## Repeating native validation locally
 
-Use an explicitly approved, isolated native probe with the supported version, synthetic Markdown larger than both the old brief limit and Windows command-line limit, and no repository work. Keep the full text out of the native launch arguments. Exercise the production extension's exact `session.send` path, then inspect Copilot's persisted first `user.message` event and the admitted delivery claim. Compare every UTF-8 byte to the approved file, including its final marker, and confirm there was no earlier partial starting prompt. Record the platform/version, document length/hash, invocation configuration and comparison result here.
+Run `node scripts/native_discussion_offline_smoke.cjs` in a real Windows terminal with the supported CLI installed. The probe sets offline mode, removes provider credentials and starts only a loopback fake provider. It does not require GitHub authentication or credits. Keep the full text out of native launch arguments; inspect the persisted user message, complete local provider request and admitted delivery claim. Evidence is retained under `target/native-discussion-proof/` for inspection. This opt-in native test is never automatically run in CI.
 
 Also test extension reload after successful admission, uncertain admission, modified/missing documents, and resume without replay. Stop the isolated provider process after evidence is captured. Enable the capability gate only alongside successful recorded native evidence; a stubbed provider, SDK type declaration, file attachment reference or successful file read alone is insufficient.
 

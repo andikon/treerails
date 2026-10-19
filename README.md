@@ -93,9 +93,10 @@ first session. `n` creates a separate conversation after you inspect its startin
 brief and optional handoff. New conversation review now captures the complete
 accessible discussion into a retained Markdown document; later comments cannot
 change an approved snapshot. Documents live outside worktrees and survive checkout
-cleanup. Complete-document native delivery is currently gated pending compatibility
-verification; new starts explain this limitation, while existing conversations can
-still Continue. See [discussion delivery status](docs/native-discussion-delivery.md).
+cleanup. Complete-document native delivery is verified on Windows with Copilot
+1.0.94 using its offline mode and a local test provider. Other platforms or CLI
+versions remain gated; existing conversations can still Continue. See
+[discussion delivery status](docs/native-discussion-delivery.md).
 The native Copilot terminal appears inside Tree Rail;
 Enter switches to **AGENT INPUT**, and `Ctrl+]` returns to **NAVIGATION**. The two
 modes have different colors and labels. Escape and Ctrl+C reach Copilot while its

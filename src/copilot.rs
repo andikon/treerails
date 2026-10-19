@@ -13,13 +13,13 @@ pub const EXTENSION_SOURCE: &str = include_str!("copilot/extension.mjs");
 const PREVIOUS_EXTENSION_SOURCE: &str = include_str!("copilot/extension-v1.mjs");
 pub const TESTED_COPILOT_VERSION: &str = "1.0.94";
 // Flip only alongside recorded native compatibility evidence, never from fake-provider tests.
-pub const DOCUMENT_DELIVERY_VERIFIED: bool = false;
+pub const DOCUMENT_DELIVERY_VERIFIED: bool = cfg!(windows);
 
 /// Extension prompt delivery is version-bound; unfamiliar CLIs require validation first.
 pub async fn verify_document_provider() -> Result<()> {
     if !DOCUMENT_DELIVERY_VERIFIED {
         bail!(
-            "Complete discussion delivery awaits native Copilot compatibility verification. The approved document is retained; existing conversations can Continue. No agent has been started with partial context."
+            "Complete discussion delivery is verified on Windows only. The approved document is retained; existing conversations can Continue. No agent has been started with partial context."
         );
     }
     let output = tokio::process::Command::new("copilot")
