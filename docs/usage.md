@@ -39,6 +39,27 @@ Parent directories are scanned one level deep by default. Folders containing `.w
 
 ## Everyday workflow
 
+Projects remember their last entry view. New projects start in **Tickets**;
+`W` opens **Work**, collecting local and ticket tasks with attention/recovery first,
+and `T` opens **Tickets**. From either browser, `w` opens **Worktrees**.
+Opening an existing worktree is passive: it creates no task or hosted session.
+
+All three entry points feed the same task workspace. Switch sections with
+`1` Overview, `2` Changes, `3` Agent, `4` Discussion and `5` Activity.
+Changes keeps Git staging/commit/push controls; `S` opens agent review from any
+section. A bare checkout first asks for a local task objective. GitHub is optional
+for local work; ticket-backed work captures its full discussion before launch.
+`s` continues/starts and `n` reviews a new conversation from Overview or Agent.
+`A` adds a local task, and `p` changes the selected task's progress manually.
+Agent attention, task progress and GitHub issue state remain independent.
+
+After stopping and reconciling agents, `L` can link local work to a GitHub issue
+already opened through Tickets. This preserves tasks, conversations, branch and
+retained context. Conflicting checkout associations prevent linking. Continue
+always resumes the original conversation without replaying its starting context.
+`Esc` returns to the entry view; the discussion browser's previous selection and
+reading position are restored. The project header keeps attention counts visible.
+
 Opening a project now shows its GitHub tickets. The direct worktree steps below
 remain available with `w`; `T` returns to tickets. Existing local Git operations
 and launch profiles remain usable without GitHub or hosted Copilot.

@@ -178,7 +178,7 @@ impl App {
         }
         numbers
     }
-    fn preview_selected(&mut self) {
+    pub(super) fn preview_selected(&mut self) {
         let Some(number) = self.browser.selected else {
             return;
         };

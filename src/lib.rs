@@ -15,4 +15,6 @@ pub mod startup;
 pub mod ticket_browser;
 pub mod ticket_comments;
 pub mod ui;
+pub mod work;
 pub mod workflow;
+pub mod workspace;

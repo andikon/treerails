@@ -560,6 +560,13 @@ pub async fn remove_worktree(project: &Path, path: &Path) -> Result<()> {
     let lease = crate::host::CheckoutLease::acquire(path).await?;
     remove_worktree_leased(project, path, &lease).await
 }
+/// Updating checked-out files must exclude managed execution in any client or
+/// configuration context, including an agent waiting for more input.
+pub async fn pull(path: &Path) -> Result<()> {
+    let _lease = crate::host::CheckoutLease::acquire(path).await?;
+    run(path, ["pull", "--progress", "--ff-only"]).await?;
+    Ok(())
+}
 /// The caller retains physical execution exclusion until removal completes.
 pub(crate) async fn remove_worktree_leased(
     project: &Path,

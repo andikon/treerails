@@ -287,15 +287,13 @@ fn choose(state: &mut workflow::WorkflowState, session: &str) -> Result<SessionR
     {
         record.current = record.id == session;
     }
-    state
-        .tickets
-        .get_mut(&chosen.ticket)
-        .context("Recorded ticket is missing")?
-        .selected_task = Some(chosen.task.clone());
+    crate::workspace::select(state, &chosen.ticket, &chosen.task)?;
     Ok(state.sessions.get(session).unwrap().clone())
 }
 /// Validate the physical checkout rather than trusting its remembered path/label.
-async fn verify_ticket_checkout(ticket: &TicketRecord) -> Result<workflow::Checkout> {
+async fn verify_workspace_checkout(
+    ticket: &crate::workspace::Workspace,
+) -> Result<workflow::Checkout> {
     let checkout = ticket
         .worktree
         .as_ref()
@@ -345,21 +343,18 @@ async fn verify_ticket_checkout(ticket: &TicketRecord) -> Result<workflow::Check
     let mut owner = String::new();
     file.take(4097).read_to_string(&mut owner)?;
     ensure!(
-        owner == ticket.id(),
+        owner == ticket.id,
         "Physical checkout association belongs to another ticket; reconcile it before starting"
     );
     Ok(checkout.clone())
 }
 async fn verify_checkout(state: &workflow::WorkflowState, record: &SessionRecord) -> Result<()> {
-    let ticket = state
-        .tickets
-        .get(&record.ticket)
-        .context("Recorded ticket is missing")?;
+    let ticket = crate::workspace::resolve(state, &record.ticket)?;
     ensure!(
         ticket.tasks.iter().any(|task| task.id == record.task),
         "Recorded task is missing; reconcile it first"
     );
-    let checkout = verify_ticket_checkout(ticket).await?;
+    let checkout = verify_workspace_checkout(&ticket).await?;
     ensure!(
         record
             .checkout
@@ -426,31 +421,29 @@ async fn execute_with_approval(
             handoff,
         } => {
             let state = workflow.snapshot()?;
-            let target = state.tickets.get(&ticket).context("Unknown ticket")?;
-            verify_ticket_checkout(target).await?;
-            let context = discussion_context(target, &task, &handoff)?;
-            let discussion = crate::ticket_browser::complete_discussion(
-                &target.project,
-                &workflow::Github,
-                target.issue.number,
-            )
-            .await?;
+            let target = crate::workspace::resolve(&state, &ticket)?;
+            verify_workspace_checkout(&target).await?;
+            let context = crate::workspace::context(&state, &ticket, &task, &handoff)?;
+            let approval = if let Some(issue) = &target.issue {
+                let discussion = crate::ticket_browser::complete_discussion(
+                    &target.project,
+                    &workflow::Github,
+                    issue.number,
+                )
+                .await?;
+                ensure!(
+                    discussion.card.issue.number == issue.number
+                        && discussion.card.issue.url == issue.url,
+                    "Repository or source issue changed during capture"
+                );
+                crate::discussion_snapshot::retain(&config_path, &discussion, context)?
+            } else {
+                crate::discussion_snapshot::retain_local(&config_path, context)?
+            };
             ensure!(
-                discussion.card.issue.number == target.issue.number
-                    && discussion.card.issue.url == target.issue.url,
-                "Repository or source issue changed during capture; reopen and review the correct ticket"
-            );
-            let approval = crate::discussion_snapshot::retain(&config_path, &discussion, context)?;
-            ensure!(
-                workflow
-                    .snapshot()?
-                    .tickets
-                    .get(&ticket)
-                    .map(|target| discussion_context(target, &task, &handoff))
-                    .transpose()?
-                    .as_ref()
-                    == Some(&approval.context),
-                "Task or checkout changed during discussion capture; capture and review again"
+                crate::workspace::context(&workflow.snapshot()?, &ticket, &task, &handoff)?
+                    == approval.context,
+                "Task or checkout changed during capture; capture and review again"
             );
             Ok(Event::DiscussionCaptured(approval))
         }
@@ -475,14 +468,20 @@ async fn execute_with_approval(
             approval.validate(&config_path)?;
             let state = workflow.snapshot()?;
             if !state.sessions.contains_key(&request_id) {
-                let target = state.tickets.get(&ticket).context("Unknown ticket")?;
+                let target = crate::workspace::resolve(&state, &ticket)?;
                 ensure!(
-                    approval.snapshot.issue_url == target.issue.url,
+                    approval.snapshot.issue_url
+                        == target
+                            .issue
+                            .as_ref()
+                            .map(|issue| issue.url.as_str())
+                            .unwrap_or_default(),
                     "Approved discussion belongs to another ticket; capture and review this ticket"
                 );
-                verify_ticket_checkout(target).await?;
+                verify_workspace_checkout(&target).await?;
                 ensure!(
-                    discussion_context(target, &task, &handoff)? == approval.context,
+                    crate::workspace::context(&state, &ticket, &task, &handoff)?
+                        == approval.context,
                     "Task, issue or checkout changed after discussion review; capture and review again"
                 );
                 // Approval survives a failed provider preflight without creating a conversation/owner.
@@ -607,19 +606,19 @@ async fn execute_with_approval(
                 return reconcile(runtime, &workflow, &record.id).await;
             }
             let before = workflow.snapshot()?;
-            let ticket_before = before.tickets.get(&ticket).context("Unknown ticket")?;
-            let verified_checkout = verify_ticket_checkout(ticket_before).await?;
+            let ticket_before = crate::workspace::resolve(&before, &ticket)?;
+            let verified_checkout = verify_workspace_checkout(&ticket_before).await?;
             let verified_project = ticket_before.project.clone();
             let host_instance = instance(runtime).await?;
             let execution_group = runtime.execution_identity(&host_instance, &request_id)?;
             let record = workflow.update(|state| {
-                let ticket_record = state.tickets.get(&ticket).context("Unknown ticket")?;
+                let ticket_record = crate::workspace::resolve(state, &ticket)?;
                 ensure!(ticket_record.worktree.as_ref()==Some(&verified_checkout) && ticket_record.project==verified_project,"Ticket checkout association changed during verification; review it before starting");
                 let brief = if let Some(approval) = &approved_document {
                     approval.validate(&config_path)?;
-                    ensure!(discussion_context(ticket_record,&task,&handoff)? == approval.context,"Task or checkout changed after discussion review");
+                    ensure!(crate::workspace::context(state,&ticket,&task,&handoff)? == approval.context,"Task or checkout changed after discussion review");
                     approval.short_prompt.clone()
-                } else { starting_brief(ticket_record, &task, &handoff)? };
+                } else if let Some(record) = state.tickets.get(&ticket) { starting_brief(record, &task, &handoff)? } else { crate::workspace::context(state, &ticket, &task, &handoff)? };
                 if let Some(expected) = &expected_brief { ensure!(expected == &brief, "Issue, task or workspace changed after brief review; inspect it again before starting"); }
                 ensure!(brief.len() <= 48 * 1024, "Starting brief exceeds the hosted limit; refine the ticket before starting");
                 let checkout = ticket_record.worktree.as_ref().unwrap();
@@ -832,9 +831,13 @@ async fn execute_with_approval(
                 previous.ticket == ticket,
                 "Handover must remain inside this ticket"
             );
-            let target = state.tickets.get(&ticket).context("Unknown ticket")?;
-            verify_ticket_checkout(target).await?;
-            let brief = starting_brief(target, &task, &handoff)?;
+            let target = crate::workspace::resolve(&state, &ticket)?;
+            verify_workspace_checkout(&target).await?;
+            let brief = if let Some(record) = state.tickets.get(&ticket) {
+                starting_brief(record, &task, &handoff)?
+            } else {
+                crate::workspace::context(&state, &ticket, &task, &handoff)?
+            };
             if let Some(expected) = &expected_brief {
                 ensure!(
                     expected == &brief,
@@ -1507,6 +1510,151 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn local_tasks_use_frozen_documents_and_link_without_losing_conversations() {
+        let mut f = Fixture::new().await;
+        let workflow = workflow::Workflow::new(&f.path);
+        let original = f.state().tickets["owner/repo#1"].clone();
+        let checkout = original.worktree.as_ref().unwrap().path.clone();
+        std::fs::remove_file(workflow::claim_path(&checkout).await.unwrap()).unwrap();
+        workflow
+            .update(|state| {
+                state.tickets.clear();
+                Ok(())
+            })
+            .unwrap();
+        let first = match workflow
+            .execute(
+                &checkout,
+                workflow::Command::CreateLocal {
+                    path: checkout.clone(),
+                    objective: "Investigate failure\nKeep the full objective and second line."
+                        .into(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            workflow::Event::Workspace(work) => work,
+            _ => panic!(),
+        };
+        let first_task = first.selected_task.clone().unwrap();
+        let second = match workflow
+            .execute(
+                &checkout,
+                workflow::Command::CreateLocal {
+                    path: checkout.clone(),
+                    objective: "Review investigation".into(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            workflow::Event::Workspace(work) => work,
+            _ => panic!(),
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.tasks.len(), 2);
+        assert!(second.issue.is_none());
+        let approval = match f
+            .command(Command::CaptureDiscussion {
+                ticket: first.id.clone(),
+                task: first_task.clone(),
+                handoff: "Local handoff".into(),
+            })
+            .await
+            .unwrap()
+        {
+            Event::DiscussionCaptured(approval) => approval,
+            _ => panic!(),
+        };
+        assert!(
+            std::fs::read_to_string(&approval.snapshot.path)
+                .unwrap()
+                .contains("Keep the full objective and second line.")
+        );
+        assert!(approval.snapshot.issue_url.is_empty());
+        let started = match f
+            .command(Command::StartDocument {
+                request_id: crate::copilot::new_session_id(),
+                ticket: first.id.clone(),
+                task: first_task.clone(),
+                handoff: "Local handoff".into(),
+                rows: 30,
+                cols: 100,
+                approval: approval.clone(),
+                from_session: None,
+            })
+            .await
+            .unwrap()
+        {
+            Event::Started(record) => record,
+            _ => panic!(),
+        };
+        assert_eq!(started.discussion_snapshot, Some(approval.clone()));
+        workflow
+            .update(|state| {
+                let mut ticket = original.clone();
+                ticket.worktree = None;
+                state.tickets.insert(ticket.id(), ticket);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            workflow
+                .execute(
+                    &checkout,
+                    workflow::Command::LinkLocal {
+                        local: first.id.clone(),
+                        ticket: original.id()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        f.command(Command::Stop {
+            session: started.id.clone(),
+        })
+        .await
+        .unwrap();
+        workflow
+            .execute(
+                &checkout,
+                workflow::Command::LinkLocal {
+                    local: first.id.clone(),
+                    ticket: original.id(),
+                },
+            )
+            .await
+            .unwrap();
+        let state = f.state();
+        assert!(!state.local_work.contains_key(&first.id));
+        assert!(
+            state.tickets[&original.id()]
+                .tasks
+                .iter()
+                .any(|task| task.id == first_task)
+        );
+        assert_eq!(state.sessions[&started.id].ticket, original.id());
+        assert_eq!(
+            state.sessions[&started.id].discussion_snapshot,
+            Some(approval)
+        );
+        assert!(
+            crate::workspace::context(&state, &original.id(), &first_task, "")
+                .unwrap()
+                .contains("Keep the full objective and second line.")
+        );
+        f.command(Command::Continue {
+            session: started.id.clone(),
+            rows: 30,
+            cols: 100,
+        })
+        .await
+        .unwrap();
+        assert!(f.runtime.launches.last().unwrap().1);
+    }
+
     #[tokio::test]
     async fn implementation_handover_review_and_exact_resume_preserve_conversations() {
         let mut f = Fixture::new().await;

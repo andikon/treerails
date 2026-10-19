@@ -15,6 +15,8 @@ use std::{
 #[serde(default)]
 pub struct WorkflowState {
     pub tickets: BTreeMap<String, TicketRecord>,
+    pub local_work: BTreeMap<String, crate::workspace::LocalWorkRecord>,
+    pub task_objectives: BTreeMap<String, String>,
     pub sessions: BTreeMap<String, crate::hosted::SessionRecord>,
     pub approved_discussions: BTreeMap<String, crate::discussion_snapshot::Approval>,
 }
@@ -91,6 +93,14 @@ pub enum Preparation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    CreateLocal {
+        path: PathBuf,
+        objective: String,
+    },
+    LinkLocal {
+        local: String,
+        ticket: String,
+    },
     Browser(crate::ticket_browser::Command),
     Comment(crate::ticket_comments::Command),
     List,
@@ -144,6 +154,7 @@ pub enum Command {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
+    Workspace(crate::workspace::Workspace),
     Browser(crate::ticket_browser::Event),
     Comment(crate::ticket_comments::Event),
     Issues(Vec<Issue>),
@@ -436,6 +447,60 @@ impl Workflow {
         source: &impl IssueSource,
     ) -> Result<Event> {
         match command {
+            Command::CreateLocal { path, objective } => {
+                crate::workspace::create_local(self, project, &path, objective)
+                    .await
+                    .map(Event::Workspace)
+            }
+            Command::LinkLocal { local, ticket } => {
+                crate::workspace::link_local(self, project, &local, &ticket)
+                    .await
+                    .map(Event::Workspace)
+            }
+            Command::SelectTask { ticket, task }
+                if self.snapshot()?.local_work.contains_key(&ticket) =>
+            {
+                self.update(|state| {
+                    let record = state
+                        .local_work
+                        .get_mut(&ticket)
+                        .context("Unknown local work")?;
+                    ensure!(
+                        config::same_path(project, &record.project),
+                        "Work belongs to another project"
+                    );
+                    ensure!(
+                        record.tasks.iter().any(|candidate| candidate.id == task),
+                        "Unknown task"
+                    );
+                    record.selected_task = Some(task);
+                    crate::workspace::resolve(state, &ticket)
+                })
+                .map(Event::Workspace)
+            }
+            Command::SetProgress {
+                ticket,
+                task,
+                progress,
+            } if self.snapshot()?.local_work.contains_key(&ticket) => self
+                .update(|state| {
+                    let record = state
+                        .local_work
+                        .get_mut(&ticket)
+                        .context("Unknown local work")?;
+                    ensure!(
+                        config::same_path(project, &record.project),
+                        "Work belongs to another project"
+                    );
+                    record
+                        .tasks
+                        .iter_mut()
+                        .find(|candidate| candidate.id == task)
+                        .context("Unknown task")?
+                        .progress = progress;
+                    crate::workspace::resolve(state, &ticket)
+                })
+                .map(Event::Workspace),
             Command::Browser(command) => {
                 crate::ticket_browser::execute(&self.config_path, project, command, source)
                     .await
@@ -911,7 +976,7 @@ fn patch(target: &mut toml_edit::Item, before: &toml_edit::Item, incoming: &toml
         }
     }
 }
-fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<()> {
+pub(crate) fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<()> {
     for (id, record) in &state.tickets {
         if id != ticket && !record.issue.state.eq_ignore_ascii_case("closed") {
             ensure!(
@@ -922,6 +987,12 @@ fn ensure_available(state: &WorkflowState, ticket: &str, path: &Path) -> Result<
                 "Worktree already belongs to active ticket {id}"
             );
         }
+    }
+    for (id, record) in &state.local_work {
+        ensure!(
+            id == ticket || !config::same_path(path, &record.worktree.path),
+            "Worktree already belongs to local work {id}"
+        );
     }
     Ok(())
 }
@@ -1008,7 +1079,7 @@ async fn verify_claim(worktree: &Path, ticket: &str) -> Result<PathBuf> {
     }
     Ok(path)
 }
-async fn preparation_lock(project: &Path) -> Result<std::fs::File> {
+pub(crate) async fn preparation_lock(project: &Path) -> Result<std::fs::File> {
     let directory = PathBuf::from(
         git::text(
             project,

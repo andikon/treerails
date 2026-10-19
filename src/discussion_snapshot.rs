@@ -101,6 +101,37 @@ pub fn retain(
             comment.body
         ));
     }
+    retain_markdown(
+        config,
+        markdown,
+        context,
+        card.issue.url.clone(),
+        discussion.comments.len(),
+        discussion.fetched_at,
+    )
+}
+
+/// Local objectives use the same immutable retained-artifact protocol without a fictitious issue.
+pub fn retain_local(config: &Path, context: String) -> Result<Approval> {
+    let markdown = format!("# Local task starting context\n\n{context}\n");
+    retain_markdown(
+        config,
+        markdown,
+        context,
+        String::new(),
+        0,
+        crate::ticket_browser::now(),
+    )
+}
+
+fn retain_markdown(
+    config: &Path,
+    markdown: String,
+    context: String,
+    issue_url: String,
+    comments: usize,
+    captured_at: u64,
+) -> Result<Approval> {
     let id = uuid::Uuid::new_v4().to_string();
     let directory = directory(config)?;
     fs::create_dir_all(&directory)?;
@@ -116,9 +147,9 @@ pub fn retain(
         path: fs::canonicalize(&path)?,
         sha256: digest(markdown.as_bytes()),
         bytes: markdown.len() as u64,
-        captured_at: discussion.fetched_at,
-        issue_url: card.issue.url.clone(),
-        comments: discussion.comments.len(),
+        captured_at,
+        issue_url,
+        comments,
         complete: true,
         context_sha256: digest(context.as_bytes()),
     };

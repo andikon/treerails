@@ -17,8 +17,20 @@ A GitHub Issue defining a requested outcome and its acceptance criteria. A ticke
 _Avoid_: Task when referring to the issue as a whole.
 
 **Task**:
-A workstream tracked by Tree Rail within a ticket, such as implementation or review. A task can have multiple agent sessions.
+A workstream tracked by Tree Rail, such as implementation, review or a local investigation. A task can belong to a GitHub ticket or local work and can have multiple agent sessions.
 _Avoid_: Ticket or agent session when referring to the workstream.
+
+**Local work**:
+Tasks and their objectives associated with a project and worktree, without requiring a GitHub issue.
+_Avoid_: Local ticket or synthetic issue.
+
+**Workspace**:
+The shared working view of a checkout, its tasks, changes and agent conversations, reached from Work, Tickets or Worktrees.
+_Avoid_: Worktree when referring to the working interface rather than the physical checkout.
+
+**Work view**:
+A project's task overview, combining ticket-backed and local tasks with their attention, progress and checkout context.
+_Avoid_: Tickets when referring to all ongoing work.
 
 **Ticket filter**:
 Criteria determining which GitHub tickets are shown for a project.
@@ -29,7 +41,7 @@ A named choice of ticket filtering and ordering belonging to a project. A projec
 _Avoid_: Planning board when referring to a saved selection of GitHub Issues in Tree Rail.
 
 **Active section**:
-A separate group of tickets currently being worked on, displayed above the saved view's filtered tickets in the same column.
+A compact view of current local and ticket-backed work, including agent attention, available alongside project browsing.
 _Avoid_: Filter match when an active ticket is visible independently of the saved view's criteria.
 
 **Ticket preview**:
@@ -53,7 +65,7 @@ Whether Tree Rail can reliably observe and control an agent session, including i
 _Avoid_: Session attention when describing a failure to observe or control the session.
 
 **Starting brief**:
-The issue content and discussion, task objective, workspace context and optional handoff captured for the start of an agent session.
+The task objective, checkout context and optional handoff captured for the start of an agent session, including the complete issue discussion when linked to a ticket.
 _Avoid_: Conversation transcript when referring to the supplied starting context.
 
 **Workflow state**:

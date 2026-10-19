@@ -193,9 +193,9 @@ impl App {
         (rows.min((20_000 / u32::from(cols)) as u16), cols)
     }
     fn focused_record(&self) -> Option<&hosted::SessionRecord> {
-        let ticket = self.ticket.as_ref()?;
+        let ticket = self.current_workspace()?;
         let task = ticket.tasks.get(self.task_cursor)?;
-        hosted::selected_session(&self.state.workflow, &ticket.id(), &task.id)
+        hosted::selected_session(&self.state.workflow, &ticket.id, &task.id)
     }
     pub fn begin_agent(&mut self, new: bool) {
         if self.hosted.pending_launch.is_some() {
@@ -212,22 +212,22 @@ impl App {
             });
             return;
         }
-        let Some(ticket) = self.ticket.as_ref() else {
+        let Some(ticket) = self.current_workspace() else {
             return;
         };
         let Some(task) = ticket.tasks.get(self.task_cursor) else {
             return;
         };
-        match hosted::discussion_context(ticket, &task.id, "") {
+        match crate::workspace::context(&self.state.workflow, &ticket.id, &task.id, "") {
             Ok(brief) => {
                 let capture = hosted::Command::CaptureDiscussion {
-                    ticket: ticket.id(),
+                    ticket: ticket.id.clone(),
                     task: task.id.clone(),
                     handoff: String::new(),
                 };
                 self.hosted.discussion_approval = None;
                 self.hosted.dialog = Some(Dialog::Start {
-                    ticket: ticket.id(),
+                    ticket: ticket.id.clone(),
                     task: task.id.clone(),
                     brief,
                     handoff: Field::new("Optional handoff", String::new(), true),
@@ -344,7 +344,11 @@ impl App {
             return true;
         }
         if !self.hosted.input {
-            if key.code == KeyCode::Char('E') && key.modifiers == KeyModifiers::NONE {
+            if key.code == KeyCode::Char('E')
+                && key.modifiers == KeyModifiers::NONE
+                && !(self.workspace_open
+                    && self.workspace_tab == super::workspace_ui::WorkspaceTab::Activity)
+            {
                 self.hosted_diagnostics();
                 return true;
             }
@@ -583,17 +587,20 @@ impl App {
                         .sessions
                         .insert(record.id.clone(), record.clone());
                     if self.hosted.pending_launch.as_ref().is_some_and(|command| matches!(command,hosted::Command::StartRequest {request_id,..}|hosted::Command::StartDocument {request_id,..} if request_id==&record.id)) { self.hosted.pending_launch=None; }
-                    self.hosted.record = Some(record.clone());
-                    self.hosted.input = false;
-                    self.hosted.terminal = None;
-                    self.hosted.token = None;
-                    self.hosted.queue.retain(|command| {
-                        !matches!(
-                            command,
-                            HostCommand::Input { .. } | HostCommand::Resize { .. }
-                        )
-                    });
-                    self.attach_agent(false);
+                    let selected = self.workspace_session_matches(&record);
+                    if selected {
+                        self.hosted.record = Some(record.clone());
+                        self.hosted.input = false;
+                        self.hosted.terminal = None;
+                        self.hosted.token = None;
+                        self.hosted.queue.retain(|command| {
+                            !matches!(
+                                command,
+                                HostCommand::Input { .. } | HostCommand::Resize { .. }
+                            )
+                        });
+                        self.attach_agent(false);
+                    }
                     if let Some(id) = record.host_session {
                         self.queue_host(HostCommand::ConfigureSession {
                             session: id,
@@ -601,7 +608,11 @@ impl App {
                             desktop_notifications: self.config.desktop_notifications,
                         });
                     }
-                    self.say("Conversation attached · Enter agent input · Ctrl+] navigation · x stop · d detach",false);
+                    if selected {
+                        self.say("Conversation attached · Enter agent input · Ctrl+] navigation · x stop · d detach",false);
+                    } else {
+                        self.say("Conversation started in background · W Work", false);
+                    }
                 }
                 hosted::Event::Stopped(record) => {
                     self.state
@@ -637,16 +648,13 @@ impl App {
                         ..
                     }) = &mut self.hosted.dialog
                     {
-                        let matching = self
-                            .state
-                            .workflow
-                            .tickets
-                            .get(ticket)
-                            .or(self.ticket.as_ref().filter(|record| record.id() == *ticket))
-                            .and_then(|record| {
-                                hosted::discussion_context(record, task, &handoff.value).ok()
-                            })
-                            .is_some_and(|context| context == approval.context);
+                        let matching = crate::workspace::context(
+                            &self.state.workflow,
+                            ticket,
+                            task,
+                            &handoff.value,
+                        )
+                        .is_ok_and(|context| context == approval.context);
                         if matching {
                             match approval
                                 .snapshot
@@ -813,7 +821,7 @@ impl App {
         });
     }
     pub fn begin_handover(&mut self) {
-        let Some(ticket) = self.ticket.as_ref() else {
+        let Some(ticket) = self.current_workspace() else {
             return;
         };
         let Some(checkout) = &ticket.worktree else {
@@ -856,7 +864,9 @@ impl App {
         }
     }
     pub fn show_sessions(&mut self) {
-        let Some(ticket) = &self.ticket else { return };
+        let Some(ticket) = self.current_workspace() else {
+            return;
+        };
         let Some(task) = ticket.tasks.get(self.task_cursor) else {
             return;
         };
@@ -865,7 +875,7 @@ impl App {
             .workflow
             .sessions
             .values()
-            .filter(|record| record.ticket == ticket.id() && record.task == task.id)
+            .filter(|record| record.ticket == ticket.id && record.task == task.id)
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));

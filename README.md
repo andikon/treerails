@@ -15,6 +15,33 @@ Find a project, choose a starting branch, and open your tools in the right works
 
 ![Tree Rail showing four parallel worktrees, colored file status, and an inline Git diff](docs/media/workspace.png)
 
+## One workspace for your work
+
+Each project has three entry points into the same workflow: **Work** (`W`) collects
+local and ticket tasks with attention and recovery first; **Tickets** (`T`) finds
+GitHub issues through saved views; **Worktrees** (`w` from either browser) shows
+physical checkouts. These entry shortcuts also work inside a workspace.
+Tree Rail remembers the last entry point per project; new
+projects start in Tickets. Browsing alone never creates tasks or starts an agent.
+
+Opening a task or worktree reaches a shared workspace: **1 Overview**, **2 Changes**,
+**3 Agent**, **4 Discussion**, **5 Activity**. Stage and commit in Changes, read or
+comment on the linked issue in Discussion, and inspect checkout operations in
+Activity. The branch, checkout and task remain attached as you switch sections.
+
+From an existing worktree, `S` creates a local task with an explicit objective and
+opens agent context review; GitHub is optional. `A` adds another local task.
+Ticket work uses the same hosted sessions and Git actions. Each checkout has one
+managed owner, including while an agent is Ready or needs recovery. External tool
+launches remain separate from managed sessions.
+
+`L` links local work to an already opened GitHub ticket after agents are stopped
+and reconciled. Tasks, conversation identities, objectives and checkout branches
+are retained; conflicting checkout associations are rejected. New ticket-backed
+conversations capture the full fresh discussion, while local conversations capture
+their objective and handoff. Continue resumes the same conversation without
+replaying either document. `Esc` returns to the entry browser.
+
 ## Ticket workflow
 
 Enter a project to browse its existing GitHub issues (requires authenticated `gh`).

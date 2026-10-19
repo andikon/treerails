@@ -115,11 +115,10 @@ pub fn active_tickets(
             .filter(|session| session.ticket == ticket.id())
         {
             let unresolved = session.pending_start.is_some()
-                || (session.current
-                    && matches!(
-                        session.health,
-                        Health::Starting | Health::Interrupted | Health::Failed
-                    ));
+                || matches!(
+                    session.health,
+                    Health::Starting | Health::Interrupted | Health::Failed
+                );
             let live = matches!(session.health, Health::Live);
             if !(unresolved || live) {
                 continue;

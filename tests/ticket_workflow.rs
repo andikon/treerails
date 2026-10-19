@@ -437,9 +437,11 @@ async fn terminal_default_browsing_and_basic_escape_share_production_events() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(text.contains("Ticket overview"));
-    assert!(text.contains("Acceptance criteria"));
-    assert!(text.contains("No shared worktree"));
+    assert!(text.contains("Task workspace"));
+    assert!(text.contains("Deliver 1"));
+    assert!(text.contains("No checkout"));
+    assert!(text.contains("4 Discussion"));
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
     assert!(!app.ticket_mode);
     app.key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE));

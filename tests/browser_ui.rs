@@ -213,12 +213,14 @@ fn ready_checkout_owners_and_recovery_count_but_historical_failures_do_not() {
     }
     for (number, health, current) in [
         (1, "Live", true),
-        (2, "Failed", false),
+        (2, "Stopped", false),
         (3, "Interrupted", true),
     ] {
         let session=serde_json::from_value(serde_json::json!({"id":format!("s{number}"),"ticket":format!("owner/repo#{number}"),"task":"task","checkout":"repo","provider_session_id":"provider","starting_brief":"brief","created_at":1,"host_session":format!("h{number}"),"health":health,"current":current,"error":null})).unwrap();
         state.sessions.insert(format!("s{number}"), session);
     }
+    state.sessions.get_mut("s2").unwrap().error =
+        Some("Historical failure, followed by a verified stop".into());
     let attention = treerail::copilot::Attention {
         value: Some(treerail::copilot::AttentionState::Ready),
         healthy: true,
@@ -262,6 +264,46 @@ fn ready_checkout_owners_and_recovery_count_but_historical_failures_do_not() {
         browser::active_tickets(&state, "owner/repo", &summaries).len(),
         2
     );
+}
+
+#[test]
+fn selecting_history_cannot_hide_unresolved_noncurrent_checkout_owners() {
+    let mut state = workflow::WorkflowState::default();
+    for (number, health) in [(1, "Failed"), (2, "Interrupted")] {
+        let ticket = record(number, Progress::Done);
+        state.tickets.insert(ticket.id(), ticket);
+        let unresolved = serde_json::from_value(serde_json::json!({
+            "id":format!("unresolved-{number}"),"ticket":format!("owner/repo#{number}"),
+            "task":"task","checkout":"repo","provider_session_id":"provider",
+            "starting_brief":"brief","created_at":1,"host_session":null,
+            "health":health,"current":false,"error":"Stop outcome not confirmed"
+        }))
+        .unwrap();
+        state
+            .sessions
+            .insert(format!("unresolved-{number}"), unresolved);
+        let selected_history = serde_json::from_value(serde_json::json!({
+            "id":format!("history-{number}"),"ticket":format!("owner/repo#{number}"),
+            "task":"task","checkout":"repo","provider_session_id":"provider",
+            "starting_brief":"brief","created_at":2,"host_session":null,
+            "health":"Stopped","current":true,"error":null
+        }))
+        .unwrap();
+        state
+            .sessions
+            .insert(format!("history-{number}"), selected_history);
+    }
+    let active = browser::active_tickets(&state, "owner/repo", &[]);
+    assert_eq!(active.len(), 2);
+    assert!(
+        active
+            .iter()
+            .all(|entry| entry.attention == "Recovery needed" && entry.rank == 0)
+    );
+    for session in state.sessions.values_mut() {
+        session.health = treerail::hosted::Health::Stopped;
+    }
+    assert!(browser::active_tickets(&state, "owner/repo", &[]).is_empty());
 }
 
 #[test]

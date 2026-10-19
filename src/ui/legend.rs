@@ -175,6 +175,60 @@ fn actions(app: &App) -> Vec<String> {
             ],
         );
     }
+    if app.workspace_open {
+        use crate::app::workspace_ui::WorkspaceTab;
+        // Entry points and section keys already have persistent headers.
+        let mut hints = vec![];
+        match app.workspace_tab {
+            WorkspaceTab::Changes => {
+                if app.workspace_changes_ready() {
+                    let actions = if app.focus == 1 {
+                        vec![
+                            ("s", "stage", "stage"),
+                            ("u", "unstage", "unstage"),
+                            ("c", "commit", "commit"),
+                        ]
+                    } else {
+                        vec![("t", "toggle_staged", "staged diff"), ("p", "push", "push")]
+                    };
+                    hints.extend(explorer(app, &actions));
+                }
+                hints.push("S agent".into());
+            }
+            WorkspaceTab::Discussion if app.ticket.is_some() => {
+                hints.extend(fixed(&["c comment", "o GitHub"]))
+            }
+            WorkspaceTab::Discussion => hints.extend(fixed(&["L link issue"])),
+            WorkspaceTab::Activity => hints.extend(fixed(&["E details", "H history"])),
+            _ => {
+                if app
+                    .current_workspace()
+                    .is_some_and(|w| w.worktree.is_none())
+                {
+                    hints.extend(fixed(&[
+                        "c create checkout",
+                        "a adopt worktree",
+                        "i import tasks",
+                    ]));
+                } else {
+                    hints.extend(fixed(&[
+                        "s continue / start",
+                        "n new conversation",
+                        "g conversations",
+                        "p task progress",
+                    ]));
+                    if app.current_workspace().is_none_or(|w| w.issue.is_none()) {
+                        hints.extend(fixed(&["A add local task", "L link issue"]));
+                    }
+                }
+            }
+        }
+        hints.push("? actions".into());
+        return hints;
+    }
+    if app.work_mode {
+        return fixed(&["T tickets", "w worktrees", "? actions"]);
+    }
     if app.ticket_mode {
         let Some(ticket) = &app.ticket else {
             return fixed(&[
@@ -183,7 +237,8 @@ fn actions(app: &App) -> Vec<String> {
                 "c comment",
                 "o GitHub",
                 "a active work",
-                "w basic worktrees",
+                "W work",
+                "w worktrees",
                 "R refresh tickets",
                 ", settings",
                 "? actions",
@@ -325,6 +380,10 @@ pub fn help(app: &App, width: u16) -> String {
     let body = if app.settings_open {
         "SETTINGS\n1 Sources · 2 Worktrees · 3 Profiles · 4 Notifications\na add source, project defaults or profile\nSources: d remove source · r recursive discovery\nCtrl+s validate, save and apply · D discard draft\nEsc returns to explorer and keeps unfinished edits\n\nEDITING\nCtrl+u clears text before the cursor\nFinal-field acceptance updates the draft, not the file\nConflicts: m keep mine · e keep external values"
             .into()
+    } else if app.workspace_open {
+        "TASK WORKSPACE\n1 Overview / 2 Changes / 3 Agent / 4 Discussion / 5 Activity\nW project work / T tickets / w worktrees\ns continue or start from Overview/Agent / S agent from Changes\nn new conversation / g conversations / p task progress\nA add local task / L link local work to an opened ticket\nb handover / r reconcile / u retry / x stop / d detach\nDiscussion: c comment / o GitHub\nActivity: E details / H history\nChanges: existing Git staging, commit and push actions\nEscape returns to the entry browser.".into()
+    } else if app.work_mode {
+        "PROJECT WORK\nAll local and ticket tasks, with attention and recovery first.\nOpen a task to reach its shared workspace.\nT tickets / w worktrees".into()
     } else if app.project.is_some() && app.ticket_mode && app.ticket.is_none() {
         "TICKET BROWSER\nf edit filters · v saved views\nc compose / restore comment · o open GitHub\na collapse / expand active work · R refresh\n\nSAVED VIEWS\nApply saves changes to the current view\nDuplicate a view before experimenting\nFilters combine across categories; labels support All or Any\nActive work remains visible independently of filters\n\nDISCUSSION\nComments are oldest first; incomplete and stale content is marked\nComment review freezes the issue, identity and exact text\nOnly y on the review screen posts a comment\nUnknown sends require explicit verification or retry\n\nw basic worktrees · , settings".into()
     } else if app.project.is_some() && app.ticket_mode {
@@ -371,7 +430,6 @@ pub fn help(app: &App, width: u16) -> String {
                     ("P", "pull", "fast-forward pull"),
                     ("r", "prs", "review PR checkout"),
                     ("v", "review_diff", "PR comparison"),
-                    ("w", "open_pr", "open PR in browser"),
                     ("T", "tickets", "ticket workflow"),
                 ],
             ));

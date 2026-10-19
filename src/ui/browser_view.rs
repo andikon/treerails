@@ -272,7 +272,7 @@ fn filter_summary(app: &App) -> String {
     chips.join(" · ")
 }
 
-fn preview(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn preview(frame: &mut Frame, app: &App, area: Rect) {
     let selected = app.browser.selected;
     let discussion = app
         .browser
