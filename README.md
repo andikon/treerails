@@ -200,9 +200,13 @@ A roughly **24-second walkthrough**: select a project → create a worktree from
 | Your machine | Download |
 | --- | --- |
 | **Windows · Intel/AMD 64-bit** | [Standalone EXE](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.exe) · [ZIP with documentation](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.zip) |
-| **Linux · Intel/AMD 64-bit** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-linux-x86_64.tar.gz) |
-| **macOS · Apple Silicon** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-macos-aarch64.tar.gz) |
-| **macOS · Intel** | [TAR.GZ](https://github.com/andikon/treerails/releases/latest/download/treerail-macos-x86_64.tar.gz) |
+| **Linux · Intel/AMD 64-bit** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-linux-x86_64.tar.gz) · build current version from source below |
+| **macOS · Apple Silicon** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-macos-aarch64.tar.gz) · build current version from source below |
+| **macOS · Intel** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-macos-x86_64.tar.gz) · build current version from source below |
+
+**v0.2.0 provides locally built Windows binaries.** Linux/macOS binaries remain at
+v0.1.0; build from current source for the new ticket and agent workflows on those
+platforms. This release uses local validation without cloud builds.
 
 On Windows, download the EXE, rename it to `treerail.exe`, and put it in a folder such as `C:\Tools\TreeRail`. Open a terminal in that folder and run:
 
