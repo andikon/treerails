@@ -1,276 +1,66 @@
-# Tree Rail usage guide
+# Using Tree Rail
 
-A keyboard-first project explorer and Git worktree manager, built in Rust with Ratatui. Jump into a project, create a worktree from the right branch, and launch Copilot or your editor in a new terminal while the explorer stays open.
+Open a repository or a parent directory: `treerail /path/to/projects`. Known projects and remembered locations load before the terminal renders; discovery then refreshes them. `Ctrl+P` opens the project explorer, where **+ Remember a path** adds a repository or discovery folder to state. Opening a project creates or selects its top tab.
 
-## Run
+## Worktrees and conversations
 
-Git must be on `PATH`. The default agent profile also needs `copilot`; PR features need an authenticated GitHub CLI (`gh`). Local Git features work independently of those optional tools.
+Select a worktree on the left. Sessions shows its conversations in the middle and the selected conversation on the right. Changes replaces only the middle and right content with files and a diff. Project tabs and the one-row status line remain fixed. Use `v` or the header controls to switch views.
 
-From this directory:
+The Worktrees **+** creates a checkout without starting an agent. The Sessions **+**, or `n`, immediately starts a new idle conversation in the selected worktree and opens the real Copilot CLI. Enter your first prompt in Copilot itself; no Tree Rail setup form appears. First-use folder trust still requires explicit confirmation. Model and permission settings can be managed in Copilot.
 
-```powershell
-cargo run --release -- 'C:\Code'
-cargo run --release -- 'C:\Code\my-project' 'D:\OtherProjects'
-```
+Help → **New session with options / new worktree** retains the optional setup form. **Create in a new worktree** is initially unchecked. Toggle it to reveal branch, starting reference, directory, remote and Fetch. A blank starting reference means the remote's freshly fetched actual default branch, such as `origin/develop`. `HEAD` explicitly means the selected checkout's current commit; another branch/tag/commit overrides it. Disabling Fetch requires an explicit cached reference. Dirty files are never copied into a new checkout. Fetch failures report an error; there is no silent fallback to stale references.
 
-Or build once and launch the executable:
+Use the creation form's Provider options to inspect the host's advertised models, permission settings and agent mode. After starting, the conversation opens immediately. The native Copilot runtime loads its own repository instructions and configured customizations. Sign in with GitHub CLI (`gh auth login`) or provide `COPILOT_GITHUB_TOKEN`; an existing login in another Copilot application does not necessarily expose a credential to an AHP client.
 
-```powershell
-cargo build --release --locked
-.\target\release\treerail.exe 'C:\Code'
-```
+The first prompt is optional: leave it blank to open an idle conversation directly in the real Copilot CLI. A supplied first prompt is sent once through AHP before the CLI attaches. `i` or clicking the right pane focuses the CLI; **Ctrl+] returns to Tree Rail navigation**. Copilot receives all other keys, including Esc, Tab, Ctrl+P, Ctrl+Q and Ctrl+C, and owns its menus, model selection, attachments and approval interface. Use its native commands and controls. Tree Rail does not reinterpret live messages or inject a second copy of your prompt.
 
-On Linux/macOS, the executable is `target/release/treerail`. Building needs a stable Rust toolchain (tested with Rust 1.95.0). Windows builds use the MSVC toolchain and Visual C++ build tools. End users do not need Rust installed.
+The full bundled Copilot CLI runs in a child terminal attached to that conversation's AHP identity. `[agent].cli` optionally selects another compatible CLI executable; `[agent].runtime` selects the SDK backend separately. AHP attachment is an experimental Copilot feature; Tree Rail enables its client flag and explicit GitHub authentication sharing for loopback or TLS hosts. The private endpoint is passed in the child environment, never command arguments or state. Ordinary terminal colors, cursor movement, keyboard, mouse and bracketed paste are supported; graphics and clipboard escape extensions are not bridged.
 
-```text
-treerail [OPTIONS] [PATHS]...
+Switching Tree Rail sessions or views preserves open terminals. The small × in the conversation header closes only that terminal frontend, without cancelling its server turn. Resume reopens it against the same session without replaying the first prompt. Use Help → Stop active turn for explicit cancellation outside the CLI. Copilot's own session chooser is independent of Tree Rail's association; use Tree Rail's session and worktree rails to change checkout context.
 
---paths-file projects.txt    One source folder per line; # comments allowed
---recursive                 Search beyond immediate children
---temporary                 Do not remember explicitly supplied sources
---config config.toml        Choose the combined settings and remembered-state file
---list                      Print discovered projects as JSON without a TUI
---help                      Show all options
-```
+## Git
 
-Paths in a paths file are relative to that file. Saved roots are relative to their configuration file; CLI directory arguments are relative to the current directory. Explicit paths and path-list entries are remembered automatically after interactive startup. Use `--temporary` for a one-off set of additional sources. Without any sources, Tree Rail uses the current directory for that session and does not remember it. Saved and temporary sources are combined, normalized to absolute paths, and deduplicated. `--list` never writes sources or creates configuration files.
+Each worktree row shows green `+added` and red `-removed` line totals for its current checkout against HEAD. Staged and unstaged edits are combined as a net diff, not added twice. Untracked text files contribute added lines; binary files remain in the changed-file count without invented line totals. Before the first commit, existing text files count as additions. All worktrees in the active project refresh in the background.
 
-Parent directories are scanned one level deep by default. Folders containing `.worktrees` in their name are excluded from discovery. Registered linked worktrees still appear under their owning project, including those made by other tools.
+Use Help for Stage, Unstage, Commit, Fetch, Pull, Push and removal. Space marks files; operations use marked files or the selected file. `t` toggles staged/unstaged diff content. Commits use normal Git hooks and signing. Pull is fast-forward only. The first Push chooses the configured publication remote, otherwise origin, otherwise the sole remote, and sets upstream. If several remotes remain ambiguous, a chooser asks which to use.
 
-## Everyday workflow
+An observed active turn, including an approval wait, blocks Tree Rail Git writes in that worktree. Read operations and Fetch remain available. OS checkout leases coordinate Tree Rail's own managed turns and writes across processes. CLI and other AHP client turns acquire a lease when observed; this cannot atomically prevent a separate client starting a turn during a Git operation. Tree Rail blocks its terminal input while a known conflicting turn or Git mutation is active. Different worktrees can run independently; external tools remain responsible for their own writes. Removal refuses original, dirty, locked, missing or busy checkouts and keeps the local branch.
 
-Projects remember their last entry view. New projects start in **Tickets**;
-`W` opens **Work**, collecting local and ticket tasks with attention/recovery first,
-and `T` opens **Tickets**. From either browser, `w` opens **Worktrees**.
-Opening an existing worktree is passive: it creates no task or hosted session.
+## Saved work and process lifetime
 
-All three entry points feed the same task workspace. Switch sections with
-`1` Overview, `2` Changes, `3` Agent, `4` Discussion and `5` Activity.
-Changes keeps Git staging/commit/push controls; `S` opens agent review from any
-section. A bare checkout first asks for a local task objective. GitHub is optional
-for local work; ticket-backed work captures its full discussion before launch.
-`s` continues/starts and `n` reviews a new conversation from Overview or Agent.
-`A` adds a local task, and `p` changes the selected task's progress manually.
-Agent attention, task progress and GitHub issue state remain independent.
+The first conversation in an untrusted checkout asks **Trust folder for Copilot?**. Confirmation adds that exact folder to Copilot's native trusted-folder list; repository instructions, hooks and tools can then load. Cancel leaves the initial prompt unsent. This uses Copilot's own trust API and does not edit its settings by hand.
 
-After stopping and reconciling agents, `L` can link local work to a GitHub issue
-already opened through Tickets. This preserves tasks, conversations, branch and
-retained context. Conflicting checkout associations prevent linking. Continue
-always resumes the original conversation without replaying its starting context.
-`Esc` returns to the entry view; the discussion browser's previous selection and
-reading position are restored. The project header keeps attention counts visible.
+The native AHP host restricts filesystem access to its launch directory. Tree Rail chooses a shared containing workspace from the locations loaded at startup, including configured sibling worktree paths. Set `[agent].host_directory` explicitly for unusual layouts. New locations outside an already-running host's scope require restarting Tree Rail; existing turns are never stopped to widen access. A single host directory cannot span separate Windows drives; use a compatible external host for a broader filesystem scope.
 
-Opening a project now shows its GitHub tickets. The direct worktree steps below
-remain available with `w`; `T` returns to tickets. Existing local Git operations
-and launch profiles remain usable without GitHub or hosted Copilot.
+Multiple conversations belong directly to a worktree. Ready conversations stay in Sessions; Archive hides one locally and Help can show archived conversations again. Missing worktrees keep readable saved history but cannot receive prompts. Resume explicitly attaches to the saved protocol identity without replaying the first message.
 
-1. Select a project with `j/k` and `Enter`.
-2. Press `a` for a new branch/worktree, or `b` to select a local or remote branch. The default directory is a sibling such as `my-project.worktrees/feature-login`.
-3. Set the starting point, such as `origin/develop`. `Ctrl+b` opens its picker. Check the destination, optionally choose a fetch, and press `Ctrl+s` to create.
-4. Press `o` to open a new terminal running Copilot in the selected worktree. `O` selects another profile, including plain terminal and Neovim.
-5. Inspect live file changes, mark files with `Space`, and stage/unstage using `s/u`. Press `t` to switch staged/unstaged diffs.
-6. Press `c` to enter a commit subject/body; `Ctrl+s` commits staged changes. Hooks and signing use your normal Git configuration.
-7. Press `p` to push. With no upstream, the publish form suggests `origin` and the current branch name and establishes its upstream. `P` pulls using fast-forward only.
-8. Once finished, focus the worktree list and press `d`. Removal keeps the branch and refuses dirty, locked, missing, or original worktrees. Branch deletion is a separate action in `b`, with Git's normal merge protections.
+Closing a tab with running sessions asks before hiding it. Help → Agent activity reopens active projects. Quitting asks before stopping owned work, closes all child terminals and ends the owned runtime. Conversations and cached history remain saved. Copilot owns live input drafts; legacy Tree Rail drafts stay preserved but are never automatically injected into the CLI. Restart restores project context but starts no turn or terminal. An explicitly configured external host retains its own lifetime.
 
-A branch already checked out in a worktree selects that worktree. New feature branches deliberately do not inherit the base branch as their upstream: they publish under their own name.
+## Keyboard navigation
 
-Every Git action keeps a live status above the explorer: its action, original target, current phase and elapsed time. Transfer percentages and rates appear when Git reports them; a spinner continues during silent commands. These percentages describe the reported transfer phase, rather than an invented overall total.
-
-Press `i` to inspect streamed Git and hook output while an operation runs, or its result afterward. Details follow new output by default; `j/k` and `Ctrl+u/d` scroll, `g`/`gg` goes to the beginning, and `G` resumes following the end. `Esc`, `q` or `i` closes details while Git continues. Output retains the latest 64 KiB and shows a notice when older output was discarded. Navigation, searching and refresh notices keep the operation attached to its original target. Only one Git operation runs at a time; cancellation is outside this version.
-
-Press `H` for recent Git operations from this session. The list shows each action, original project/worktree and outcome; use `j/k`, `gg/G` or `/` to find a result, then `Enter` for its details. An older result stays selected while a newer operation's live status remains visible above it. `H` returns to history from details. Up to 20 operations are retained, including the current one; an inspected result is kept while the oldest other results are discarded. The list reports how many were discarded. History and output are never saved to `config.toml` and start empty next launch.
-
-## Keyboard controls
-
-The bottom legend shows workflow actions for the active view and focused pane.
-Routine navigation, search and entering input are omitted. Press `?` for the
-current workflow's action guide, including recovery and cleanup commands. Narrow
-legends keep complete hints and the action-guide shortcut instead of clipping keys.
-In agent-input mode the legend shows only the configured shortcut back to Tree Rail;
-other keys go to Copilot. Existing key bindings are unchanged.
-
-### Ticket sessions
-
-Ticket browsing requires authenticated `gh`; native hosted sessions additionally
-require Copilot. Native Windows hosting has been validated with Copilot 1.0.94.
-Its extension interface is experimental. Hosted process ownership on other
-platforms is explicitly unavailable until validated; their basic workflow remains
-supported. Tests and version-specific evidence are in
-[the compatibility report](research/copilot-hosting-proof.md).
-
-| Key | Ticket action |
+| Context | Keys |
 | --- | --- |
-| `c` / `a` | Prepare a shared worktree / adopt a registered one |
-| `s` | Continue the selected task; inspect a first starting brief when needed |
-| `n` | Start a separate recorded conversation after brief review |
-| `Enter` | Focus the visible native agent terminal |
-| `Ctrl+]` | Return from agent input to Tree Rail navigation |
-| `g` | Inspect and select recorded conversations |
-| `b` | Explicitly hand the shared checkout to another task/session |
-| `d` / `x` | Detach the view / explicitly stop the session |
-| `X` | Stop the host after stopping its sessions |
-| `!` | Explicitly take terminal input control from another UI |
-| `r` | Reconcile an interrupted recorded session; no automatic agent restart |
-| `u` | Review and retry an unresolved launch using its original request UUID |
-| `R` / `v` | Refresh GitHub requirements / inspect and explicitly apply revisions |
-| `D` | Preview optional cleanup, protections and unpublished commits |
-| `E` | Inspect host and notification diagnostics |
+| Projects / preferences / quit | Ctrl+P / Ctrl+, / Ctrl+Q |
+| Project tabs | Ctrl+Tab next; Alt+W close selected |
+| Panes | Tab / Shift+Tab; h / l |
+| Lists | j / k; arrows |
+| Sessions / Changes | v |
+| Create worktree / session | a / n |
+| Stage / unstage / commit | s / u / c |
+| Fetch / pull / push | f / P / p |
+| Remove worktree | d |
+| Resume / archive | r / e |
+| Refresh projects, Git and agents | R |
+| Focus Copilot CLI / stop turn from navigation | i / Ctrl+C |
+| Leave Copilot CLI focus | Ctrl+] |
+| Scroll detail | Ctrl+u / Ctrl+d |
+| Form fields / submit / cancel | Tab / Ctrl+Enter / Esc |
+| Help | ? |
 
-The starting brief includes the issue requirements, selected task, checkout and
-branch, plus any explicit handoff you supply. Review and scroll it before accepting.
-Each conversation keeps its original brief; Continue does not copy a transcript or
-resend that brief. A missing provider conversation is an error requiring an explicit
-new-session choice. Ready means Copilot finished responding, not that the task is done.
-Task progress remains manual with `p`.
+These are Tree Rail navigation keys. While the CLI is focused, only Ctrl+] is reserved by Tree Rail; every other key belongs to Copilot. Letters typed into a form are text. Mouse support covers project tabs, selections, creation buttons, forms, command choices and the embedded terminal. Very small terminals ask for at least 60 columns × 16 rows while keeping background work alive.
 
-Navigation and agent-input modes use separate text labels and theme colors. In
-agent-input mode ordinary keys, including Escape and Ctrl+C, reach Copilot. Map a
-key to `agent_navigation` in `[keys]` to replace the default Ctrl+] shortcut.
-Pastes retain native bracketed-paste behavior. Only one UI controls a live terminal;
-explicit takeover invalidates the previous client's input authority.
+## Files
 
-Closing the UI or detaching leaves the same agent running or waiting in the local
-host. Reopening and continuing restores its current screen and pending-input state.
-The host keeps bounded screen/history state in memory and drains output even with
-no UI. Host failure or reboot ends that live terminal: durable references remain,
-but recovery reconciles execution before an explicit exact-conversation resume.
-An uncertain stop does not release checkout ownership. Neither reconnect nor
-recovery automatically approves prompts, replays instructions or starts another task.
+`config.toml` and `state.json` live together in the OS application directory. `--config /other/config.toml` uses that file and a sibling `state.json`. Configured sources are separate from paths remembered during ordinary use. State saves never patch configuration. Settings and paths load before terminal initialization; Git, discovery and AHP calls run asynchronously afterwards.
 
-Desktop notifications default to off. In settings, section `4 Notifications`, Enter
-toggles delivery; Ctrl+s saves. The host delivers input-request and session-failure
-notifications while detached. Ordinary output and Ready remain quiet. In-app
-indicators remain visible with notifications disabled or blocked by OS settings;
-delivery errors are separate from agent health and permissions.
-
-Ticket/task/conversation references and brief snapshots share the existing combined
-TOML file with settings. Terminal output is bounded in host memory, and Copilot owns
-its transcripts. Saves preserve unrelated settings, comments and concurrent edits.
-`--list` remains read-only and never starts the host. A standalone Tree Rail download
-includes its own host role; no service or login-startup installation is required.
-
-### Basic workspace keys
-
-| Keys | Action |
-| --- | --- |
-| `j/k`, arrows | Move selection; scroll in the diff pane |
-| `gg`, `G` | First/last item |
-| `Ctrl+u/d` | Move half a page, adapting to terminal height |
-| `h/l`, `Tab`, `Shift+Tab` | Focus adjacent panes |
-| `Ctrl+w`, then `h/j/k/l` | Focus adjacent panes using a Vim-style prefix |
-| `/` | Filter the current list or search the diff |
-| `n/N` | Next/previous filtered result or diff match |
-| `Enter` | Explore a project or focus the next pane |
-| `a`, `b` | Create worktree; open branch picker |
-| `o`, `O` | Launch default profile; choose profile |
-| `Space`, `s/u` | Mark files; stage/unstage files |
-| `t` | Toggle staged/unstaged diff |
-| `c`, `f`, `p`, `P` | Commit, fetch, push/publish, fast-forward pull |
-| `i` | Inspect live operation output or the latest result |
-| `H` | Open this session's recent Git operation history |
-| `r`, `v`, `w` | PR picker, PR comparison, open PR in browser |
-| `d` | Confirm worktree removal, while focused on worktrees |
-| `,`, `S` | Open settings (also available with an empty explorer) |
-| `R` | Refresh |
-| `Esc`, `q` | Close/back; quit from projects |
-| `?` | Keyboard help |
-
-Forms accept ordinary text: `j`, `k`, and `q` never act as navigation while typing. Use `Tab`/`Shift+Tab` to change fields, arrows/Home/End to edit, and `Ctrl+s` to submit. Commit bodies support newlines and bracketed paste. `Enter` advances a single-line field and submits the last one.
-
-Pickers support `j/k`, `gg/G`, arrows, and `Ctrl+n/p`. Press `/` to filter, type the query, and `Enter` to select. `Esc` leaves filter entry, then closes the picker on another press. In navigation mode, `a` creates a branch in the branch picker, and `d` offers safe local branch deletion. In the PR picker, `a` lets you enter a PR number or URL directly.
-
-## Pull requests
-
-`r` lists up to 100 open PRs for the selected project. Select one or enter its number/URL. Tree Rail fetches the GitHub pull ref, including fork PRs, into its own local refs and prepares `review/pr-123` in `my-project.worktrees/review-pr-123`. It never force-resets an existing review branch.
-
-`v` shows the review branch's merge-base diff against the fetched PR base; `t` returns to local staged/unstaged changes. `w` opens the PR in a browser. Existing review worktrees are selected as-is; updating them is an explicit Git operation. Posting reviews is outside this version.
-
-## Configuration
-
-Interactive startup automatically creates one combined `config.toml`. On Windows it lives at `%LOCALAPPDATA%\treerails\config.toml`; on Linux and macOS it lives at `~/.config/treerails/config.toml`. The Unix location uses your home directory even when `XDG_CONFIG_HOME` is set. `?` displays the active path. Use `--config` to choose another file, including that file's remembered selections and starting points. You can also start from [examples/config.toml](../examples/config.toml).
-
-Settings and remembered selections share this document. Session memory is stored under `[state]` and `[state.bases]`. Automatic memory saves preserve comments and unrelated settings, including changes saved by other instances or your editor. The most recently saved selection wins; starting points changed in separate projects are preserved. Writes are atomic and Tree Rail instances coordinate through a small `.lock` sidecar containing no settings or history. `--list` only reads files: it never creates a configuration, imports data to disk, or saves selections. Invalid settings produce an error without replacing the document.
-
-When the new **default** file is missing, Tree Rail imports the former configuration and `state.json` before creating it. Relative saved paths retain their original meaning. The old files remain untouched. Windows legacy settings used `%APPDATA%\treerail\config\config.toml` and memory used `%LOCALAPPDATA%\treerail\data\state.json`; Linux used `$XDG_CONFIG_HOME/treerail/config.toml` (or `~/.config/treerail/config.toml`) and `$XDG_STATE_HOME/treerail/state.json` (or `~/.local/state/treerail/state.json`); macOS used `~/Library/Application Support/treerail/`. An existing new file is authoritative and never reimports old values. If import fails, the original data is preserved and the error names the failed component. Correct it before retrying, or choose a separate file with `--config`. Explicit overrides do not import the default legacy files. The old `--state` option has been removed because settings and memory now belong to the same file.
-
-### Settings in the TUI
-
-Press `,` from project or worktree navigation to open settings. The page shows the active configuration path and three sections: **Sources**, **Worktrees**, and **Profiles**. Switch with `1/2/3`, `h/l`, or `Tab`; use `j/k`, arrows, `gg/G`, or `Ctrl+u/d` to navigate within a section. In Sources, `a` adds a source, `Enter` edits one, `d` removes one from the draft, and `r` toggles recursive discovery. Relative source paths resolve beside the configuration file. New sources must be available directories. Existing sources that become unavailable remain saved and receive a warning from the background scan.
-
-In Worktrees, edit global path/default-profile choices or the selected project's starting point, path and profile overrides. Configured projects are also listed, and `a` adds defaults for another directory. Blank project overrides inherit the existing precedence: an explicit project base wins over its remembered starting point and Git's default, while project paths/profiles override global choices.
-
-In Profiles, `a` creates a named profile and `Enter` edits an existing one. Fields cover program, arguments, working-directory template, environment and terminal adapter. Use `Tab`/`Shift+Tab` between fields; the editor scrolls to keep the active field visible. `Ctrl+u` clears the text before the cursor. Arguments use a TOML string array such as `['a file.txt', '--flag']`; environment uses a TOML map such as `{ MODE = 'dev', BRANCH = '{branch}' }`. Ordinary letters and digits always enter text while editing. A blank program opens a plain terminal. Choose `auto` or the name of an existing custom terminal adapter. Keybindings, colors and adapter definitions remain editable in the file.
-
-`Ctrl+s` validates, saves and applies the complete draft. Invalid arrays, environment maps, profile references or adapter choices remain editable and leave active settings untouched. Worktree/profile changes affect the next creation form or launch immediately; only source/discovery changes trigger a project rescan, retaining valid project/worktree selections. Sources can be repositories or parent directories. Removing a source only changes discovery; it never deletes directories, repositories or worktrees. `Esc` returns to the explorer while retaining your draft, including unfinished input. Reopen settings to continue. `D` asks before discarding a draft, and quitting the application also asks before dropping unsaved settings.
-
-If another instance or your editor changes an unrelated setting, Save & Apply keeps that change. Project overrides merge by project and individual field, so edits to another project are preserved. If the same field changed in both places, settings presents the conflict without writing anything: `m` applies your changes to conflicting fields, `e` keeps their external values while saving your nonconflicting edits, and `Esc` leaves the draft editable. If a project/profile was removed externally, keeping your draft restores its full settings. Comments, advanced settings and remembered state are preserved. `S` remains an alias for opening settings; it no longer saves temporary sources implicitly.
-
-```toml
-project_roots = ['C:\Code', 'D:\Projects']
-default_profile = 'copilot'
-
-[profiles.editor]
-program = 'nvim'
-args = ['.']
-cwd = '{worktree}'
-terminal = 'auto'
-
-[[projects]]
-path = 'C:\Code\my-project'
-base = 'origin/develop'
-default_profile = 'editor'
-```
-
-Built-in `copilot`, `editor`, and `terminal` profiles are always available unless overridden. A profile describes a tool, argument array, working directory, optional environment map, and terminal adapter. Relative profile working directories resolve inside the worktree.
-
-The automatic adapter uses Windows Terminal in a new window on Windows, Terminal.app on macOS, and `$TERMINAL` or a detected terminal on Linux. Custom adapters can target another emulator or create a combined layout. Each `{command}` entry expands to the profile's program and its individual arguments; other arguments remain separate.
-
-```toml
-[terminals.my-terminal]
-program = 'my-terminal'
-args = ['--working-directory', '{cwd}', '--', '{command}']
-
-[profiles.custom]
-program = 'my-agent'
-args = ['--project', '{worktree}']
-cwd = '{worktree}'
-terminal = 'my-terminal'
-env = { WORK_BRANCH = '{branch}' }
-```
-
-`{worktree}` and `{branch}` refer to the selection; terminal adapters also accept `{cwd}` for the profile's resolved working directory. Select a shell explicitly as the profile program when you want shell syntax. Tool availability is checked before launch. A successful terminal spawn is reported separately from whatever the tool does afterward.
-
-Worktree paths support `{project_parent}`, `{project_name}`, and `{branch_slug}`. Relative templates resolve against the project. Slashes in a branch name become dashes in its folder name; occupied destinations are refused instead of overwritten.
-
-```toml
-[worktrees]
-path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
-
-[theme]
-accent = '#7dd3fc'
-added = '#86efac'
-deleted = '#fda4af'
-modified = '#fde68a'
-
-[keys]
-'alt+o' = 'profiles'
-'ctrl+n' = 'down'
-```
-
-Key overrides apply in navigation contexts. Action names include `down`, `up`, `first`, `last`, `focus_left`, `focus_right`, `search`, `help`, `back`, `refresh`, `settings`, `save_roots` (settings alias), `create_worktree`, `branches`, `launch`, `profiles`, `stage`, `unstage`, `commit`, `fetch`, `pull`, `push`, `remove_worktree`, `prs`, `review_diff`, `open_pr`, and `toggle_staged`.
-
-## Development and validation
-
-```text
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo build --release --locked
-```
-
-Integration tests use disposable real Git repositories and local bare remotes; they do not push to your projects. They cover non-HEAD worktree bases, publication/upstream setup, staging, rename handling, commits, fast-forward divergence, discovery, cleanup, configuration, input contexts, and rendering at multiple sizes.
-
-The CI workflow runs checks and builds native artifacts on Windows, Linux, and macOS. Local validation has been performed on Windows; live GitHub/Copilot authentication and other OS terminal emulators require testing in their respective environments. Tree Rail serializes mutations while allowing navigation, and reads status/diffs in background workers. File diffs display up to 20,000 lines.
-
-Product scope: [docs/product-spec.md](product-spec.md). Framework research: [docs/research/tui-frameworks.md](research/tui-frameworks.md).
+Migration of a combined document writes state before removing its old state table and preserves the entire original as `config.pre-worktree-refactor.toml`. Existing separate state is authoritative. Malformed files report an error instead of being overwritten. Historical ticket/task records remain recoverable from the backup; the new app has no ticket or task layer.

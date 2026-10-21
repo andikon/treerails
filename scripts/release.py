@@ -62,7 +62,9 @@ def package(target, binary, destination, root=ROOT):
             f"Open a terminal in this directory and run:\n  {command}\n\n"
             "Git must be on PATH. No Rust installation is required.\n"
             "Add this directory to PATH to run treerail from anywhere.\n"
-            "Copilot CLI, Neovim, and GitHub CLI are optional, depending on your profiles.\n"
+            "The compatible Copilot runtime is bundled. Copilot access requires GitHub authentication.\n"
+            "Sign in with GitHub CLI or provide COPILOT_GITHUB_TOKEN for Copilot conversations.\n"
+            "The right pane runs the real Copilot CLI. Ctrl+] returns to Tree Rail navigation.\n"
             "See usage.md and config.example.toml for configuration and keyboard controls.\n"
             "Project: https://github.com/andikon/treerails\n",
             encoding="utf-8",

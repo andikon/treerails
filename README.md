@@ -1,335 +1,49 @@
-<div align="center">
-
 # Tree Rail
 
-**Your projects. Your branches. Room to work in parallel.**
+**Projects. Git worktrees. Agent conversations.**
 
-A native terminal explorer for Git worktrees and agent-assisted development.<br>
-Find a project, choose a starting branch, and open your tools in the right workspace.
+A native Rust terminal application that keeps Copilot beside your worktrees and Git changes. Project tabs share one header; switch between Sessions and Changes without moving the panes. A single status line keeps branch, tracking, checkout path and agent activity in view.
 
-`Rust` · `Ratatui` · `Vim navigation` · `Windows · macOS · Linux`
+![Actual Copilot CLI attached inside Tree Rail](docs/media/copilot-cli.svg)
 
-[Quick start](#quick-start) · [Watch the demo](#see-it-in-action) · [Keyboard controls](#keyboard-controls) · [Configuration](#make-it-yours) · [Usage guide](docs/usage.md)
-
-</div>
-
-![Tree Rail showing four parallel worktrees, colored file status, and an inline Git diff](docs/media/workspace.png)
-
-## One workspace for your work
-
-Each project has three entry points into the same workflow: **Work** (`W`) collects
-local and ticket tasks with attention and recovery first; **Tickets** (`T`) finds
-GitHub issues through saved views; **Worktrees** (`w` from either browser) shows
-physical checkouts. These entry shortcuts also work inside a workspace.
-Tree Rail remembers the last entry point per project; new
-projects start in Tickets. Browsing alone never creates tasks or starts an agent.
-
-Opening a task or worktree reaches a shared workspace: **1 Overview**, **2 Changes**,
-**3 Agent**, **4 Discussion**, **5 Activity**. Stage and commit in Changes, read or
-comment on the linked issue in Discussion, and inspect checkout operations in
-Activity. The branch, checkout and task remain attached as you switch sections.
-
-From an existing worktree, `S` creates a local task with an explicit objective and
-opens agent context review; GitHub is optional. `A` adds another local task.
-Ticket work uses the same hosted sessions and Git actions. Each checkout has one
-managed owner, including while an agent is Ready or needs recovery. External tool
-launches remain separate from managed sessions.
-
-`L` links local work to an already opened GitHub ticket after agents are stopped
-and reconciled. Tasks, conversation identities, objectives and checkout branches
-are retained; conflicting checkout associations are rejected. New ticket-backed
-conversations capture the full fresh discussion, while local conversations capture
-their objective and handoff. Continue resumes the same conversation without
-replaying either document. `Esc` returns to the entry browser.
-
-## Ticket workflow
-
-Enter a project to browse its existing GitHub issues (requires authenticated `gh`).
-The ticket column shows **Active** work above the selected saved view, beside a
-Markdown preview of the issue and its chronological comments. Cards show issue
-state and named labels. Previewing creates no local tasks, checkout or agent;
-Enter explicitly opens the selected ticket's task workspace.
-
-Use `f` for guided filters (state, assignees, All/Any/excluded labels, text scope
-and order), `v` to manage named views, `a` to collapse Active, `R` to refresh and
-`o` to open GitHub. Applied filters and the last selected view persist per GitHub
-repository across clones. Matching pages load automatically; incomplete, stale,
-unavailable and search-limited results are identified. Cached views and discussion
-remain readable offline. Active keeps local in-progress tasks and live/recoverable
-agents reachable independently of filters, including closed issues.
-
-In the browser, `c` composes a persistent per-issue comment draft. `Ctrl+s` reviews
-the exact target, posting account and text; only `y` from review posts. Esc keeps
-the draft, and `Ctrl+d` explicitly discards it in the editor. A lost response stays
-**confirmation unknown** across restart: refresh and inspect candidate comments,
-then explicitly verify success or review a retry. Tree Rail never reposts it
-automatically. While editing, letters and paste belong to the editor.
-
-Inside the ticket workspace, inspect requirements and persisted local tasks.
-Each newly opened issue initially has one task. Press
-`i` to inspect and explicitly import checklist items under a Markdown heading named
-`Tasks`; other headings, acceptance criteria, prose and code fences are excluded.
-Importing the same title again keeps its original task identity. Select a task with
-Enter and use `p` to cycle Pending → In progress → Done manually. PgUp/PgDn scroll
-requirements.
-
-Press `c` to prepare the ticket's shared worktree with an explicit branch, starting
-point, destination and optional fetch, or `a` to adopt a registered worktree. All
-tasks reuse this association. Original checkouts remain identified and protected by
-the existing cleanup rules. A physical checkout cannot belong to another ticket,
-even through another configuration file. This association does not import or
-control externally launched Copilot conversations.
-
-The direct project → worktree workflow remains available: press `w` on a project or
-from ticket navigation, and `T` in the basic workspace to return to tickets. Existing
-launch profiles, Git actions and read-only `--list` discovery are unchanged.
-Use `R` in a selected ticket to refresh GitHub requirements and state. Changes show
-`Issue updated`; `v` opens the previous/current requirements side by side with a
-task merge preview. `m` explicitly adds new task candidates while keeping existing
-identities and progress; `s` approves the displayed requirements as an instruction
-for the selected live task/session. Existing sessions retain their original starting
-briefs. A changed preview must be inspected again before it can be applied or sent.
-
-When GitHub is unavailable, already known tickets stay available with their last
-successful sync time and an explicit stale warning. This does not change Copilot
-health or require a successful issue refresh to reattach to local work. GitHub
-requests time out after 20 seconds; new offline-only tickets are never invented.
-
-A GitHub closure appears as `Ticket closed` while retaining every task's previous
-progress and every conversation's original brief. Press `D` in a ticket to inspect
-cleanup: the shared checkout, managed owner, protection reasons and unpublished
-local commits are shown before deletion. `x` explicitly requests stopping the
-recorded owner; reopen cleanup once its stop has been verified. `y` removes only a
-clean linked-worktree directory, preserving the branch and all workflow records.
-Running or waiting sessions, uncertain/failed stops, dirty directories, locked or
-missing worktrees, and original checkouts prevent cleanup. The basic deletion path
-also respects managed ownership. Removed checkouts remain identified in ticket
-history and are never silently recreated. GitHub issues and pull requests are not
-changed by cleanup.
-
-Ticket records, timestamps, task identities/progress and checkout associations live
-alongside settings in the combined TOML document; edits retain unrelated settings,
-comments and concurrent changes. Ticket preparation is exposed through the public
-`workflow::Workflow` command/event interface for terminal clients and the later
-session host.
-
-### Hosted Copilot sessions
-
-After preparing the shared worktree, `s` continues the selected task or offers its
-first session. `n` creates a separate conversation after you inspect its starting
-brief and optional handoff. New conversation review now captures the complete
-accessible discussion into a retained Markdown document; later comments cannot
-change an approved snapshot. Documents live outside worktrees and survive checkout
-cleanup. Complete-document native delivery is verified on Windows with Copilot
-1.0.94 using its offline mode and a local test provider. Other platforms or CLI
-versions remain gated; existing conversations can still Continue. See
-[discussion delivery status](docs/native-discussion-delivery.md).
-The native Copilot terminal appears inside Tree Rail;
-Enter switches to **AGENT INPUT**, and `Ctrl+]` returns to **NAVIGATION**. The two
-modes have different colors and labels. Escape and Ctrl+C reach Copilot while its
-terminal owns input. Override the return shortcut with a key mapped to
-`agent_navigation` in `[keys]`.
-
-`d` detaches the terminal view, and closing Tree Rail leaves hosted work alive.
-`s` reattaches to the same live process; a stopped conversation resumes its exact
-recorded UUID, without replaying the starting brief. `g` lists retained
-conversations. `x` explicitly stops a session, while `X` stops an empty host.
-`!` explicitly takes terminal control from another UI. A waiting agent still owns
-its checkout; handover and cleanup require a verified stop.
-Use `b` for an inspected handover, `r` to reconcile an interrupted session, and `u`
-to review/retry an unresolved launch using its original request identity. `E` opens
-full host and notification diagnostics.
-
-Running, Needs input and Ready describe agent attention, independently of manual
-task progress. Other hosted tickets remain visible while you type. Lost status
-observation is shown as unavailable, and host interruption requires explicit
-reconciliation rather than automatically restarting agents. Desktop notifications
-are off by default; enable them in settings section **4 Notifications** for input
-requests and session failures. Ready and ordinary output remain quiet.
-
-Native hosted sessions are currently validated on **Windows with Copilot 1.0.94**
-and use its experimental extension interface. The basic worktree workflow remains
-available on Windows, Linux and macOS. See the
-[compatibility evidence](docs/research/copilot-hosting-proof.md) and
-[usage guide](docs/usage.md). The standalone executable also contains the host role;
-it does not require a service installation or a separately downloaded host.
-
-## Built for the next ticket
-
-Feature development and code review often begin with the same steps: find the repository, find the right branch, create a worktree, and open a terminal. Tree Rail puts those steps in one keyboard-driven interface and stays open while you work.
-
-| Your next step | Tree Rail handles |
-| --- | --- |
-| **Find the project** | Load repositories, parent folders, saved roots, or a file of paths. Search once and jump in. |
-| **Choose a workspace** | Select an existing worktree or create one from a local branch, remote branch, tag, or commit. |
-| **Bring your tools** | Launch Copilot, Neovim, a shell, or a custom profile in a new terminal with the worktree as its working directory. |
-| **Keep Git close** | Inspect live changes and diffs, stage files, commit, fetch, pull, and publish branches. |
-| **Prepare a review** | Pick a GitHub PR or enter its number/URL, prepare a review worktree, and inspect its merge-base diff. |
-
-## See it in action
-
-A roughly **24-second walkthrough**: select a project → create a worktree from `origin/develop` → inspect changes → stage and commit → choose a launch profile.
-
-[![Animated walkthrough of Tree Rail's project, worktree, diff, commit, and launch-profile screens](docs/media/demo.gif)](docs/media/demo.mp4)
-
-**[Watch or download the MP4](docs/media/demo.mp4)** · [Open the animated GIF](docs/media/demo.gif)
-
-<sub>The screenshots and scripted demo use Tree Rail's real Ratatui renderer, keyboard handlers, and disposable Git repositories. Demo paths are normalized to <code>C:\Code</code>. The clip ends at profile selection; it does not launch an external agent.</sub>
-
-<details>
-<summary><strong>Explore the screenshots</strong></summary>
-
-| Project discovery | Worktree creation |
-| --- | --- |
-| [![Searchable project explorer with three sample repositories](docs/media/projects.png)](docs/media/projects.png) | [![New worktree form with origin/develop selected as its starting point](docs/media/create-worktree.png)](docs/media/create-worktree.png) |
-
-| Commit form | Launch profiles |
-| --- | --- |
-| [![Commit form with a subject and multiline body](docs/media/commit.png)](docs/media/commit.png) | [![Launch-profile picker offering Copilot, Neovim, and a terminal](docs/media/launch-profiles.png)](docs/media/launch-profiles.png) |
-
-[View the staged-diff screenshot](docs/media/staged-diff.png). Click any image for its full size.
-
-</details>
-
-## Quick start
-
-### Download a prebuilt binary
-
-**[Get the latest release →](https://github.com/andikon/treerails/releases/latest)** No Rust installation or build tools required.
-
-| Your machine | Download |
-| --- | --- |
-| **Windows · Intel/AMD 64-bit** | [Standalone EXE](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.exe) · [ZIP with documentation](https://github.com/andikon/treerails/releases/latest/download/treerail-windows-x86_64.zip) |
-| **Linux · Intel/AMD 64-bit** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-linux-x86_64.tar.gz) · build current version from source below |
-| **macOS · Apple Silicon** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-macos-aarch64.tar.gz) · build current version from source below |
-| **macOS · Intel** | [Older v0.1.0 TAR.GZ](https://github.com/andikon/treerails/releases/download/v0.1.0/treerail-macos-x86_64.tar.gz) · build current version from source below |
-
-**v0.2.0 provides locally built Windows binaries.** Linux/macOS binaries remain at
-v0.1.0; build from current source for the new ticket and agent workflows on those
-platforms. This release uses local validation without cloud builds.
-
-On Windows, download the EXE, rename it to `treerail.exe`, and put it in a folder such as `C:\Tools\TreeRail`. Open a terminal in that folder and run:
+## Run
 
 ```powershell
-.\treerail.exe 'C:\Code'
+cargo run --release -- "C:\Code"
 ```
 
-Add the folder to your user `PATH` to run `treerail` from anywhere. Alternatively, extract the ZIP; it already contains `treerail.exe`, the usage guide, and an example configuration.
-
-On macOS or Linux, extract the archive and run `./treerail ~/code`. Move the executable to a directory on `PATH` for convenient access. Linux downloads are static musl builds. The release includes `SHA256SUMS`; compare a download with `Get-FileHash -Algorithm SHA256` on Windows or `shasum -a 256` on macOS/Linux. Binaries are currently unsigned and macOS builds are not notarized.
-
-Git must be installed on the machine. See the optional tool requirements below.
-
-### Install from a local checkout
-
-With a stable Rust toolchain and Git installed:
-
-```powershell
-cargo install --path . --locked
-treerail 'C:\Code'
-```
-
-Or build and run directly:
-
-```powershell
-cargo build --release --locked
-.\target\release\treerail.exe 'C:\Code'
-```
-
-On Linux and macOS, the built executable is `./target/release/treerail`.
-
-### Point it at your projects
-
-```powershell
-# A repository or the direct parent of several repositories
-treerail 'C:\Code'
-
-# Several roots, including projects on another drive
-treerail 'C:\Code\atlas-api' 'D:\Projects'
-
-# Saved sources and explicit recursive discovery
-treerail --paths-file projects.txt
-treerail --recursive 'C:\Code'
-```
-
-Explicit CLI sources are remembered automatically, so future launches can use just `treerail`. Add `--temporary` for a one-off source, or press **`,`** to manage sources in settings. Direct children are scanned by default; folders containing `.worktrees` are excluded from project discovery and appear under their owning repository instead.
-
-### Requirements
-
-- **Git** on `PATH` for repository operations.
-- **Copilot CLI** for the default agent profile; **Neovim** for the editor profile.
-- **GitHub CLI**, authenticated with `gh auth login`, for PR features.
-- A modern terminal. The automatic launch adapter uses Windows Terminal, Terminal.app on macOS, or a configured/detected Linux terminal.
-
-The terminal-only profile works without Copilot or Neovim. Building on Windows requires the Rust MSVC toolchain and Visual C++ build tools; running the built executable requires no Rust installation.
-
-## From ticket to worktree
-
-1. **Choose a project.** Navigate with `j/k`, search with `/`, and press `Enter`.
-2. **Create your workspace.** Press `a`, name the branch, and use `Ctrl+b` to choose its starting point. Review the directory and press `Ctrl+s`.
-3. **Open your tools.** Press `o` to launch the default profile, or `O` to choose one. Tree Rail stays open.
-4. **Inspect and commit.** Move between panes with `h/l`. Mark files with `Space`, stage with `s`, and press `c` for the commit form.
-5. **Publish and finish.** Press `p` to push or publish under the same branch name. Once the work is finished, `d` removes a clean linked worktree and retains its branch.
-
-Worktrees follow the sibling-directory convention used by Copilot:
+Requires Git and an interactive terminal. Building requires Rust 1.94 or later. The official Copilot Rust SDK bundles its matching native runtime; no Node.js installation or persistent Tree Rail service is required. Copilot access requires a GitHub account with Copilot access. Sign in with `gh auth login`, or provide `COPILOT_GITHUB_TOKEN` (`GH_TOKEN` and `GITHUB_TOKEN` are also supported). Tree Rail forwards the credential to the advertised GitHub resource, using Copilot's encrypted, connection-bound authentication envelope when required. Credentials are never saved in Tree Rail state. `cargo run --example ahp_probe` verifies the real AHP handshake and catalog without creating a session or sending a model prompt.
 
 ```text
-C:\Code\atlas-api
-C:\Code\atlas-api.worktrees\feature-health-checks
-C:\Code\atlas-api.worktrees\review-pr-128
+treerail --list /path/to/projects
+treerail --temporary /path/to/one-off-project
+treerail --config /path/to/config.toml
 ```
 
-Choosing a branch that is already checked out selects its existing worktree. New feature branches publish under their own name, so `feature/health-checks` suggests `origin/feature/health-checks` when no upstream exists.
+Start in the project explorer. Open projects into tabs, choose a worktree, and use the small **+** beside Worktrees or Sessions. Sessions **+** opens a new Copilot conversation directly, ready for input in the CLI. Help → New session with options / new worktree retains the optional combined creation flow. Worktree rows show green additions and red deletions against HEAD, including untracked text files. New worktrees default to the fetched remote default branch; set an explicit starting reference to override it. Push publishes an unpublished branch and sets its upstream automatically.
 
-Pulls use **fast-forward only**. Worktree removal refuses uncommitted changes and protects the original checkout. Local branch deletion is a separate action with Git's normal merge protections.
+Use **?** for Git, conversation and application commands. `Ctrl+P` opens projects, `v` switches views, `Tab` changes panes, and `j/k` navigate. `i` or clicking the right pane focuses the real Copilot CLI. **Ctrl+] returns to Tree Rail navigation**; while focused, Copilot receives its normal keys, including Tab, Esc and Ctrl+C. Close a running project's tab after confirming to hide it without stopping its sessions. Quit confirms stopping owned runtime work; saved conversations resume explicitly.
 
-## Keyboard controls
+## Configuration and state
 
-| Keys | Action |
-| --- | --- |
-| `j/k` · `gg/G` · `Ctrl+u/d` | Move, jump to the first/last item, or move half a page |
-| `h/l` · `Tab` · `Ctrl+w` then `h/j/k/l` | Move between panes |
-| `/` · `n/N` | Search and move between results |
-| `a` · `b` | Create a worktree or open branch actions |
-| `o` · `O` | Launch the default profile or choose another |
-| `Space` · `s/u` · `t` | Mark files, stage/unstage, toggle staged/unstaged diffs |
-| `c` · `f` · `p/P` | Commit, fetch, push/publish, pull |
-| `r` · `v` · `w` | Choose a PR, view its comparison, open it in a browser |
-| `d` · `R` · `,` | Remove a worktree, refresh, open settings |
-| `?` · `Esc` · `q` | Help, close/back, back/quit |
+Windows uses `%LOCALAPPDATA%\treerails\`; Unix uses `$XDG_CONFIG_HOME/treerails/` or `~/.config/treerails/`. Both documents load before the first frame:
 
-Forms receive ordinary text. Use `Tab` to change fields and `Ctrl+s` to submit. Pickers support Vim navigation and `/` to enter a filter. **[Complete keyboard reference →](docs/usage.md#keyboard-controls)**
+- `config.toml`: declared sources, discovery preferences, worktree locations and provider configuration.
+- `state.json`: remembered paths, known projects, tabs, selections, conversation history and drafts.
 
-## Make it yours
+Opening another path updates state, leaving configuration alone. Existing combined documents migrate with a complete `config.pre-worktree-refactor.toml` backup; historical ticket/task data stays in that backup. `--list` never creates, migrates or updates files.
 
-Tree Rail keeps roots, per-project defaults, launch profiles, keybindings, colors, and remembered selections together in **`config.toml`**. Interactive startup creates it automatically at `%LOCALAPPDATA%\treerails\config.toml` on Windows or `~/.config/treerails/config.toml` on Linux and macOS. `--config` selects another combined file.
+See the [example configuration](examples/config.toml), [usage guide](docs/usage.md), [product specification](docs/product-spec.md), and [validation status](docs/testing/worktree-release.md). Earlier ticket-workflow documents are historical and superseded by ADRs [0010](docs/adr/0010-separate-configuration-from-remembered-state.md) and [0011](docs/adr/0011-return-to-worktrees-with-native-ahp-conversations.md).
 
-Explicit project sources are remembered automatically; add `--temporary` for a one-off launch. Press `,` to manage sources, discovery, worktree defaults and launch profiles in the TUI, then `Ctrl+s` to Save & Apply. Drafts survive navigation, and conflicting external edits prompt for a choice.
+## The real Copilot CLI over AHP
 
-```toml
-project_roots = ['C:\Code', 'D:\Projects']
-default_profile = 'copilot'
+The right pane runs the actual Copilot CLI in a child terminal, using Windows ConPTY or a Unix PTY. Copilot owns the live conversation, menus, attachments, permissions and keyboard behavior. Tree Rail handles resizing and keeps each opened terminal alive while switching views. Closing a terminal disconnects that frontend; it does not cancel the agent turn. Tree Rail keeps read-only cached history when no terminal is open.
 
-[profiles.editor]
-program = 'nvim'
-args = ['.']
-cwd = '{worktree}'
-terminal = 'auto'
+The CLI attaches to the same AHP session observed by Tree Rail, rather than creating a second conversation. Copilot's official SDK owns the temporary runtime and authenticated listener; use Help → AHP connection details to inspect its private endpoint. The CLI's AHP client is experimental and requires a compatible version. The bundled full CLI is the default; `[agent].cli` overrides the frontend separately from `[agent].runtime`, the SDK backend. Tree Rail enables the AHP client feature and GitHub authentication sharing for a trusted loopback or TLS host. Connection secrets stay out of command arguments and saved state.
 
-[[projects]]
-path = 'C:\Code\atlas-api'
-base = 'origin/develop'
-default_profile = 'editor'
-```
+An external AHP host can be configured explicitly. Interoperability depends on its protocol and provider support. Windows checks cover native CLI rendering, typing and resizing, plus discovery of the same idle session by VS Code. A real model conversation and interactive VS Code handoff remain release checks. Use Tree Rail's rails to switch worktrees; Copilot's own session navigation is independent of Tree Rail's launch association. Terminal graphics and clipboard escape extensions are not implemented.
 
-Start with **[examples/config.toml](examples/config.toml)**, then run:
-
-```powershell
-Copy-Item '.\examples\config.toml' '.\treerail.toml'
-treerail --config '.\treerail.toml'
-```
-
-Press `?` to see the active configuration path. On first use of the new default location, Tree Rail imports legacy settings and `state.json` without changing the originals. Custom profiles can run another agent, editor, shell, or terminal layout. **[Configuration, upgrades, profiles, and key overrides →](docs/usage.md#configuration)**
+Copilot asks before trusting a new checkout; Cancel preserves the unsent prompt. Its native AHP host also limits filesystem access to its launch workspace. Tree Rail derives that workspace from remembered project sources and configured worktree locations. `[agent].host_directory` overrides it explicitly. After adding a project outside the current host scope, restart Tree Rail before starting a conversation there.
 
 ## Development
 
@@ -337,11 +51,7 @@ Press `?` to see the active configuration path. On first use of the new default 
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-cargo build --release --locked
+cargo run --example capture_demo
 ```
 
-Tests cover real disposable repositories and local remotes, worktree creation from non-HEAD bases, staging and commits, upstream publication, safe cleanup, input modes, and responsive terminal layouts. CI checks and builds Windows, Linux, and macOS artifacts. Pushing a matching version tag automatically publishes prebuilt downloads to GitHub Releases after every platform passes. **[Release instructions →](docs/releasing.md)**
-
-**Validation status:** Windows builds and terminal smoke checks have run locally. macOS/Linux terminal adapters and live authenticated GitHub/Copilot workflows still need environment-specific validation.
-
-[Product specification](docs/product-spec.md) · [Full usage guide](docs/usage.md) · [Framework research](docs/research/tui-frameworks.md) · [Recreate the screenshots and demo](docs/media/README.md)
+Tests use disposable repositories, real child terminals and a deterministic local AHP host. They cover remote-default fetching, publication, cleanup protections, storage migration, checkout leases, terminal rendering/input/lifetime and stable TUI layout. No model prompts are sent by the test suite. Published downloads are available on the [GitHub releases page](https://github.com/andikon/treerails/releases).

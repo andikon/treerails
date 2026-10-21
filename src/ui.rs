@@ -1,4 +1,7 @@
-use crate::app::{App, Modal, PickerKind};
+use crate::{
+    agent::{Attention, Conversation},
+    app::{Action, App, Confirm, FieldType, FormKind, Hit, Modal, Pane, View},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -6,535 +9,1007 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
-mod browser_view;
-mod comment_view;
-mod hosted_view;
-mod legend;
-mod workspace_view;
 
-fn color(value: &str, fallback: Color) -> Color {
-    value.parse().unwrap_or(fallback)
-}
-fn accent(app: &App) -> Color {
-    color(&app.config.theme.accent, Color::Cyan)
-}
-fn border<'a>(title: impl Into<Line<'a>>, active: bool, app: &App) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(if active { accent(app) } else { Color::DarkGray }))
-}
-pub fn draw(frame: &mut Frame, app: &App) {
+const BG: Color = Color::Rgb(17, 22, 28);
+const SURFACE: Color = Color::Rgb(23, 32, 41);
+const DIM: Color = Color::Rgb(28, 39, 49);
+const FG: Color = Color::Rgb(220, 229, 231);
+const MUTED: Color = Color::Rgb(157, 174, 184);
+const LINE: Color = Color::Rgb(58, 75, 88);
+const ACCENT: Color = Color::Rgb(109, 203, 217);
+const SELECTED: Color = Color::Rgb(35, 63, 74);
+const GREEN: Color = Color::Rgb(142, 210, 163);
+const YELLOW: Color = Color::Rgb(242, 205, 127);
+const RED: Color = Color::Rgb(241, 155, 157);
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.hits.clear();
+    app.terminal_area = Rect::default();
     let area = frame.area();
+    frame.render_widget(Block::new().style(Style::default().bg(BG).fg(FG)), area);
+    if area.width < 60 || area.height < 16 {
+        frame.render_widget(Paragraph::new("Tree Rail\n\nEnlarge the terminal to at least 60 columns × 16 rows.\nYour conversations and Git operations keep running.").wrap(Wrap{trim:false}).style(Style::default().fg(MUTED)),area);
+        return;
+    }
     let rows = Layout::vertical([
-        Constraint::Length(if app.latest_operation.is_some() { 4 } else { 2 }),
-        Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
-    let location = app
-        .project
-        .as_ref()
-        .map(|p| format!(" / {}", p.name))
-        .unwrap_or_else(|| " / projects".into());
+    header(frame, app, rows[0]);
+    let columns = Layout::horizontal([
+        Constraint::Percentage(22),
+        Constraint::Percentage(22),
+        Constraint::Fill(1),
+    ])
+    .split(rows[1]);
+    worktrees(frame, app, columns[0]);
+    middle(frame, app, columns[1]);
+    detail(frame, app, columns[2]);
+    statusline(frame, app, rows[2]);
+    if let Some(modal) = app.modal.clone() {
+        app.hits.clear();
+        overlay(frame, app, area, modal);
+    }
+}
+fn style(color: Color) -> Style {
+    Style::default().fg(color)
+}
+fn hit(app: &mut App, rect: Rect, action: Action) {
+    if rect.width > 0 && rect.height > 0 {
+        app.hits.push(Hit { rect, action });
+    }
+}
+fn label(
+    frame: &mut Frame,
+    app: &mut App,
+    rect: Rect,
+    text: impl Into<String>,
+    color: Color,
+    action: Action,
+) {
+    frame.render_widget(Paragraph::new(text.into()).style(style(color)), rect);
+    hit(app, rect, action);
+}
+fn fit(text: &str, width: usize) -> String {
+    let clean = plain(text);
+    let text = clean.as_str();
+    if text.width() <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        used += w;
+        result.push(c);
+    }
+    result.push('…');
+    result
+}
+fn header(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " TREE RAIL ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(accent(app))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(location, Style::default().fg(Color::White)),
-            Span::styled(app.project.as_ref().map(|project| { let rows=crate::work::rows_with_attention(&app.state.workflow,&project.path,&app.hosted.summaries); let active=rows.iter().filter(|row|row.active).count(); let attention=rows.iter().filter(|row|row.rank==0).count(); format!("  W Work {active} active / {attention} attention  T Tickets  w Worktrees") }).unwrap_or_default(),Style::default().fg(Color::Cyan)),
-            Span::styled(
-                if app.busy { "   RUNNING" } else { "" },
-                Style::default().fg(Color::Yellow),
-            ),
-        ])),
-        rows[0],
+        Block::new()
+            .borders(Borders::BOTTOM)
+            .border_style(style(LINE))
+            .style(Style::default().bg(SURFACE)),
+        area,
     );
-    if let Some(record) = &app.latest_operation {
-        let path = record.target.display().to_string();
-        let length = rows[0].width.saturating_sub(2) as usize;
-        let path = if path.chars().count() > length {
+    let right = area.right().saturating_sub(24);
+    let mut x = area.x;
+    let current = app.selected_tab;
+    // Keep the selected project reachable even when many tabs are open.
+    let tabs = app
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let active = app
+                .state
+                .conversations
+                .iter()
+                .filter(|c| {
+                    crate::config::same_path(&c.project, &t.project.path) && c.attention.busy()
+                })
+                .count();
+            (i, t.project.name.clone(), active)
+        })
+        .collect::<Vec<_>>();
+    let total = tabs
+        .iter()
+        .map(|(_, name, active)| name.width() + if *active > 0 { 7 } else { 4 })
+        .sum::<usize>();
+    let start = if total > right.saturating_sub(x) as usize {
+        current
+    } else {
+        0
+    };
+    for (i, name, active) in tabs.into_iter().skip(start) {
+        let width = (name.width() + if active > 0 { 7 } else { 4 }).min(32) as u16;
+        if x + width > right.saturating_sub(2) {
+            break;
+        }
+        let rect = Rect::new(x, area.y, width, 1);
+        let selected = i == current;
+        frame.render_widget(
+            Block::new().style(Style::default().bg(if selected { SELECTED } else { SURFACE })),
+            rect,
+        );
+        let text = if active > 0 {
             format!(
-                "…{}",
-                path.chars()
-                    .rev()
-                    .take(length.saturating_sub(1))
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
+                " {} ●{}",
+                fit(&name, width.saturating_sub(7) as usize),
+                active
             )
         } else {
-            path
+            format!(" {}", fit(&name, width.saturating_sub(4) as usize))
         };
-        let summary = format!("{}\n{}", record.headline(), path);
-        let status = if record.progress.is_empty() {
-            summary
-        } else {
-            format!("{}\n{}", summary, record.progress)
-        };
-        frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(
-                if record.result.as_ref().is_some_and(Result::is_err) {
-                    Color::Red
-                } else {
-                    Color::Yellow
-                },
-            )),
-            Rect::new(
-                rows[0].x,
-                rows[0].y.saturating_add(1),
-                rows[0].width,
-                rows[0].height.saturating_sub(1),
-            ),
-        );
-    }
-    if app.latest_operation.is_none() {
-        hosted_view::attention(
+        label(
             frame,
             app,
-            Rect::new(rows[0].x, rows[0].y.saturating_add(1), rows[0].width, 1),
+            Rect::new(x, area.y, width.saturating_sub(2), 1),
+            text,
+            if selected { ACCENT } else { FG },
+            Action::Tab(i),
         );
+        label(
+            frame,
+            app,
+            Rect::new(x + width - 2, area.y, 2, 1),
+            "× ",
+            MUTED,
+            Action::Close(i),
+        );
+        x += width;
     }
-    if app.settings_open {
-        settings_view(frame, app, rows[1]);
-    } else if app.project.is_none() {
-        projects(frame, app, rows[1]);
-    } else if app.workspace_open {
-        workspace_view::draw(frame, app, rows[1]);
-    } else if app.work_mode {
-        workspace_view::work(frame, app, rows[1]);
-    } else if app.ticket_mode {
-        tickets(frame, app, rows[1]);
-    } else {
-        workspace(frame, app, rows[1]);
-    }
-    let prompt = if app.searching {
-        format!("/{}", app.filter)
-    } else if !app.filter.is_empty() {
-        format!("filter: {} · Esc clears", app.filter)
-    } else {
-        app.notice.clone()
-    };
-    frame.render_widget(
-        Paragraph::new(prompt)
-            .style(Style::default().fg(if app.error && !app.searching {
-                color(&app.config.theme.deleted, Color::Red)
-            } else {
-                Color::Gray
-            }))
-            .wrap(Wrap { trim: false }),
-        rows[2],
+    label(
+        frame,
+        app,
+        Rect::new(x.min(right), area.y, 2, 1),
+        " +",
+        MUTED,
+        Action::Projects,
     );
-    let hints = legend::footer(app, rows[3].width);
-    let footer_color = if app.hosted.input && app.hosted.dialog.is_none() {
-        color(&app.config.theme.modified, Color::Yellow)
-    } else {
-        accent(app)
-    };
-    frame.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(Color::Black).bg(footer_color)),
-        rows[3],
+    let changes = app.tab().is_some_and(|t| t.view == View::Changes);
+    let session = Rect::new(right, area.y, 10, 1);
+    let files = Rect::new(right + 10, area.y, 10, 1);
+    for (rect, selected, text, view) in [
+        (session, !changes, " Sessions ", View::Sessions),
+        (files, changes, " Changes ", View::Changes),
+    ] {
+        frame.render_widget(
+            Paragraph::new(text).style(
+                Style::default()
+                    .bg(if selected { SELECTED } else { SURFACE })
+                    .fg(if selected { ACCENT } else { FG }),
+            ),
+            rect,
+        );
+        hit(app, rect, Action::Switch(view));
+    }
+    label(
+        frame,
+        app,
+        Rect::new(area.right() - 3, area.y, 3, 1),
+        " ? ",
+        MUTED,
+        Action::Help,
     );
-    if app.comment_editor.is_some() {
-        comment_view::draw(frame, app);
-    }
-    if let Some(modal) = &app.modal {
-        let history =
-            matches!(modal, Modal::Picker(picker) if matches!(picker.kind, PickerKind::Operations));
-        let area = if history || matches!(modal, Modal::OperationDetails) {
-            Rect::new(
-                area.x,
-                rows[0].bottom(),
-                area.width,
-                area.bottom().saturating_sub(rows[0].bottom()),
-            )
-        } else {
-            area
-        };
-        modal_view(frame, app, modal, area);
-    }
-    hosted_view::dialog(frame, app, area);
 }
-fn settings_view(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(draft) = &app.settings else {
+fn pane(frame: &mut Frame, area: Rect, title: &str, focused: bool) -> Rect {
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::RIGHT)
+            .border_style(style(LINE)),
+        area,
+    );
+    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let head = Rect::new(inner.x, inner.y, inner.width, 2);
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::BOTTOM)
+            .border_style(style(if focused { ACCENT } else { LINE })),
+        head,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {title}")).style(style(if focused { ACCENT } else { FG })),
+        Rect::new(head.x, head.y, head.width, 1),
+    );
+    Rect::new(
+        inner.x,
+        inner.y + 2,
+        inner.width,
+        inner.height.saturating_sub(2),
+    )
+}
+fn worktrees(frame: &mut Frame, app: &mut App, area: Rect) {
+    let body = pane(frame, area, "Worktrees", app.pane == Pane::Worktrees);
+    label(
+        frame,
+        app,
+        Rect::new(body.right().saturating_sub(2), area.y, 2, 1),
+        "+ ",
+        MUTED,
+        Action::NewTree,
+    );
+    let Some(tab) = app.tab() else {
+        frame.render_widget(
+            Paragraph::new("\n Choose a project\n from the explorer").style(style(MUTED)),
+            body,
+        );
         return;
     };
-    let block = border(
-        format!(
-            " Settings · {} ",
-            if draft.dirty() {
-                "Unsaved draft"
-            } else {
-                "Saved"
-            }
-        ),
-        true,
-        app,
-    );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(3),
-    ])
-    .split(inner);
-    let introduction = draft
-        .input
-        .as_ref()
-        .map(|editor| format!("{}\nConfig: {}", editor.title, app.config_path.display()))
-        .unwrap_or_else(|| format!("Config: {}", app.config_path.display()));
-    frame.render_widget(
-        Paragraph::new(introduction).wrap(Wrap { trim: false }),
-        rows[0],
-    );
-    let sections = [
-        crate::settings::Section::Sources,
-        crate::settings::Section::Worktrees,
-        crate::settings::Section::Profiles,
-        crate::settings::Section::Notifications,
-    ];
-    frame.render_widget(
-        Paragraph::new(Line::from(
-            sections
-                .iter()
-                .enumerate()
-                .map(|(index, section)| {
-                    Span::styled(
-                        format!(" {} {} ", index + 1, section.title()),
-                        if *section == draft.section {
-                            Style::default().fg(Color::Black).bg(accent(app))
-                        } else {
-                            Style::default().fg(Color::Gray)
-                        },
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )),
-        rows[1],
-    );
-    if let Some(editor) = &draft.input {
-        let visible = (rows[2].height as usize / 3).max(1);
-        let start = editor.active.saturating_sub(visible - 1);
-        for (position, (index, field)) in editor
-            .fields
+    let selected = tab.selected;
+    let trees = tab.trees.clone();
+    let page = (body.height as usize / 4).max(1);
+    let start = selected.saturating_sub(page - 1);
+    for (i, tree) in trees.iter().enumerate().skip(start).take(page) {
+        let y = body.y + ((i - start) * 4) as u16;
+        let rect = Rect::new(
+            body.x,
+            y,
+            body.width,
+            4.min(body.bottom().saturating_sub(y)),
+        );
+        let active = app
+            .state
+            .conversations
             .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .enumerate()
-        {
-            let rect = Rect::new(
-                rows[2].x,
-                rows[2].y + (position * 3) as u16,
-                rows[2].width,
-                3.min(rows[2].height.saturating_sub((position * 3) as u16)),
-            );
-            let active = index == editor.active;
-            let block = border(
-                format!(" {}/{} · {} ", index + 1, editor.fields.len(), field.label),
-                active,
-                app,
-            );
-            let inner = block.inner(rect);
-            let column = field.value[..field.cursor].width();
-            let offset = if active {
-                column.saturating_sub(inner.width.saturating_sub(1) as usize)
+            .find(|c| crate::config::same_path(&c.worktree, &tree.path) && c.attention.busy());
+        let name = if tree.original {
+            tree.branch.clone()
+        } else {
+            tree.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into()
+        };
+        let count = app
+            .state
+            .conversations
+            .iter()
+            .filter(|c| crate::config::same_path(&c.worktree, &tree.path) && !c.archived)
+            .count();
+        let files = app
+            .snapshots
+            .get(&tree.path)
+            .map(|s| {
+                if s.files.is_empty() {
+                    "clean".into()
+                } else {
+                    format!("{} files", s.files.len())
+                }
+            })
+            .unwrap_or_else(|| {
+                if tree.prunable {
+                    "history only".into()
+                } else {
+                    "…".into()
+                }
+            });
+        let description = if tree.prunable {
+            "Removed checkout".into()
+        } else if tree.original {
+            "Original checkout".into()
+        } else {
+            format!("{count} conversations")
+        };
+        let text = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {}", fit(&name, body.width.saturating_sub(4) as usize)),
+                    style(FG).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if let Some(c) = active {
+                        if c.attention == Attention::NeedsInput {
+                            " !"
+                        } else {
+                            " ●"
+                        }
+                    } else {
+                        ""
+                    },
+                    style(
+                        if active.is_some_and(|c| c.attention == Attention::NeedsInput) {
+                            YELLOW
+                        } else {
+                            GREEN
+                        },
+                    ),
+                ),
+            ]),
+            Line::styled(
+                format!(
+                    " {}",
+                    fit(&tree.branch, body.width.saturating_sub(2) as usize)
+                ),
+                style(MUTED),
+            ),
+            Line::styled(
+                format!(
+                    " {}",
+                    fit(
+                        &format!("{description} · {files}"),
+                        body.width.saturating_sub(2) as usize
+                    )
+                ),
+                style(MUTED),
+            ),
+            Line::from(
+                app.snapshots
+                    .get(&tree.path)
+                    .map(|s| {
+                        vec![
+                            Span::styled(format!(" +{}", s.additions), style(GREEN)),
+                            Span::styled(format!(" -{}", s.deletions), style(RED)),
+                        ]
+                    })
+                    .unwrap_or_default(),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().bg(if i == selected {
+                SELECTED
             } else {
-                0
+                BG
+            })),
+            rect,
+        );
+        hit(app, rect, Action::Tree(i));
+    }
+}
+fn middle(frame: &mut Frame, app: &mut App, area: Rect) {
+    let changes = app.tab().is_some_and(|t| t.view == View::Changes);
+    let body = pane(
+        frame,
+        area,
+        if changes { "Changes" } else { "Sessions" },
+        app.pane == Pane::List,
+    );
+    if changes {
+        let files = app.snapshot().map(|s| s.files.clone()).unwrap_or_default();
+        let selected = app.tab().map_or(0, |t| t.file);
+        let page = (body.height as usize / 3).max(1);
+        let start = selected.saturating_sub(page - 1);
+        for (i, file) in files.iter().enumerate().skip(start).take(page) {
+            let y = body.y + ((i - start) * 3) as u16;
+            let rect = Rect::new(
+                body.x,
+                y,
+                body.width,
+                3.min(body.bottom().saturating_sub(y)),
+            );
+            let mark = if app.marked.contains(&file.path) {
+                "×"
+            } else {
+                " "
             };
+            let state = if file.untracked {
+                "Untracked"
+            } else if file.staged() && file.unstaged() {
+                "Staged + unstaged"
+            } else if file.staged() {
+                "Staged"
+            } else {
+                "Unstaged"
+            };
+            let text = vec![
+                Line::styled(
+                    format!(" [{mark}] {} {state}", file.code()),
+                    style(if file.untracked { GREEN } else { YELLOW }),
+                ),
+                Line::from(format!(
+                    " {}",
+                    fit(
+                        &file.path.to_string_lossy(),
+                        body.width.saturating_sub(2) as usize
+                    )
+                )),
+            ];
             frame.render_widget(
-                Paragraph::new(field.value.as_str())
-                    .scroll((0, offset.min(u16::MAX as usize) as u16))
-                    .block(block),
+                Paragraph::new(text).style(Style::default().bg(if i == selected {
+                    SELECTED
+                } else {
+                    BG
+                })),
                 rect,
             );
-            if active && inner.width > 0 && inner.height > 0 {
-                frame.set_cursor_position((inner.x + (column - offset) as u16, inner.y));
-            }
+            hit(app, rect, Action::File(i));
+        }
+        if files.is_empty() {
+            frame.render_widget(
+                Paragraph::new("\n No changed files").style(style(MUTED)),
+                body,
+            );
         }
     } else {
-        let items = draft
-            .rows()
-            .into_iter()
-            .map(ListItem::new)
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(draft.cursor));
-        frame.render_stateful_widget(
-            List::new(items)
-                .highlight_symbol("▸ ")
-                .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
-            rows[2],
-            &mut state,
+        label(
+            frame,
+            app,
+            Rect::new(body.right().saturating_sub(2), area.y, 2, 1),
+            "+ ",
+            MUTED,
+            Action::NewSession,
         );
-    }
-    let message = match &draft.mode {
-        crate::settings::Mode::Edit => draft.message.clone(),
-        crate::settings::Mode::Discard { quit } => format!(
-            "Discard unsaved settings{}? y discard · any other key keep editing",
-            if *quit { " and quit" } else { "" }
-        ),
-        crate::settings::Mode::Conflict(fields) => {
-            let fields = fields
-                .iter()
-                .map(|field| {
-                    let Some((path, setting)) = field
-                        .strip_prefix("projects.")
-                        .and_then(|field| field.rsplit_once('.'))
-                    else {
-                        return field.clone();
-                    };
-                    let name = std::path::Path::new(path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    let name = if name.chars().count() > 24 {
-                        format!("{}…", name.chars().take(23).collect::<String>())
+        let sessions = app.sessions().into_iter().cloned().collect::<Vec<_>>();
+        let current = app.tab().and_then(|t| t.conversation.clone());
+        let selected = sessions
+            .iter()
+            .position(|s| Some(&s.id) == current.as_ref())
+            .unwrap_or(0);
+        let page = (body.height as usize / 3).max(1);
+        let start = selected.saturating_sub(page - 1);
+        for (i, session) in sessions.iter().enumerate().skip(start).take(page) {
+            let y = body.y + ((i - start) * 3) as u16;
+            let rect = Rect::new(
+                body.x,
+                y,
+                body.width,
+                3.min(body.bottom().saturating_sub(y)),
+            );
+            let color = attention_color(session.attention);
+            let text = vec![
+                Line::styled(
+                    format!(
+                        " {}",
+                        fit(&session.title, body.width.saturating_sub(2) as usize)
+                    ),
+                    style(FG).add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    format!(
+                        " {} {}{}",
+                        attention_icon(session.attention),
+                        session.attention.label(),
+                        if session.archived { " · archived" } else { "" }
+                    ),
+                    style(color),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().bg(
+                    if Some(&session.id) == current.as_ref() {
+                        SELECTED
                     } else {
-                        name.into_owned()
-                    };
-                    format!("{setting} ({name})")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let choices = if rows[3].width >= 64 {
-                "m use my changes · e keep external changes · Esc continue editing"
-            } else {
-                "m mine · e external · Esc edit"
-            };
-            format!("{choices}\nChanged elsewhere: {fields}")
+                        BG
+                    },
+                )),
+                rect,
+            );
+            hit(app, rect, Action::Session(session.id.clone()));
         }
-    };
-    frame.render_widget(
-        Paragraph::new(message)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(if draft.error {
-                Color::Red
-            } else {
-                Color::Yellow
-            })),
-        rows[3],
-    );
-}
-fn projects(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .visible_projects()
-        .iter()
-        .map(|p| {
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!(" {}", p.name),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!(" {}", p.path.display()),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
-    if items.is_empty() {
-        frame.render_widget(Paragraph::new("\n  No projects found.\n\n  Pass a repository or its parent directory:\n  treerail \"C:\\Code\"\n\n  R reloads sources; ? opens help.").block(border(" Projects ",true,app)),area);
-        return;
+        if sessions.is_empty() {
+            frame.render_widget(
+                Paragraph::new("\n No conversations yet\n\n Use + to start one")
+                    .style(style(MUTED)),
+                body,
+            );
+        }
     }
-    let mut state = ListState::default().with_selected(Some(app.project_cursor));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(border(
-                format!(" Projects · {} ", app.projects.len()),
-                true,
-                app,
-            ))
-            .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58)))
-            .highlight_symbol("▸ "),
-        area,
-        &mut state,
-    );
 }
-fn workspace(frame: &mut Frame, app: &App, area: Rect) {
-    let panes = if app.workspace_open {
-        let columns = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(area);
-        vec![Rect::default(), columns[0], columns[1]]
-    } else if area.width >= 110 {
-        Layout::horizontal([
-            Constraint::Percentage(29),
-            Constraint::Percentage(28),
-            Constraint::Percentage(43),
-        ])
-        .split(area)
-        .to_vec()
+fn detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    let changes = app.tab().is_some_and(|t| t.view == View::Changes);
+    let heading = if changes {
+        app.selected_file()
+            .map(|f| {
+                format!(
+                    "{} · {}",
+                    f.path.display(),
+                    if app.diff_staged {
+                        "staged"
+                    } else {
+                        "unstaged"
+                    }
+                )
+            })
+            .unwrap_or("Changes".into())
     } else {
-        vec![area; 3]
+        format!(
+            "Copilot CLI / {}",
+            app.conversation()
+                .map(|c| c.title.as_str())
+                .unwrap_or("New conversation")
+        )
     };
-    if !app.workspace_open && (area.width >= 110 || app.focus == 0) {
-        let items: Vec<ListItem> = app
-            .visible_trees()
-            .iter()
-            .map(|w| {
-                let (a, m, d) = app
-                    .snapshots
-                    .get(&w.path)
-                    .map(|s| s.counts())
-                    .unwrap_or_default();
-                let mut title = vec![Span::styled(
-                    format!(" {}", w.branch),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )];
-                if w.original {
-                    title.push(Span::styled(
-                        " [original]",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                if w.locked {
-                    title.push(Span::styled(
-                        " [locked]",
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-                if w.prunable {
-                    title.push(Span::styled(" [missing]", Style::default().fg(Color::Red)));
-                }
-                let counts = Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("+{a} "),
-                        Style::default().fg(color(&app.config.theme.added, Color::Green)),
-                    ),
-                    Span::styled(
-                        format!("~{m} "),
-                        Style::default().fg(color(&app.config.theme.modified, Color::Yellow)),
-                    ),
-                    Span::styled(
-                        format!("-{d}"),
-                        Style::default().fg(color(&app.config.theme.deleted, Color::Red)),
-                    ),
-                ]);
-                ListItem::new(vec![
-                    Line::from(title),
-                    counts,
-                    Line::from(Span::styled(
-                        format!(" {}", w.path.display()),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ])
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(Some(app.tree));
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(border(" 1 · Worktrees ", app.focus == 0, app))
-                .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58)))
-                .highlight_symbol("▸ "),
-            panes[0],
-            &mut state,
-        );
-    }
-    if app.workspace_open || area.width >= 110 || app.focus == 1 {
-        let items: Vec<ListItem> = app
-            .visible_files()
-            .iter()
-            .map(|file| {
-                let fg = match file.code() {
-                    '+' => color(&app.config.theme.added, Color::Green),
-                    '-' => color(&app.config.theme.deleted, Color::Red),
-                    _ => color(&app.config.theme.modified, Color::Yellow),
-                };
-                let mark = if app.marked.contains(&file.path) {
-                    "●"
-                } else {
-                    " "
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!("{mark} ")),
-                    Span::styled(format!("{} ", file.code()), Style::default().fg(fg)),
-                    Span::styled(
-                        format!("{}{} ", file.index, file.work),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(file.path.display().to_string()),
-                ]))
-            })
-            .collect();
-        let status = app
-            .snapshot()
-            .map(|s| format!("↑{} ↓{}", s.ahead, s.behind))
-            .unwrap_or_default();
-        let mut state = ListState::default().with_selected(Some(app.file));
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(border(
-                    format!(" 2 · Files · {status} "),
-                    app.focus == 1,
-                    app,
-                ))
-                .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58)))
-                .highlight_symbol("▸ "),
-            panes[1],
-            &mut state,
-        );
-    }
-    if app.workspace_open || area.width >= 110 || app.focus == 2 {
-        let lines: Vec<Line> = app
+    let body = pane(
+        frame,
+        area,
+        &fit(&heading, area.width.saturating_sub(5) as usize),
+        app.pane == Pane::Detail,
+    );
+    if changes {
+        let lines = app
             .diff
             .lines()
-            .skip(app.diff_scroll)
-            .take(panes[2].height.saturating_sub(2) as usize)
-            .map(|line| {
-                let fg = if line.starts_with("@@") {
-                    accent(app)
-                } else if line.starts_with('+') {
-                    color(&app.config.theme.added, Color::Green)
-                } else if line.starts_with('-') {
-                    color(&app.config.theme.deleted, Color::Red)
-                } else if line.starts_with("diff ") {
-                    Color::White
+            .map(|text| {
+                let color = if text.starts_with('+') && !text.starts_with("+++") {
+                    GREEN
+                } else if text.starts_with('-') && !text.starts_with("---") {
+                    RED
+                } else if text.starts_with("@@") {
+                    ACCENT
                 } else {
-                    Color::Gray
+                    FG
                 };
-                Line::from(Span::styled(line.to_owned(), Style::default().fg(fg)))
+                Line::styled(plain(text), style(color))
             })
-            .collect();
-        let label = if app.pr_diff {
-            "PR comparison"
-        } else if app.staged {
-            "staged"
-        } else {
-            "unstaged"
-        };
-        let lines = if lines.is_empty() {
-            vec![
-                Line::from(""),
-                Line::from(" Select a changed file."),
-                Line::from(" t switches staged/unstaged."),
-                Line::from(" v shows the PR comparison."),
-            ]
-        } else {
-            lines
-        };
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(lines).block(border(
-                format!(" 3 · Diff · {label} "),
-                app.focus == 2,
-                app,
-            )),
-            panes[2],
+            Paragraph::new(lines)
+                .scroll((app.diff_scroll, 0))
+                .wrap(Wrap { trim: false }),
+            body,
         );
+        hit(app, body, Action::Scroll(0));
+        return;
+    }
+    app.terminal_area = body;
+    if let Some(session) = app.conversation().cloned() {
+        if let Some(terminal) = app.terminals.get_mut(&session.id) {
+            terminal.resize(body.height, body.width);
+            frame.render_widget(crate::cli_terminal::TerminalWidget(terminal.screen()), body);
+            if !terminal.started && terminal.exit.is_none() {
+                frame.render_widget(
+                    Paragraph::new("Starting Copilot CLI…").style(style(MUTED)),
+                    body,
+                );
+            }
+            if app.cli_focused
+                && app.modal.is_none()
+                && terminal.running()
+                && !terminal.screen().hide_cursor()
+            {
+                let (row, col) = terminal.screen().cursor_position();
+                if row < body.height && col < body.width {
+                    frame.set_cursor_position((body.x + col, body.y + row));
+                }
+            }
+            if let Some(exit) = &terminal.exit {
+                frame.render_widget(
+                    Paragraph::new(format!("{exit} · Resume to reopen")).style(style(MUTED)),
+                    Rect::new(body.x, body.bottom().saturating_sub(1), body.width, 1),
+                );
+            }
+            hit(app, body, Action::FocusTerminal);
+            label(
+                frame,
+                app,
+                Rect::new(area.right().saturating_sub(3), area.y, 2, 1),
+                "× ",
+                MUTED,
+                Action::CloseTerminal,
+            );
+            return;
+        }
+        if session.chat_uri.is_none()
+            && session.attention == Attention::Running
+            && !session.creation_failed
+            && session.error.is_none()
+        {
+            frame.render_widget(
+                Paragraph::new("Starting Copilot CLI…").style(style(MUTED)),
+                body,
+            );
+            return;
+        }
+        let mut lines = conversation_lines(&session, app.expanded);
+        if let Some(error) = &session.error {
+            lines.push(Line::styled(plain(error), style(RED)));
+        }
+        if lines.is_empty() {
+            lines.push(Line::styled(
+                "Saved conversation · open Copilot CLI to continue",
+                style(MUTED),
+            ));
+        }
+        let content = Rect::new(body.x, body.y, body.width, body.height.saturating_sub(2));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((app.transcript_scroll, 0)),
+            content,
+        );
+        if session.worktree.is_dir() {
+            label(
+                frame,
+                app,
+                Rect::new(
+                    body.x + 1,
+                    body.bottom().saturating_sub(1),
+                    body.width.saturating_sub(2),
+                    1,
+                ),
+                if session.creation_failed {
+                    "[ Retry session creation ]"
+                } else {
+                    "[ Open Copilot CLI ]"
+                },
+                ACCENT,
+                if session.creation_failed {
+                    Action::Retry
+                } else {
+                    Action::Resume
+                },
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new("Checkout missing · saved history is read-only").style(style(MUTED)),
+                Rect::new(body.x, body.bottom().saturating_sub(1), body.width, 1),
+            );
+        }
+    } else {
+        frame.render_widget(Paragraph::new("\n Start a session with +.\n\n The real Copilot CLI runs here, beside your worktrees and Git changes.").style(style(MUTED)).wrap(Wrap{trim:false}),body);
     }
 }
+pub fn conversation_lines(session: &Conversation, expanded: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(chat) = &session.chat else {
+        return lines;
+    };
+    for turn in &chat.turns {
+        append_turn(
+            &mut lines,
+            &turn.message.text,
+            &turn.response_parts,
+            expanded,
+        );
+    }
+    if let Some(turn) = &chat.active_turn {
+        append_turn(
+            &mut lines,
+            &turn.message.text,
+            &turn.response_parts,
+            expanded,
+        );
+    }
+    lines
+}
+fn append_turn(
+    lines: &mut Vec<Line<'static>>,
+    prompt: &str,
+    parts: &[ahp_types::state::ResponsePart],
+    expanded: bool,
+) {
+    lines.push(Line::styled("YOU", style(ACCENT)));
+    markdown(lines, prompt);
+    lines.push(Line::from(""));
+    lines.push(Line::styled("COPILOT", style(ACCENT)));
+    for part in parts {
+        let value = serde_json::to_value(part).unwrap_or(Value::Null);
+        match part {
+            ahp_types::state::ResponsePart::Markdown(text) => markdown(lines, &text.content),
+            ahp_types::state::ResponsePart::Reasoning(_) => {
+                lines.push(Line::styled(
+                    if expanded {
+                        "▾ Reasoning"
+                    } else {
+                        "▸ Reasoning"
+                    },
+                    style(MUTED),
+                ));
+                if expanded {
+                    markdown(lines, value["content"].as_str().unwrap_or(""));
+                }
+            }
+            ahp_types::state::ResponsePart::ToolCall(_) => {
+                let tool = &value["toolCall"];
+                let name = tool["displayName"].as_str().unwrap_or("Tool");
+                let status = tool["status"].as_str().unwrap_or("working");
+                lines.push(Line::styled(
+                    format!("{} {name} · {status}", if expanded { "▾" } else { "▸" }),
+                    style(if status.contains("confirmation") {
+                        YELLOW
+                    } else {
+                        MUTED
+                    }),
+                ));
+                if expanded {
+                    if let Some(input) = tool["input"].as_str() {
+                        markdown(lines, input);
+                    }
+                    if let Some(result) = tool.get("result") {
+                        markdown(
+                            lines,
+                            &serde_json::to_string_pretty(result).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+            ahp_types::state::ResponsePart::InputRequest(_) => {
+                lines.push(Line::styled(
+                    "! Copilot needs an answer · open Help → Respond",
+                    style(YELLOW),
+                ));
+                if expanded {
+                    markdown(
+                        lines,
+                        &serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    );
+                }
+            }
+            ahp_types::state::ResponsePart::Error(_) => markdown(
+                lines,
+                &format!(
+                    "Error: {}",
+                    value["error"]["message"].as_str().unwrap_or("Agent error")
+                ),
+            ),
+            _ => {
+                if expanded {
+                    markdown(
+                        lines,
+                        &serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+    lines.push(Line::from(""));
+}
+fn markdown(lines: &mut Vec<Line<'static>>, content: &str) {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let clean = plain(content);
+    let mut spans = vec![];
+    let (mut code, mut bold, mut italic, mut heading) = (false, false, false, false);
+    fn flush(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>) {
+        if !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(spans)));
+        }
+    }
+    for event in Parser::new(&clean) {
+        match event {
+            Event::Start(Tag::CodeBlock(language)) => {
+                flush(lines, &mut spans);
+                if let pulldown_cmark::CodeBlockKind::Fenced(lang) = language
+                    && !lang.is_empty()
+                {
+                    lines.push(Line::styled(format!("  {lang}"), style(MUTED)));
+                }
+                code = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                flush(lines, &mut spans);
+                code = false;
+            }
+            Event::Start(Tag::Strong) => bold = true,
+            Event::End(TagEnd::Strong) => bold = false,
+            Event::Start(Tag::Emphasis) => italic = true,
+            Event::End(TagEnd::Emphasis) => italic = false,
+            Event::Start(Tag::Heading { .. }) => {
+                flush(lines, &mut spans);
+                heading = true;
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                flush(lines, &mut spans);
+                heading = false;
+            }
+            Event::Start(Tag::Item) => {
+                flush(lines, &mut spans);
+                spans.push(Span::styled(" • ", style(MUTED)));
+            }
+            Event::Text(text) | Event::Code(text) => {
+                let mut text_style = style(if code {
+                    GREEN
+                } else if heading {
+                    ACCENT
+                } else {
+                    FG
+                });
+                if bold || heading {
+                    text_style = text_style.add_modifier(Modifier::BOLD);
+                }
+                if italic {
+                    text_style = text_style.add_modifier(Modifier::ITALIC);
+                }
+                for (i, line) in text.split('\n').enumerate() {
+                    if i > 0 {
+                        flush(lines, &mut spans);
+                    }
+                    spans.push(Span::styled(line.to_owned(), text_style));
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => flush(lines, &mut spans),
+            Event::End(TagEnd::Paragraph | TagEnd::Item) => {
+                flush(lines, &mut spans);
+                lines.push(Line::from(""));
+            }
+            Event::Rule => {
+                flush(lines, &mut spans);
+                lines.push(Line::styled("────────", style(LINE)));
+            }
+            _ => {}
+        }
+    }
+    flush(lines, &mut spans);
+}
+fn plain(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect::<String>()
+        .replace('\t', "    ")
+}
+fn statusline(frame: &mut Frame, app: &mut App, area: Rect) {
+    let tree = app.tree().cloned();
+    let snapshot = app.snapshot();
+    let branch = tree
+        .as_ref()
+        .map(|t| {
+            if t.branch.is_empty() {
+                "HEAD"
+            } else {
+                &t.branch
+            }
+        })
+        .unwrap_or("Tree Rail");
+    let tracking = if let Some(s) = snapshot {
+        if s.upstream.is_some() {
+            format!("↑{} ↓{}", s.ahead, s.behind)
+        } else {
+            "unpublished".into()
+        }
+    } else if tree.as_ref().is_some_and(|t| t.prunable) {
+        "missing".into()
+    } else {
+        "Git".into()
+    };
+    let activity = tree
+        .as_ref()
+        .and_then(|t| {
+            app.state
+                .conversations
+                .iter()
+                .find(|c| crate::config::same_path(&c.worktree, &t.path) && c.attention.busy())
+        })
+        .map(|c| c.attention);
+    let all_running = app
+        .state
+        .conversations
+        .iter()
+        .filter(|c| c.attention == Attention::Running)
+        .count();
+    let all_input = app
+        .state
+        .conversations
+        .iter()
+        .filter(|c| c.attention == Attention::NeedsInput)
+        .count();
+    let width = area.width;
+    let columns = Layout::horizontal([
+        Constraint::Length((branch.width() as u16 + 3).min(width / 4)),
+        Constraint::Length((tracking.width() as u16 + 3).min(width / 5)),
+        Constraint::Fill(1),
+        Constraint::Length(if width >= 130 { 9 } else { 0 }),
+        Constraint::Length(if width >= 110 { 9 } else { 3 }),
+        Constraint::Length(7),
+        Constraint::Length(if width >= 120 { 10 } else { 2 }),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {}",
+            fit(branch, columns[0].width.saturating_sub(2) as usize)
+        ))
+        .style(
+            Style::default()
+                .bg(ACCENT)
+                .fg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {tracking} ›")).style(Style::default().bg(SELECTED).fg(FG)),
+        columns[1],
+    );
+    let context = if let Some((path, action)) = &app.mutation {
+        format!("{action} · {}", path.display())
+    } else if let Some((message, _, _)) = &app.notice {
+        message.clone()
+    } else {
+        tree.as_ref()
+            .map(|t| t.path.display().to_string())
+            .unwrap_or_else(|| app.config_path.display().to_string())
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {}",
+            fit(&context, columns[2].width.saturating_sub(1) as usize)
+        ))
+        .style(Style::default().bg(DIM).fg(
+            if app.notice.as_ref().is_some_and(|(_, error, _)| *error) {
+                RED
+            } else {
+                MUTED
+            },
+        )),
+        columns[2],
+    );
+    hit(
+        app,
+        columns[2],
+        if app.notice.is_some() {
+            Action::Details
+        } else {
+            Action::WorktreeInfo
+        },
+    );
+    if let Some(tree) = tree {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " {}",
+                tree.head.chars().take(7).collect::<String>()
+            ))
+            .style(Style::default().bg(DIM).fg(MUTED)),
+            columns[3],
+        );
+    }
+    let label = if let Some(attention) = activity {
+        if width >= 110 {
+            format!(
+                " {} {}",
+                attention_icon(attention),
+                if attention == Attention::NeedsInput {
+                    "Input"
+                } else {
+                    "Active"
+                }
+            )
+        } else {
+            format!(" {}", attention_icon(attention))
+        }
+    } else if width >= 110 {
+        " ○ Ready".into()
+    } else {
+        " ○".into()
+    };
+    frame.render_widget(
+        Paragraph::new(label).style(
+            Style::default()
+                .bg(DIM)
+                .fg(activity.map(attention_color).unwrap_or(MUTED)),
+        ),
+        columns[4],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" ●{all_running} !{all_input}")).style(
+            Style::default()
+                .bg(DIM)
+                .fg(if all_input > 0 { YELLOW } else { GREEN }),
+        ),
+        columns[5],
+    );
+    hit(app, columns[5], Action::Activity);
+    let provider = if width >= 120 {
+        if app.connected {
+            " Copilot ✓"
+        } else {
+            " Copilot ○"
+        }
+    } else if app.connected {
+        " ✓"
+    } else {
+        " ○"
+    };
+    frame.render_widget(
+        Paragraph::new(provider).style(Style::default().bg(SURFACE).fg(MUTED)),
+        columns[6],
+    );
+    hit(app, columns[6], Action::Host);
+}
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(2));
     Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -542,400 +1017,535 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         height,
     )
 }
-fn modal_view(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
+fn modal_frame(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .border_style(style(ACCENT))
+        .style(Style::default().bg(SURFACE).fg(FG));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
     match modal {
-        Modal::Cleanup(preview) => cleanup_preview(frame, app, preview, area),
-        Modal::Requirements(review) => requirements_review(frame, app, review, area),
-        Modal::OperationDetails => {
-            let Some(record) = app.inspected_operation() else {
-                return;
-            };
-            let rect = centered(area, 112, area.height);
-            frame.render_widget(Clear, rect);
-            let block = border(
-                format!(" Operation #{} · G follow output · H history ", record.id),
-                true,
-                app,
-            );
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-            let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(inner);
+        Modal::Projects { query, selected } => {
+            let projects = app.visible_projects(&query.value);
+            let rect = centered(area, 82, 22);
+            let inner = modal_frame(frame, rect, "Projects");
             frame.render_widget(
-                Paragraph::new(format!(
-                    "{}\nProject: {} · Target: {}\n{}",
-                    record.headline(),
-                    record
-                        .project
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    record
-                        .target
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    if record.truncated {
-                        "Earlier output discarded (64 KiB limit)."
-                    } else {
-                        "Output retained for this UI session only"
-                    }
-                )),
-                rows[0],
+                Paragraph::new(format!(" Search: {}▌", query.value)).style(style(ACCENT)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
             );
-            let visible = rows[1].height as usize;
-            let lines = record.details_lines(rows[1].width as usize);
-            let count = lines.len();
-            let start = app.operation_scroll.min(count.saturating_sub(visible));
-            frame.render_widget(
-                Paragraph::new(lines.into_iter().skip(start).collect::<Vec<_>>().join("\n")),
-                rows[1],
+            let body = Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(4),
             );
-        }
-        Modal::Help => {
-            let help = legend::help(app, area.width.min(104).saturating_sub(2));
-            let rect = centered(area, 104, (help.lines().count() + 2) as u16);
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(help)
-                    .block(border(" Tree Rail · actions · ? close ", true, app))
-                    .wrap(Wrap { trim: false }),
-                rect,
-            );
-        }
-        Modal::Confirm(message, _) => {
-            let rect = centered(area, 85, 11);
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "\n{message}\n\nEnter / y confirm    Esc / n cancel"
-                ))
-                .wrap(Wrap { trim: false })
-                .block(border(" Confirm ", true, app)),
-                rect,
-            );
-        }
-        Modal::Picker(picker) => {
-            let history = matches!(picker.kind, PickerKind::Operations);
-            let rect = centered(area, 100, if history { area.height } else { 24 });
-            frame.render_widget(Clear, rect);
-            let block = border(format!(" {} ", picker.title), true, app);
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-            let rows = Layout::vertical([
-                Constraint::Length(if history { 4 } else { 2 }),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-            let mut prompt = format!(
-                " /{}  [{}]",
-                picker.query,
-                if picker.editing { "filter" } else { "navigate" }
-            );
-            if history {
-                prompt.push_str(&format!(
-                    "\n Session only · {} retained · {} older discarded\n {}",
-                    app.operation_records().len(),
-                    app.history_evicted,
-                    if app.latest_operation.is_none() {
-                        "No Git operations yet. Run an action to see its result here."
-                    } else {
-                        "Up to 20 results; the inspected result stays available."
-                    }
-                ));
-            }
-            frame.render_widget(
-                Paragraph::new(prompt).style(Style::default().fg(accent(app))),
-                rows[0],
-            );
-            let items: Vec<ListItem> = picker
-                .visible()
-                .iter()
-                .map(|e| ListItem::new(e.0.clone()))
-                .collect();
-            let mut state = ListState::default().with_selected(Some(picker.selected));
-            frame.render_stateful_widget(
-                List::new(items)
-                    .highlight_symbol("▸ ")
-                    .highlight_style(Style::default().bg(Color::Rgb(28, 43, 58))),
-                rows[1],
-                &mut state,
-            );
-            let hint = legend::picker_hint(&picker.kind);
-            frame.render_widget(
-                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-                rows[2],
-            );
-        }
-        Modal::Form(form) => {
-            let height = 5 + form
-                .fields
-                .iter()
-                .map(|f| if f.multiline { 8 } else { 3 })
-                .sum::<u16>();
-            let rect = centered(area, 96, height);
-            frame.render_widget(Clear, rect);
-            let block = border(format!(" {} ", form.title), true, app);
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-            let mut constraints: Vec<Constraint> = form
-                .fields
-                .iter()
-                .map(|f| Constraint::Length(if f.multiline { 8 } else { 3 }))
-                .collect();
-            constraints.push(Constraint::Min(1));
-            let rows = Layout::vertical(constraints).split(inner);
-            for (index, field) in form.fields.iter().enumerate() {
-                let active = index == form.active;
-                let block = border(format!(" {} ", field.label), active, app);
-                let text_rect = block.inner(rows[index]);
-                let before = &field.value[..field.cursor];
-                let row = before.bytes().filter(|b| *b == b'\n').count();
-                let column = before.rsplit('\n').next().unwrap_or("").width();
-                let sy = row.saturating_sub(text_rect.height.saturating_sub(1) as usize);
-                let sx = column.saturating_sub(text_rect.width.saturating_sub(1) as usize);
+            let page = (body.height as usize / 3).max(1);
+            let start = selected.saturating_sub(page - 1);
+            for (pos, index) in projects.iter().enumerate().skip(start).take(page) {
+                let project = &app.projects[*index];
+                let y = body.y + ((pos - start) * 3) as u16;
+                let rect = Rect::new(body.x, y, body.width, 2);
                 frame.render_widget(
-                    Paragraph::new(field.value.as_str())
-                        .scroll((
-                            sy.min(u16::MAX as usize) as u16,
-                            sx.min(u16::MAX as usize) as u16,
-                        ))
-                        .block(block),
-                    rows[index],
+                    Paragraph::new(vec![
+                        Line::from(format!(" {}", project.name)),
+                        Line::styled(
+                            format!(
+                                " {}",
+                                fit(
+                                    &project.path.to_string_lossy(),
+                                    body.width.saturating_sub(2) as usize
+                                )
+                            ),
+                            style(MUTED),
+                        ),
+                    ])
+                    .style(Style::default().bg(if pos == selected {
+                        SELECTED
+                    } else {
+                        SURFACE
+                    })),
+                    rect,
                 );
-                if active && text_rect.width > 0 && text_rect.height > 0 {
-                    frame.set_cursor_position((
-                        text_rect.x + (column - sx) as u16,
-                        text_rect.y + (row - sy) as u16,
-                    ));
+                hit(app, rect, Action::Project(*index));
+            }
+            if projects.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(" No projects found. Add a repository or discovery folder.")
+                        .wrap(Wrap { trim: false })
+                        .style(style(MUTED)),
+                    body,
+                );
+            }
+            label(
+                frame,
+                app,
+                Rect::new(inner.x, inner.bottom() - 1, inner.width / 2, 1),
+                " + Remember a path",
+                ACCENT,
+                Action::Git("add-path"),
+            );
+            label(
+                frame,
+                app,
+                Rect::new(
+                    inner.x + inner.width / 2,
+                    inner.bottom() - 1,
+                    inner.width / 2,
+                    1,
+                ),
+                "Close",
+                MUTED,
+                Action::Cancel,
+            );
+        }
+        Modal::Help(selected) => {
+            let actions = app.help_actions();
+            let rect = centered(area, 78, actions.len() as u16 + 6);
+            let inner = modal_frame(frame, rect, "Help & actions");
+            let busy = app.tree().is_some_and(|t| app.busy(&t.path));
+            let hint = if busy {
+                " Agent active · Git writes paused"
+            } else {
+                " Commands apply to the selected worktree"
+            };
+            frame.render_widget(
+                Paragraph::new(hint).style(style(if busy { YELLOW } else { MUTED })),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let list = Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(4),
+            );
+            let start = selected.saturating_sub(list.height.saturating_sub(1) as usize);
+            for (i, (text, key, action)) in actions
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .take(list.height as usize)
+            {
+                let rect = Rect::new(list.x, list.y + (i - start) as u16, list.width, 1);
+                let disabled = matches!(
+                    action,
+                    Action::Git("stage" | "unstage" | "commit" | "pull" | "push" | "remove")
+                ) && busy;
+                let pad = (list.width as usize).saturating_sub(text.width() + key.width() + 3);
+                frame.render_widget(
+                    Paragraph::new(format!(" {text}{}{key}", " ".repeat(pad))).style(
+                        Style::default()
+                            .bg(if i == selected { SELECTED } else { SURFACE })
+                            .fg(if disabled { LINE } else { FG }),
+                    ),
+                    rect,
+                );
+                if !disabled {
+                    hit(app, rect, action);
                 }
             }
             frame.render_widget(
-                Paragraph::new(legend::form_hint(form)).style(Style::default().fg(Color::DarkGray)),
-                rows[form.fields.len()],
+                Paragraph::new(" Tab focus · Enter execute · Esc close").style(style(MUTED)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
             );
         }
-    }
-}
-
-fn tickets(frame: &mut Frame, app: &App, area: Rect) {
-    let area = if app.hosted.terminal.is_some() {
-        let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(area);
-        hosted_view::terminal(frame, app, panes[1]);
-        panes[0]
-    } else {
-        area
-    };
-    if app.ticket.is_none() {
-        browser_view::draw(frame, app, area);
-        return;
-    }
-    if let Some(ticket) = &app.ticket {
-        let rows = Layout::vertical([
-            Constraint::Length(6),
-            Constraint::Percentage(45),
-            Constraint::Min(3),
-        ])
-        .split(area);
-        let checkout = ticket
-            .worktree
-            .as_ref()
-            .map(|wt| {
-                format!(
-                    "{} · {}{}",
-                    wt.branch,
-                    wt.path.display(),
-                    if ticket.checkout_removed_at.is_some() {
-                        " [directory removed; branch retained]"
-                    } else if !wt.path.is_dir() {
-                        " [checkout missing]"
-                    } else if wt.original {
-                        " [original checkout]"
+        Modal::Form(form) => {
+            let visible = form.visible();
+            let height = visible
+                .iter()
+                .map(|i| {
+                    if matches!(form.fields[*i].kind, FieldType::Toggle) {
+                        2
+                    } else if matches!(form.fields[*i].kind, FieldType::Multiline) {
+                        5
                     } else {
-                        ""
+                        3
                     }
-                )
-            })
-            .unwrap_or_else(|| "No shared worktree · c create or a adopt".into());
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} #{} · {} [{}]{}{}\n{}\nLast sync Unix {} · {}\n{}",
-                ticket.repository,
-                ticket.issue.number,
-                ticket.issue.title,
-                ticket.issue.state,
-                if ticket.is_closed() {
-                    " · Ticket closed"
+                })
+                .sum::<u16>()
+                + 6;
+            let rect = centered(area, 82, height);
+            let inner = modal_frame(frame, rect, &form.title);
+            let bottom = inner.bottom().saturating_sub(3);
+            let mut y = inner.y;
+            // Start at the focused field on terminals too short for the form.
+            let total = height.saturating_sub(6);
+            let available = bottom.saturating_sub(y);
+            let start = if total > available {
+                visible.iter().position(|i| *i == form.focused).unwrap_or(0)
+            } else {
+                0
+            };
+            for index in visible.into_iter().skip(start) {
+                let field = &form.fields[index];
+                let toggle = matches!(field.kind, FieldType::Toggle);
+                let lines = if toggle {
+                    2
+                } else if matches!(field.kind, FieldType::Multiline) {
+                    5
                 } else {
-                    ""
-                },
-                if ticket.issue_updated() {
-                    " · Issue updated · v inspect"
-                } else {
-                    ""
-                },
-                ticket.issue.url,
-                ticket.fetched_at,
-                checkout,
-                ticket
-                    .github_error
-                    .as_deref()
-                    .unwrap_or("GitHub issue cache · provider health is reported separately")
-            ))
-            .wrap(Wrap { trim: false })
-            .block(border(" Ticket overview ", true, app)),
-            rows[0],
-        );
-        frame.render_widget(
-            Paragraph::new(ticket.issue.body.clone())
-                .scroll((app.ticket_scroll, 0))
-                .wrap(Wrap { trim: false })
-                .block(border(" GitHub requirements ", false, app)),
-            rows[1],
-        );
-        let items: Vec<ListItem> = ticket
-            .tasks
-            .iter()
-            .map(|task| {
-                ListItem::new(format!(
-                    "{} {} · {:?} · {}{}",
-                    if ticket.selected_task.as_ref() == Some(&task.id) {
-                        "●"
+                    3
+                };
+                if y + lines > bottom {
+                    break;
+                }
+                let focused = form.focused == index;
+                let color = if focused { ACCENT } else { MUTED };
+                if toggle {
+                    let mark = if field.input.value == "yes" {
+                        "×"
                     } else {
                         " "
-                    },
-                    task.id,
-                    task.progress,
-                    task.title,
-                    if ticket.is_closed() {
-                        " · Ticket closed"
+                    };
+                    label(
+                        frame,
+                        app,
+                        Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
+                        format!("[{mark}] {}", field.label),
+                        color,
+                        Action::Field(index),
+                    );
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(fit(&field.label, inner.width.saturating_sub(2) as usize))
+                            .style(style(color)),
+                        Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
+                    );
+                    let input =
+                        Rect::new(inner.x + 1, y + 1, inner.width.saturating_sub(2), lines - 2);
+                    let shown = if field.input.value.is_empty() {
+                        "…".to_owned()
                     } else {
-                        ""
+                        field.input.value.clone()
+                    };
+                    frame.render_widget(
+                        Paragraph::new(plain(&shown))
+                            .wrap(Wrap { trim: false })
+                            .style(
+                                Style::default()
+                                    .bg(if focused { SELECTED } else { DIM })
+                                    .fg(FG),
+                            ),
+                        input,
+                    );
+                    hit(app, input, Action::Field(index));
+                    if focused {
+                        let before = &field.input.value[..field.input.cursor];
+                        let col = before.lines().last().unwrap_or("").width() as u16;
+                        let row = before.chars().filter(|c| *c == '\n').count() as u16;
+                        frame.set_cursor_position((
+                            input.x + col.min(input.width.saturating_sub(1)),
+                            input.y + row.min(input.height.saturating_sub(1)),
+                        ));
                     }
-                ))
-            })
-            .collect();
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(border(" Tasks ", true, app))
-                .highlight_style(Style::default().bg(Color::DarkGray)),
-            rows[2],
-            &mut ListState::default().with_selected(Some(app.task_cursor)),
-        );
-    } else {
-        let items: Vec<ListItem> = app
-            .issues
-            .iter()
-            .map(|issue| {
-                ListItem::new(format!(
-                    "#{} [{}] {}",
-                    issue.number, issue.state, issue.title
-                ))
-            })
-            .collect();
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(border(
-                    if app.issue_warning.is_empty() {
-                        " GitHub tickets "
-                    } else {
-                        " Cached GitHub tickets · stale "
-                    },
-                    true,
+                }
+                y += lines;
+            }
+            if form.kind == FormKind::Session {
+                label(
+                    frame,
                     app,
-                ))
-                .highlight_style(Style::default().bg(Color::DarkGray)),
-            area,
-            &mut ListState::default().with_selected(Some(app.issue_cursor)),
-        );
-    }
-}
-
-fn requirements_review(
-    frame: &mut Frame,
-    app: &App,
-    review: &crate::workflow::RequirementsReview,
-    area: Rect,
-) {
-    frame.render_widget(Clear, area);
-    let block = border(" Issue requirements ", true, app);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
-    let columns =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{}\n\n{}",
-            review.previous.title, review.previous.body
-        ))
-        .scroll((app.ticket_scroll, 0))
-        .wrap(Wrap { trim: false })
-        .block(border(" Previously reviewed requirements ", false, app)),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new(review.instructions())
-            .scroll((app.ticket_scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(border(
-                " Current requirements · exact text sent by s ",
-                true,
+                    Rect::new(inner.x + 1, bottom, inner.width.saturating_sub(2), 1),
+                    if form.advanced {
+                        "▾ Provider options"
+                    } else {
+                        "▸ Provider options"
+                    },
+                    MUTED,
+                    Action::ToggleAdvanced,
+                );
+            }
+            let row = inner.bottom() - 1;
+            label(
+                frame,
                 app,
-            )),
-        columns[1],
-    );
-    frame.render_widget(Paragraph::new(format!("Task merge preview: retain {} local tasks with their IDs, progress and sessions; add: {}\nm apply task additions explicitly · s send displayed revision to selected live task/session\nExisting sessions keep their original starting briefs. No conversation is created by this action.", review.retained_tasks.len(), if review.additions.is_empty() { "none".into() } else { review.additions.join(", ") })).wrap(Wrap {trim:false}), rows[1]);
-}
-
-fn cleanup_preview(
-    frame: &mut Frame,
-    app: &App,
-    preview: &crate::workflow::CleanupPreview,
-    area: Rect,
-) {
-    frame.render_widget(Clear, area);
-    let block = border(" Ticket worktree cleanup ", true, app);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let mut lines = vec![format!("{} · {}", preview.checkout.branch, preview.checkout.path.display()),
-        "This removes the checkout directory only. Branch, tasks, progress, starting briefs and conversation records are retained.".into()];
-    if let Some(owner) = &preview.owner {
-        lines.push(format!("Managed owner: {} · {:?} · task {}. Running and Needs input both retain ownership. x explicitly stop session, then reopen cleanup.", owner.id, owner.health, owner.task));
-    }
-    if let Some(warning) = &preview.ownership_warning {
-        lines.push(format!(
-            "Physical checkout ownership unavailable: {warning}"
-        ));
-    }
-    for (blocked, reason) in [
-        (preview.original, "Original checkout is protected"),
-        (preview.dirty, "Uncommitted changes: cleanup refused"),
-        (preview.locked, "Worktree is locked; repair with Git first"),
-        (
-            preview.missing,
-            "Checkout missing or no longer registered; records retained",
-        ),
-        (
-            preview.already_removed,
-            "Directory was already removed; records retained",
-        ),
-    ] {
-        if blocked {
-            lines.push(reason.into());
+                Rect::new(inner.right().saturating_sub(26), row, 12, 1),
+                "[ Cancel ]",
+                MUTED,
+                Action::Cancel,
+            );
+            label(
+                frame,
+                app,
+                Rect::new(inner.right().saturating_sub(14), row, 14, 1),
+                "[ Continue ]",
+                ACCENT,
+                Action::Confirm,
+            );
+        }
+        Modal::Confirm(kind) => {
+            let (title, message) = match &kind {
+                Confirm::Trust { .. } => ("Trust folder for Copilot?", ""),
+                Confirm::Close(_) => (
+                    "Close project tab?",
+                    "Its sessions are currently running. Close the tab and keep them running? Reopen the project through agent activity.",
+                ),
+                Confirm::Quit => (
+                    "Quit Tree Rail?",
+                    "Stop Tree Rail-owned agent work and exit? Conversations stay saved. No agent will restart automatically next time.",
+                ),
+                Confirm::Remove => (
+                    "Remove worktree?",
+                    "Remove this clean linked checkout and keep its branch? Saved conversations remain readable. The directory will not be recreated automatically.",
+                ),
+            };
+            let message = match &kind {
+                Confirm::Trust { path, .. } => format!(
+                    "{}\n\nAllow Copilot to load this folder's instructions, hooks and tools? Saves this exact folder in Copilot's trusted folders. Cancel keeps your prompt unsent.",
+                    path.display()
+                ),
+                _ => message.to_owned(),
+            };
+            let rect = if matches!(kind, Confirm::Trust { .. }) {
+                centered(area, 80, 14)
+            } else {
+                centered(area, 68, 10)
+            };
+            let inner = modal_frame(frame, rect, title);
+            frame.render_widget(
+                Paragraph::new(message).wrap(Wrap { trim: false }),
+                Rect::new(
+                    inner.x + 1,
+                    inner.y + 1,
+                    inner.width.saturating_sub(2),
+                    inner.height.saturating_sub(3),
+                ),
+            );
+            label(
+                frame,
+                app,
+                Rect::new(inner.right() - 28, inner.bottom() - 1, 13, 1),
+                "[ Cancel ]",
+                if app.confirm_yes { MUTED } else { ACCENT },
+                Action::Cancel,
+            );
+            label(
+                frame,
+                app,
+                Rect::new(inner.right() - 15, inner.bottom() - 1, 15, 1),
+                "[ Confirm ]",
+                if app.confirm_yes { YELLOW } else { MUTED },
+                Action::Confirm,
+            );
+        }
+        Modal::Activity(selected) => {
+            let rect = centered(area, 76, 18);
+            let inner = modal_frame(frame, rect, "Agent activity");
+            let items = app
+                .state
+                .conversations
+                .iter()
+                .filter(|c| c.attention.busy())
+                .map(|c| {
+                    ListItem::new(format!(
+                        "{} · {} · {}",
+                        c.project.file_name().unwrap_or_default().to_string_lossy(),
+                        c.title,
+                        c.attention.label()
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mut state = ListState::default().with_selected(Some(selected));
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(Style::default().bg(SELECTED)),
+                inner,
+                &mut state,
+            );
+        }
+        Modal::Host => {
+            let rect = centered(area, 88, 13);
+            let inner = modal_frame(frame, rect, "AHP connection · private");
+            let text = if let Some(url) = &app.connection_url {
+                format!(
+                    "Use this authenticated endpoint in another AHP client.\nThe token grants access to this host; keep it private.\n\n{url}\n\nTree Rail-owned hosts stop when Tree Rail exits.\nExternal hosts remain owned by their original application."
+                )
+            } else {
+                "Copilot is not connected. Start a session or Refresh to connect.\n\nThe official pinned runtime is used by default.\nSet [agent].runtime or [agent].endpoint in config.toml to override.".into()
+            };
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .style(style(MUTED)),
+                inner,
+            );
+        }
+        Modal::Approval(request) => {
+            let rect = centered(area, 88, 24);
+            let inner = modal_frame(frame, rect, "Copilot · approval required");
+            let worktree = app
+                .conversation()
+                .map(|c| c.worktree.display().to_string())
+                .unwrap_or_default();
+            let tool = &request["toolCall"];
+            let text = format!(
+                "{}\n{}\n\n{}",
+                tool["displayName"].as_str().unwrap_or("Tool request"),
+                worktree,
+                serde_json::to_string_pretty(tool).unwrap_or_default()
+            );
+            let options = tool["options"].as_array();
+            let option_count = options.map_or(2, Vec::len).min(9) as u16;
+            frame.render_widget(
+                Paragraph::new(text).wrap(Wrap { trim: false }),
+                Rect::new(
+                    inner.x + 1,
+                    inner.y,
+                    inner.width.saturating_sub(2),
+                    inner.height.saturating_sub(option_count + 1),
+                ),
+            );
+            let y = inner.bottom().saturating_sub(option_count);
+            if let Some(options) = options {
+                for (i, option) in options.iter().take(9).enumerate() {
+                    let approved = option["kind"] == "approve";
+                    label(
+                        frame,
+                        app,
+                        Rect::new(inner.x + 1, y + i as u16, inner.width.saturating_sub(2), 1),
+                        format!(
+                            "[{}] {}",
+                            i + 1,
+                            option["label"].as_str().unwrap_or("Choose")
+                        ),
+                        if approved { YELLOW } else { MUTED },
+                        Action::Approve(approved, option["id"].as_str().map(str::to_owned)),
+                    );
+                }
+            } else {
+                label(
+                    frame,
+                    app,
+                    Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
+                    "[y] Allow once",
+                    YELLOW,
+                    Action::Approve(true, None),
+                );
+                label(
+                    frame,
+                    app,
+                    Rect::new(inner.x + 1, y + 1, inner.width.saturating_sub(2), 1),
+                    "[n] Deny",
+                    MUTED,
+                    Action::Approve(false, None),
+                );
+            }
+        }
+        Modal::Completions { items, selected } => {
+            let rect = centered(area, 76, items.len().min(12) as u16 + 4);
+            let inner = modal_frame(frame, rect, "Copilot completions");
+            let start = selected.saturating_sub(inner.height.saturating_sub(1) as usize);
+            for (i, item) in items
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(inner.height as usize)
+            {
+                let label_text = item["attachment"]["label"]
+                    .as_str()
+                    .or_else(|| item["insertText"].as_str())
+                    .unwrap_or("Completion");
+                let rect = Rect::new(inner.x, inner.y + (i - start) as u16, inner.width, 1);
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        " {}",
+                        fit(label_text, inner.width.saturating_sub(2) as usize)
+                    ))
+                    .style(
+                        Style::default()
+                            .bg(if i == selected { SELECTED } else { SURFACE })
+                            .fg(FG),
+                    ),
+                    rect,
+                );
+                hit(app, rect, Action::Completion(i));
+            }
+        }
+        Modal::Sources(selected) => {
+            let rect = centered(area, 88, 18);
+            let inner = modal_frame(frame, rect, "Remembered locations");
+            frame.render_widget(
+                Paragraph::new(" Forget removes the remembered entry and keeps the directory.")
+                    .style(style(MUTED)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let start = selected.saturating_sub(inner.height.saturating_sub(5) as usize);
+            let paths = app.state.remembered_sources.clone();
+            for (i, path) in paths
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(inner.height.saturating_sub(4) as usize)
+            {
+                let row = Rect::new(inner.x, inner.y + 2 + (i - start) as u16, inner.width, 1);
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        " {}",
+                        fit(
+                            &path.display().to_string(),
+                            inner.width.saturating_sub(5) as usize
+                        )
+                    ))
+                    .style(
+                        Style::default()
+                            .bg(if i == selected { SELECTED } else { SURFACE })
+                            .fg(FG),
+                    ),
+                    row,
+                );
+                label(
+                    frame,
+                    app,
+                    Rect::new(inner.right() - 3, row.y, 3, 1),
+                    " × ",
+                    MUTED,
+                    Action::ForgetSource(i),
+                );
+            }
+            label(
+                frame,
+                app,
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+                "+ Remember a path",
+                ACCENT,
+                Action::Git("add-path"),
+            );
+        }
+        Modal::Notice(message) => {
+            let rect = centered(area, 88, 18);
+            let inner = modal_frame(frame, rect, "Details");
+            frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), inner);
         }
     }
-    lines.push(format!("Unpublished local commits: {} (not reachable from locally fetched remote-tracking refs; no automatic fetch)",preview.unpublished_count));
-    lines.extend(preview.unpublished_commits.iter().cloned());
-    if preview.unpublished_count > preview.unpublished_commits.len() as u64 {
-        lines.push("Showing first 100 unpublished commits.".into());
+    if let Some((message, true, _)) = &app.notice {
+        let rect = Rect::new(
+            area.x + 2,
+            area.bottom().saturating_sub(2),
+            area.width.saturating_sub(4),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(fit(message, rect.width as usize))
+                .style(Style::default().bg(SURFACE).fg(RED)),
+            rect,
+        );
     }
-    lines.push(if preview.can_remove() { "y remove clean linked-worktree directory; branch is retained · n cancel" } else { "Cleanup blocked. No force-delete bypass. Stop or reconcile the owner and repair protected state first." }.into());
-    frame.render_widget(
-        Paragraph::new(lines.join("\n\n"))
-            .scroll((app.ticket_scroll, 0))
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+}
+fn attention_color(attention: Attention) -> Color {
+    match attention {
+        Attention::Running => GREEN,
+        Attention::NeedsInput => YELLOW,
+        Attention::Interrupted | Attention::Unavailable => RED,
+        Attention::Ready => MUTED,
+    }
+}
+fn attention_icon(attention: Attention) -> &'static str {
+    match attention {
+        Attention::Running => "●",
+        Attention::NeedsInput => "!",
+        Attention::Interrupted | Attention::Unavailable => "×",
+        Attention::Ready => "○",
+    }
 }

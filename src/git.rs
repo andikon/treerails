@@ -11,7 +11,7 @@ use tokio::{
     process::Command,
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub path: PathBuf,
     pub name: String,
@@ -57,6 +57,8 @@ pub struct Snapshot {
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    pub additions: u64,
+    pub deletions: u64,
 }
 impl Snapshot {
     pub fn counts(&self) -> (usize, usize, usize) {
@@ -75,15 +77,6 @@ impl Snapshot {
 pub struct Branch {
     pub name: String,
     pub remote: bool,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PullRequest {
-    pub number: u64,
-    pub title: String,
-    pub head_ref_name: String,
-    pub base_ref_name: String,
-    pub url: String,
 }
 
 fn command(program: &str, cwd: &Path) -> Command {
@@ -312,7 +305,83 @@ pub async fn status(path: &Path) -> Result<Snapshot> {
         ],
     )
     .await?;
-    parse_status(&data)
+    let mut snapshot = parse_status(&data)?;
+    match run(
+        path,
+        [
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    )
+    .await
+    {
+        Ok(stats) => {
+            let mut records = stats.split(|b| *b == 0);
+            while let Some(record) = records.next() {
+                let fields = record.splitn(3, |b| *b == b'\t').collect::<Vec<_>>();
+                if fields.len() != 3 {
+                    continue;
+                }
+                snapshot.additions += String::from_utf8_lossy(fields[0])
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                snapshot.deletions += String::from_utf8_lossy(fields[1])
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if fields[2].is_empty() {
+                    records.next();
+                    records.next();
+                }
+            }
+            for file in snapshot.files.iter().filter(|f| f.untracked) {
+                snapshot.additions += text_lines(&path.join(&file.path)).await?;
+            }
+        }
+        Err(error) => {
+            // Before the first commit every extant file is an addition.
+            if run(path, ["rev-parse", "--verify", "HEAD"]).await.is_ok() {
+                return Err(error);
+            }
+            for file in &snapshot.files {
+                snapshot.additions += text_lines(&path.join(&file.path)).await?;
+            }
+        }
+    }
+    Ok(snapshot)
+}
+async fn text_lines(path: &Path) -> Result<u64> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(1);
+    }
+    if !metadata.is_file() {
+        return Ok(0);
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut bytes = vec![0u8; 65536];
+    let (mut lines, mut read, mut last) = (0, 0, None);
+    loop {
+        let count = file.read(&mut bytes).await?;
+        if count == 0 {
+            break;
+        }
+        if read < 8000 && bytes[..count.min(8000 - read)].contains(&0) {
+            return Ok(0);
+        }
+        read += count;
+        lines += bytes[..count].iter().filter(|b| **b == b'\n').count() as u64;
+        last = bytes[..count].last().copied();
+    }
+    Ok(lines + u64::from(last.is_some_and(|b| b != b'\n')))
 }
 pub fn parse_status(data: &[u8]) -> Result<Snapshot> {
     let mut snapshot = Snapshot::default();
@@ -491,9 +560,11 @@ pub async fn create_worktree(
     };
     run(project, ["check-ref-format", "--branch", branch]).await?;
     for wt in worktrees(project).await? {
-        if wt.branch == branch {
-            return Ok(wt.path);
-        }
+        anyhow::ensure!(
+            wt.branch != branch,
+            "Branch '{branch}' is already checked out at {}",
+            wt.path.display()
+        );
     }
     anyhow::ensure!(
         !destination.exists(),
@@ -517,6 +588,7 @@ pub async fn create_worktree(
     Ok(destination)
 }
 pub async fn stage(path: &Path, files: &[ChangedFile], unstage: bool) -> Result<()> {
+    let _lease = crate::checkout::Lease::acquire(path).await?;
     let mut args: Vec<OsString> = if unstage {
         if run(path, ["rev-parse", "--verify", "--quiet", "HEAD"])
             .await
@@ -542,6 +614,7 @@ pub async fn stage(path: &Path, files: &[ChangedFile], unstage: bool) -> Result<
     Ok(())
 }
 pub async fn commit(path: &Path, subject: &str, body: &str) -> Result<String> {
+    let _lease = crate::checkout::Lease::acquire(path).await?;
     anyhow::ensure!(!subject.trim().is_empty(), "A commit subject is required");
     feedback::report(Update::Phase(
         "Committing (hooks and signing enabled)".into(),
@@ -557,31 +630,7 @@ pub async fn commit(path: &Path, subject: &str, body: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().into())
 }
 pub async fn remove_worktree(project: &Path, path: &Path) -> Result<()> {
-    let lease = crate::host::CheckoutLease::acquire(path).await?;
-    remove_worktree_leased(project, path, &lease).await
-}
-/// Updating checked-out files must exclude managed execution in any client or
-/// configuration context, including an agent waiting for more input.
-pub async fn pull(path: &Path) -> Result<()> {
-    let _lease = crate::host::CheckoutLease::acquire(path).await?;
-    run(path, ["pull", "--progress", "--ff-only"]).await?;
-    Ok(())
-}
-/// The caller retains physical execution exclusion until removal completes.
-pub(crate) async fn remove_worktree_leased(
-    project: &Path,
-    path: &Path,
-    lease: &crate::host::CheckoutLease,
-) -> Result<()> {
-    let metadata = std::fs::canonicalize(
-        text(path, &["rev-parse", "--absolute-git-dir"])
-            .await?
-            .trim(),
-    )?;
-    anyhow::ensure!(
-        crate::config::same_path(&metadata, lease.metadata_directory()),
-        "Cleanup lease belongs to another checkout"
-    );
+    let _lease = crate::checkout::Lease::acquire(path).await?;
     let trees = worktrees(project).await?;
     let wt = trees
         .iter()
@@ -608,6 +657,68 @@ pub(crate) async fn remove_worktree_leased(
     .await?;
     Ok(())
 }
+pub async fn pull(path: &Path) -> Result<()> {
+    let _lease = crate::checkout::Lease::acquire(path).await?;
+    run(path, ["pull", "--progress", "--ff-only"]).await?;
+    Ok(())
+}
+pub async fn choose_remote(path: &Path, preferred: Option<&str>) -> Result<String> {
+    let remotes = remotes(path).await?;
+    if let Some(remote) = preferred {
+        anyhow::ensure!(
+            remotes.iter().any(|r| r == remote),
+            "Configured remote '{remote}' does not exist"
+        );
+        return Ok(remote.into());
+    }
+    if remotes.iter().any(|r| r == "origin") {
+        return Ok("origin".into());
+    }
+    anyhow::ensure!(
+        remotes.len() == 1,
+        "Choose a remote explicitly (available: {})",
+        remotes.join(", ")
+    );
+    Ok(remotes[0].clone())
+}
+/// Query the actual remote HEAD after fetching. Never infer main/develop or
+/// silently fall back to the selected checkout when the remote is unavailable.
+pub async fn fresh_default_base(path: &Path, preferred: Option<&str>) -> Result<String> {
+    let remote = choose_remote(path, preferred).await?;
+    run(path, ["fetch", "--progress", "--prune", "--", &remote]).await?;
+    let advertised = text(path, &["ls-remote", "--symref", "--", &remote, "HEAD"]).await?;
+    let branch = advertised
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|s| s.split_once('\t'))
+                .map(|(branch, _)| branch)
+        })
+        .context("Remote has no default branch; select an explicit starting point")?;
+    let reference = format!("refs/remotes/{remote}/{branch}");
+    run(
+        path,
+        [
+            "fetch",
+            "--progress",
+            "--",
+            &remote,
+            &format!("refs/heads/{branch}:{reference}"),
+        ],
+    )
+    .await?;
+    Ok(format!("{remote}/{branch}"))
+}
+pub async fn push_or_publish(path: &Path, preferred: Option<&str>) -> Result<()> {
+    if status(path).await?.upstream.is_some() {
+        return push(path).await;
+    }
+    let branch = text(path, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .context("Cannot publish a detached checkout")?;
+    let remote = choose_remote(path, preferred).await?;
+    publish(path, &remote, &branch).await
+}
 pub async fn remotes(path: &Path) -> Result<Vec<String>> {
     Ok(text(path, &["remote"])
         .await?
@@ -616,6 +727,7 @@ pub async fn remotes(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 pub async fn publish(path: &Path, remote: &str, branch: &str) -> Result<()> {
+    let _lease = crate::checkout::Lease::acquire(path).await?;
     anyhow::ensure!(
         remotes(path).await?.iter().any(|r| r == remote),
         "Unknown remote: {remote}"
@@ -636,6 +748,7 @@ pub async fn publish(path: &Path, remote: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 pub async fn push(path: &Path) -> Result<()> {
+    let _lease = crate::checkout::Lease::acquire(path).await?;
     let branch = text(path, &["symbolic-ref", "--short", "HEAD"])
         .await
         .context("Cannot push a detached checkout; create a branch first")?;
@@ -669,173 +782,4 @@ pub async fn push(path: &Path) -> Result<()> {
     )
     .await?;
     Ok(())
-}
-async fn gh(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = command("gh", path);
-    cmd.args(args);
-    let output = if feedback::active() {
-        feedback::report(Update::Phase("Reading pull request information".into())).await;
-        capture(&mut cmd, None, false).await?
-    } else {
-        cmd.output()
-            .await
-            .context("GitHub CLI unavailable; install gh and authenticate with gh auth login")?
-    };
-    anyhow::ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
-}
-pub async fn prs(path: &Path) -> Result<Vec<PullRequest>> {
-    Ok(serde_json::from_slice(
-        &gh(
-            path,
-            &[
-                "pr",
-                "list",
-                "--limit",
-                "100",
-                "--json",
-                "number,title,headRefName,baseRefName,url",
-            ],
-        )
-        .await?,
-    )?)
-}
-pub async fn review(project: &Path, number: &str, destination: &Path) -> Result<PathBuf> {
-    let pr: PullRequest = serde_json::from_slice(
-        &gh(
-            project,
-            &[
-                "pr",
-                "view",
-                number,
-                "--json",
-                "number,title,headRefName,baseRefName,url",
-            ],
-        )
-        .await?,
-    )?;
-    let repo: serde_json::Value =
-        serde_json::from_slice(&gh(project, &["repo", "view", "--json", "url"]).await?)?;
-    let url = repo["url"]
-        .as_str()
-        .context("GitHub repository URL missing")?;
-    anyhow::ensure!(
-        pr.url
-            .starts_with(&format!("{}/pull/", url.trim_end_matches('/'))),
-        "The PR belongs to a different repository than the selected project"
-    );
-    let mut transport = url.to_owned();
-    for remote in remotes(project).await? {
-        if let Ok(remote_url) = text(project, &["remote", "get-url", &remote]).await
-            && repository_identity(&remote_url) == repository_identity(url)
-        {
-            transport = remote;
-            break;
-        }
-    }
-    let branch = format!("review/pr-{}", pr.number);
-    for wt in worktrees(project).await? {
-        if wt.branch == branch {
-            return Ok(wt.path);
-        }
-    }
-    anyhow::ensure!(
-        !destination.exists(),
-        "Review destination already exists: {}",
-        destination.display()
-    );
-    // Fetch GitHub's pull ref through the configured base-repository remote, including fork PRs.
-    let reference = format!("refs/treerail/pr/{}/head", pr.number);
-    let fetch_head = format!("+refs/pull/{}/head:{reference}", pr.number);
-    run(
-        project,
-        ["fetch", "--progress", "--", &transport, &fetch_head],
-    )
-    .await?;
-    let base_ref = format!("refs/treerail/pr/{}/base", pr.number);
-    let fetch_base = format!("+refs/heads/{}:{base_ref}", pr.base_ref_name);
-    run(
-        project,
-        ["fetch", "--progress", "--", &transport, &fetch_base],
-    )
-    .await?;
-    if run(
-        project,
-        [
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .await
-    .is_ok()
-    {
-        let existing_head = text(project, &["rev-parse", &format!("refs/heads/{branch}")]).await?;
-        let pr_head = text(project, &["rev-parse", &reference]).await?;
-        anyhow::ensure!(
-            existing_head == pr_head,
-            "Review branch {branch} already exists at a different commit; choose another branch or update it explicitly"
-        );
-        create_worktree(project, &branch, &reference, destination, true, false).await
-    } else {
-        create_worktree(project, &branch, &reference, destination, false, false).await
-    }
-}
-pub async fn review_diff(path: &Path, branch: &str) -> Result<String> {
-    let number = branch
-        .strip_prefix("review/pr-")
-        .context("This is not a Tree Rail PR review branch")?;
-    let base = format!("refs/treerail/pr/{number}/base...HEAD");
-    text(
-        path,
-        &[
-            "--no-pager",
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            &base,
-        ],
-    )
-    .await
-}
-pub async fn open_pr(path: &Path, branch: &str) -> Result<()> {
-    let number = branch.strip_prefix("review/pr-").unwrap_or(branch);
-    gh(path, &["pr", "view", number, "--web"]).await?;
-    Ok(())
-}
-fn repository_identity(url: &str) -> Option<String> {
-    let (authority, path) = if let Some((_, rest)) = url.split_once("://") {
-        rest.split_once('/')?
-    } else {
-        url.split_once(':')?
-    };
-    let host = authority.rsplit('@').next()?;
-    Some(format!("{host}/{}", path.trim_matches('/').trim_end_matches(".git")).to_ascii_lowercase())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::repository_identity;
-    #[test]
-    fn github_transport_identity_preserves_ssh_remote_selection() {
-        let expected = repository_identity("https://github.com/Owner/Repo");
-        assert_eq!(
-            expected,
-            repository_identity("git@github.com:Owner/Repo.git")
-        );
-        assert_eq!(
-            expected,
-            repository_identity("ssh://git@github.com/Owner/Repo.git")
-        );
-        assert_ne!(
-            expected,
-            repository_identity("https://github.com/other/repo")
-        );
-    }
 }

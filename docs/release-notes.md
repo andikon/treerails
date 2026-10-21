@@ -1,3 +1,45 @@
+# Tree Rail v0.3.0 — Worktrees and the real Copilot CLI
+
+Tree Rail now follows Project → Worktree → Conversation. The ticket, task,
+discussion and persistent terminal-host layers have been removed.
+
+- Project tabs, fixed worktree and session/file columns, Copilot CLI/diff on the
+  right, small creation controls and one segmented status line.
+- The actual Copilot CLI runs in the right pane, attached to the same AHP
+  conversation. Copilot owns menus, input and approvals. Ctrl+] returns focus
+  to Tree Rail; switching views preserves terminals. The experimental AHP
+  frontend and compatible SDK backend follow Tree Rail's lifetime.
+- Independent worktree creation and session creation, with an optional new
+  worktree. New checkouts start at the freshly fetched remote default branch
+  unless an explicit starting reference is supplied.
+- Sessions + opens a new idle Copilot CLI conversation directly, without a
+  setup form. Optional session/worktree settings remain in Help. Worktree rows
+  show added/removed line totals, including untracked text files.
+- Stage, unstage, commit, fetch, fast-forward pull and push/publish through Help.
+  Checkout leases exclude managed turns and Git writes in the same worktree;
+  turns started by other clients acquire guards when observed.
+- Pure `config.toml` settings and separate sibling `state.json`, both loaded
+  before the first frame. Combined legacy files migrate with a complete backup.
+- Explicit confirmation for active-tab closure and quitting; closing a tab hides
+  its conversations, while quitting stops the owned runtime. Restart never
+  sends a prompt automatically.
+
+Windows downloads are built and tested locally. Download the standalone
+`treerail-windows-x86_64.exe`, or extract `treerail-windows-x86_64.zip` for the
+executable, usage guide and example configuration. Git must be on PATH;
+no Rust or separate Node.js installation is required. Sign in with GitHub CLI
+or provide `COPILOT_GITHUB_TOKEN`. Binaries are not code-signed.
+
+Validation: 48 Rust tests, four packaging tests, formatting and strict Clippy
+passed. The real CLI accepted typing and resizing on an idle AHP conversation,
+and VS Code discovered that same session. No live model prompt was submitted.
+The CLI's AHP client is experimental; real model responses, tool approvals
+and interactive VS Code handoff still need verification. Linux/macOS downloads
+are not included in this release. See the
+[validation record](https://github.com/andikon/treerails/blob/v0.3.0/docs/testing/worktree-release.md).
+
+---
+
 # Tree Rail v0.2.0 — One workspace for tickets, worktrees and agents
 
 Work, Tickets and Worktrees now feed the same task workspace. Find a GitHub issue,

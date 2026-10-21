@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -8,23 +7,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub project_roots: Vec<PathBuf>,
     pub recursive: bool,
-    pub desktop_notifications: bool,
-    pub default_profile: String,
+    pub publication_remote: Option<String>,
     pub worktrees: WorktreeConfig,
-    pub profiles: BTreeMap<String, Profile>,
-    pub terminals: BTreeMap<String, TerminalConfig>,
     pub projects: Vec<ProjectConfig>,
-    pub keys: BTreeMap<String, String>,
-    pub theme: Theme,
-    pub state: State,
+    pub agent: AgentConfig,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct WorktreeConfig {
     pub path_template: String,
 }
@@ -36,462 +30,330 @@ impl Default for WorktreeConfig {
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ProjectConfig {
     pub path: PathBuf,
-    pub base: Option<String>,
     pub path_template: Option<String>,
-    pub default_profile: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Profile {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: String,
-    pub terminal: String,
-    pub env: BTreeMap<String, String>,
-}
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            program: String::new(),
-            args: vec![],
-            cwd: "{worktree}".into(),
-            terminal: "auto".into(),
-            env: BTreeMap::new(),
-        }
-    }
+    pub publication_remote: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct TerminalConfig {
-    pub program: String,
-    pub args: Vec<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Theme {
-    pub accent: String,
-    pub added: String,
-    pub deleted: String,
-    pub modified: String,
-}
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            accent: "#7dd3fc".into(),
-            added: "#86efac".into(),
-            deleted: "#fda4af".into(),
-            modified: "#fde68a".into(),
-        }
-    }
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            project_roots: vec![],
-            recursive: false,
-            desktop_notifications: false,
-            default_profile: "copilot".into(),
-            worktrees: WorktreeConfig::default(),
-            profiles: BTreeMap::from([
-                (
-                    "copilot".into(),
-                    Profile {
-                        program: "copilot".into(),
-                        ..Profile::default()
-                    },
-                ),
-                (
-                    "editor".into(),
-                    Profile {
-                        program: "nvim".into(),
-                        args: vec![".".into()],
-                        ..Profile::default()
-                    },
-                ),
-                ("terminal".into(), Profile::default()),
-            ]),
-            terminals: BTreeMap::new(),
-            projects: vec![],
-            keys: BTreeMap::new(),
-            theme: Theme::default(),
-            state: State::default(),
-        }
-    }
+#[serde(default)]
+pub struct AgentConfig {
+    pub runtime: Option<PathBuf>,
+    /// Optional real CLI frontend, independent of the compatible host runtime.
+    pub cli: Option<PathBuf>,
+    /// Optional isolated Copilot state directory (the runtime's COPILOT_HOME).
+    pub home: Option<PathBuf>,
+    pub host_directory: Option<PathBuf>,
+    /// Attach to an existing AHP host instead of starting an owned runtime.
+    pub endpoint: Option<String>,
+    pub token_env: Option<String>,
 }
 impl Config {
-    pub fn validate(&self) -> Result<()> {
-        let valid_text = |name: &str, value: &str| -> Result<()> {
-            anyhow::ensure!(
-                !value.contains('\0'),
-                "{name} cannot contain a NUL character"
-            );
-            Ok(())
-        };
-        anyhow::ensure!(
-            !self.worktrees.path_template.trim().is_empty(),
-            "Worktree path template cannot be empty"
-        );
-        valid_text("Worktree path template", &self.worktrees.path_template)?;
-        anyhow::ensure!(
-            self.profiles.contains_key(&self.default_profile),
-            "Unknown default_profile '{}'",
-            self.default_profile
-        );
-        for project in &self.projects {
-            if let Some(profile) = &project.default_profile {
-                anyhow::ensure!(
-                    self.profiles.contains_key(profile),
-                    "Unknown profile '{profile}' for {}",
-                    project.path.display()
-                );
-            }
-            if let Some(template) = &project.path_template {
-                anyhow::ensure!(
-                    !template.trim().is_empty(),
-                    "Project worktree path cannot be empty"
-                );
-                valid_text("Project worktree path", template)?;
-            }
-            if let Some(base) = &project.base {
-                anyhow::ensure!(
-                    !base.trim().is_empty(),
-                    "Project starting point cannot be empty"
-                );
-                valid_text("Starting point", base)?;
-            }
-        }
-        for (name, profile) in &self.profiles {
-            anyhow::ensure!(!name.trim().is_empty(), "Profile name cannot be empty");
-            anyhow::ensure!(
-                !profile.cwd.trim().is_empty(),
-                "Working directory for profile '{name}' cannot be empty"
-            );
-            anyhow::ensure!(
-                profile.terminal == "auto" || self.terminals.contains_key(&profile.terminal),
-                "Unknown terminal adapter '{}' for profile '{name}'",
-                profile.terminal
-            );
-            for value in std::iter::once(&profile.program)
-                .chain(&profile.args)
-                .chain(std::iter::once(&profile.cwd))
-            {
-                valid_text("Profile field", value)?;
-            }
-            for (key, value) in &profile.env {
-                anyhow::ensure!(
-                    !key.is_empty() && !key.contains(['=', '\0']),
-                    "Invalid environment variable name '{key}'"
-                );
-                valid_text("Environment value", value)?;
-            }
-        }
-        Ok(())
-    }
-    pub fn load(path: &Path) -> Result<Self> {
-        let Some(raw) = read_optional(path)? else {
-            return Ok(Self::default());
-        };
-        Self::parse(&raw, path)
-    }
-    pub(crate) fn parse(raw: &str, path: &Path) -> Result<Self> {
+    pub fn parse(raw: &str, path: &Path) -> Result<Self> {
         let mut config: Self = toml::from_str(raw)
             .with_context(|| format!("Invalid configuration {}", path.display()))?;
-        let directory = path.parent().unwrap_or(Path::new("."));
+        let parent = path.parent().unwrap_or(Path::new("."));
+        if let Some(cli) = &mut config.agent.cli
+            && cli.is_relative()
+        {
+            *cli = parent.join(&*cli);
+        }
+        if let Some(home) = &mut config.agent.home
+            && home.is_relative()
+        {
+            *home = parent.join(&*home);
+        }
+        if let Some(directory) = &mut config.agent.host_directory
+            && directory.is_relative()
+        {
+            *directory = parent.join(&*directory);
+        }
         for root in &mut config.project_roots {
             if root.is_relative() {
-                *root = directory.join(&*root);
+                *root = parent.join(&*root);
             }
         }
         for project in &mut config.projects {
             if project.path.is_relative() {
-                project.path = directory.join(&project.path);
+                project.path = parent.join(&project.path);
             }
         }
-        for (name, profile) in Self::default().profiles {
-            config.profiles.entry(name).or_insert(profile);
-        }
         anyhow::ensure!(
-            config.profiles.contains_key(&config.default_profile),
-            "Unknown default_profile '{}'",
-            config.default_profile
+            !config.worktrees.path_template.trim().is_empty(),
+            "Worktree path template cannot be empty"
         );
-        config.state.original_bases = config.state.bases.clone();
-        config.state.original_workspace_views = config.state.workspace_views.clone();
         Ok(config)
-    }
-    pub fn project(&self, path: &Path) -> Option<&ProjectConfig> {
-        self.projects.iter().find(|p| same_path(&p.path, path))
     }
     pub fn worktree_path(&self, project: &Path, branch: &str) -> PathBuf {
         let template = self
-            .project(project)
+            .projects
+            .iter()
+            .find(|p| same_path(&p.path, project))
             .and_then(|p| p.path_template.as_ref())
             .unwrap_or(&self.worktrees.path_template);
-        let parent = project.parent().unwrap_or(project).to_string_lossy();
-        let name = project.file_name().unwrap_or_default().to_string_lossy();
-        let path = PathBuf::from(
+        let result = PathBuf::from(
             template
-                .replace("{project_parent}", &parent)
-                .replace("{project_name}", &name)
+                .replace(
+                    "{project_parent}",
+                    &project.parent().unwrap_or(project).to_string_lossy(),
+                )
+                .replace(
+                    "{project_name}",
+                    &project.file_name().unwrap_or_default().to_string_lossy(),
+                )
                 .replace("{branch_slug}", &branch.replace(['/', '\\'], "-")),
         );
-        if path.is_absolute() {
-            path
+        if result.is_absolute() {
+            result
         } else {
-            project.join(path)
+            project.join(result)
         }
     }
-    pub fn save_roots(path: &Path, roots: &[PathBuf]) -> Result<()> {
-        edit_document(path, |doc| {
-            let mut array = toml_edit::Array::new();
-            for root in roots {
-                array.push(root.to_string_lossy().as_ref());
+    /// Launch the native host in the shared declared workspace so its filesystem
+    /// scope includes sibling worktrees. This is derived memory, never config.
+    pub fn agent_for_sources(
+        &self,
+        sources: &[PathBuf],
+        projects: &[crate::git::Project],
+    ) -> AgentConfig {
+        let mut agent = self.agent.clone();
+        if agent.host_directory.is_some() {
+            return agent;
+        }
+        let mut paths = sources.to_vec();
+        for project in sources
+            .iter()
+            .filter(|p| p.join(".git").exists())
+            .chain(projects.iter().map(|p| &p.path))
+        {
+            paths.push(project.clone());
+            if let Some(parent) = self.worktree_path(project, "treerail-scope").parent() {
+                paths.push(parent.to_path_buf());
             }
-            let decor = doc
-                .get("project_roots")
-                .and_then(toml_edit::Item::as_value)
-                .map(|v| v.decor().clone());
-            let mut value = toml_edit::Value::Array(array);
-            if let Some(decor) = decor {
-                *value.decor_mut() = decor;
+        }
+        if let Some(first) = paths.first() {
+            agent.host_directory = first
+                .ancestors()
+                .find(|root| {
+                    root.is_dir()
+                        && paths
+                            .iter()
+                            .all(|path| path.ancestors().any(|p| same_path(p, root)))
+                })
+                .map(Path::to_path_buf);
+        }
+        agent
+    }
+    pub fn remote(&self, project: &Path) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|p| same_path(&p.path, project))
+            .and_then(|p| p.publication_remote.clone())
+            .or_else(|| self.publication_remote.clone())
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Navigation {
+    pub worktree: Option<PathBuf>,
+    pub conversation: Option<String>,
+    pub changes: bool,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct State {
+    pub remembered_sources: Vec<PathBuf>,
+    pub known_projects: Vec<crate::git::Project>,
+    pub tabs: Vec<PathBuf>,
+    pub last_project: Option<PathBuf>,
+    pub last_worktree: Option<PathBuf>,
+    pub navigation: BTreeMap<String, Navigation>,
+    pub conversations: Vec<crate::agent::Conversation>,
+    #[serde(skip)]
+    baseline: Option<serde_json::Value>,
+}
+impl State {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        with_lock(path, || {
+            let current = serde_json::to_value(&*self)?;
+            let mut disk: serde_json::Value = match read_optional(path)? {
+                Some(raw) => serde_json::from_str(&raw)
+                    .context("Invalid state; original file was preserved")?,
+                None => serde_json::to_value(State::default())?,
+            };
+            let _: State = serde_json::from_value(disk.clone())
+                .context("Invalid state; original file was preserved")?;
+            for (key, value) in current.as_object().context("Invalid state")? {
+                if self.baseline.as_ref().and_then(|b| b.get(key)) == Some(value) {
+                    continue;
+                }
+                if key == "conversations" {
+                    let mut records: BTreeMap<String, serde_json::Value> = disk[key]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| Some((v.get("id")?.as_str()?.to_owned(), v.clone())))
+                        .collect();
+                    let previous: BTreeMap<String, serde_json::Value> = self
+                        .baseline
+                        .as_ref()
+                        .and_then(|b| b.get(key))
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| Some((v.get("id")?.as_str()?.to_owned(), v.clone())))
+                        .collect();
+                    for record in value.as_array().into_iter().flatten() {
+                        if let Some(id) = record["id"].as_str()
+                            && previous.get(id) != Some(record)
+                        {
+                            if let (Some(old), Some(saved)) =
+                                (previous.get(id), records.get_mut(id))
+                            {
+                                if let Some(fields) = record.as_object() {
+                                    for (key, value) in fields {
+                                        if old.get(key) != Some(value) {
+                                            saved[key] = value.clone();
+                                        }
+                                    }
+                                }
+                            } else {
+                                records.insert(id.to_owned(), record.clone());
+                            }
+                        }
+                    }
+                    disk[key] = serde_json::Value::Array(records.into_values().collect());
+                } else if key == "remembered_sources" {
+                    let previous = self
+                        .baseline
+                        .as_ref()
+                        .and_then(|b| b.get(key))
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let wanted = value.as_array().cloned().unwrap_or_default();
+                    let mut merged = disk[key].as_array().cloned().unwrap_or_default();
+                    merged.retain(|v| !previous.contains(v) || wanted.contains(v));
+                    for path in wanted {
+                        if !merged.contains(&path) {
+                            merged.push(path);
+                        }
+                    }
+                    disk[key] = serde_json::Value::Array(merged);
+                } else if key == "navigation" {
+                    if let Some(entries) = value.as_object() {
+                        for (name, entry) in entries {
+                            if self
+                                .baseline
+                                .as_ref()
+                                .and_then(|b| b.get(key))
+                                .and_then(|v| v.get(name))
+                                != Some(entry)
+                            {
+                                disk[key][name] = entry.clone();
+                            }
+                        }
+                    }
+                } else {
+                    disk[key] = value.clone();
+                }
             }
-            doc["project_roots"] = toml_edit::Item::Value(value);
+            atomic_write(path, &serde_json::to_vec_pretty(&disk)?)?;
+            self.baseline = Some(current);
             Ok(())
         })
     }
 }
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct State {
-    pub browser: crate::ticket_browser::BrowserState,
-    pub comment_drafts: BTreeMap<String, crate::ticket_comments::Draft>,
-    pub workflow: crate::workflow::WorkflowState,
-    pub bases: BTreeMap<String, String>,
-    pub workspace_views: BTreeMap<String, String>,
-    pub last_project: Option<PathBuf>,
-    pub last_worktree: Option<PathBuf>,
-    #[serde(skip)]
-    original_bases: BTreeMap<String, String>,
-    #[serde(skip)]
-    original_workspace_views: BTreeMap<String, String>,
-}
-impl State {
-    pub fn load(path: &Path) -> Result<Self> {
-        Ok(Config::load(path)?.state)
-    }
-    pub fn save(&mut self, path: &Path) -> Result<()> {
-        edit_document(path, |doc| {
-            if doc.get("state").is_none() {
-                doc["state"] = toml_edit::Item::Table(toml_edit::Table::new());
-            }
-            for (name, current, previous) in [
-                ("bases", &self.bases, &self.original_bases),
-                (
-                    "workspace_views",
-                    &self.workspace_views,
-                    &self.original_workspace_views,
-                ),
-            ] {
-                if doc["state"].get(name).is_none() {
-                    doc["state"][name] = toml_edit::table();
-                }
-                for key in current.keys().chain(previous.keys()) {
-                    if current.get(key) == previous.get(key) {
-                        continue;
-                    }
-                    if let Some(value) = current.get(key) {
-                        replace_value(
-                            &mut doc["state"][name][key],
-                            toml_edit::Value::from(value.as_str()),
-                        );
-                    } else {
-                        doc["state"][name]
-                            .as_table_like_mut()
-                            .context("Invalid remembered-state table")?
-                            .remove(key);
-                    }
-                }
-            }
-            for (key, path) in [
-                ("last_project", &self.last_project),
-                ("last_worktree", &self.last_worktree),
-            ] {
-                if let Some(path) = path {
-                    replace_value(
-                        &mut doc["state"][key],
-                        toml_edit::Value::from(path.to_string_lossy().as_ref()),
-                    );
-                } else {
-                    doc["state"]
-                        .as_table_like_mut()
-                        .context("Invalid state table")?
-                        .remove(key);
-                }
-            }
-            Ok(())
-        })?;
-        self.original_bases = self.bases.clone();
-        self.original_workspace_views = self.workspace_views.clone();
-        Ok(())
-    }
-}
-/// The combined configuration location. macOS deliberately uses the Unix path.
 pub fn default_path() -> Result<PathBuf> {
     #[cfg(windows)]
     let directory = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .or_else(|| BaseDirs::new().map(|dirs| dirs.data_local_dir().to_owned()))
-        .context("Cannot determine local application data directory; use --config")?;
+        .context("Cannot determine LOCALAPPDATA; use --config")?;
     #[cfg(not(windows))]
-    let directory = BaseDirs::new()
-        .context("Cannot determine home directory; use --config")?
-        .home_dir()
-        .join(".config");
+    let directory = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".config")))
+        .context("Cannot determine config directory; use --config")?;
     Ok(directory.join("treerails").join("config.toml"))
 }
-pub fn legacy_paths() -> Result<(PathBuf, PathBuf)> {
-    let dirs = ProjectDirs::from("", "", "treerail")
-        .context("Cannot determine legacy application directories; use --config")?;
-    Ok((
-        dirs.config_dir().join("config.toml"),
-        dirs.state_dir()
-            .unwrap_or(dirs.data_local_dir())
-            .join("state.json"),
-    ))
+pub fn state_path(config: &Path) -> PathBuf {
+    config.parent().unwrap_or(Path::new(".")).join("state.json")
 }
-
-/// Open settings and memory together. Only interactive startup creates/imports files.
-/// Legacy paths are supplied explicitly so custom --config files never import defaults.
-pub fn open(
-    path: &Path,
-    create: bool,
-    legacy: Option<(PathBuf, PathBuf)>,
-) -> Result<(Config, State)> {
-    if read_optional(path)?.is_some() {
-        let config = Config::load(path)?;
-        return Ok((config.clone(), config.state));
-    }
-    let mut config = Config::default();
-    let mut source = None;
-    if let Some((old_config, old_state)) = legacy {
-        if let Some(raw) = read_optional(&old_config)? {
-            config = Config::load(&old_config).context("Import legacy configuration")?;
-            let mut doc: toml_edit::DocumentMut = raw.parse()?;
-            // Relative legacy paths must keep their original meaning after moving.
-            let mut roots = toml_edit::Array::new();
-            for root in &config.project_roots {
-                roots.push(root.to_string_lossy().as_ref());
-            }
-            if doc.get("project_roots").is_some() {
-                replace_value(&mut doc["project_roots"], toml_edit::Value::Array(roots));
-            }
-            if let Some(projects) = doc
-                .get_mut("projects")
-                .and_then(toml_edit::Item::as_array_of_tables_mut)
-            {
-                for (table, project) in projects.iter_mut().zip(&config.projects) {
-                    replace_value(
-                        &mut table["path"],
-                        toml_edit::Value::from(project.path.to_string_lossy().as_ref()),
-                    );
-                }
-            } else if let Some(projects) = doc
-                .get_mut("projects")
-                .and_then(toml_edit::Item::as_array_mut)
-            {
-                for (value, project) in projects.iter_mut().zip(&config.projects) {
-                    if let Some(table) = value.as_inline_table_mut() {
-                        let mut path =
-                            toml_edit::Value::from(project.path.to_string_lossy().as_ref());
-                        if let Some(old) = table.get("path") {
-                            *path.decor_mut() = old.decor().clone();
-                        }
-                        table.insert("path", path);
-                    }
-                }
-            }
-            source = Some(doc.to_string());
-        }
-        if let Some(raw) = read_optional(&old_state)? {
-            config.state = serde_json::from_str(&raw).with_context(|| {
-                format!("Import legacy remembered state {}", old_state.display())
-            })?;
-        }
-    }
+/// Load settings and memory before terminal initialization. A complete backup
+/// protects old workflow records when splitting a combined document.
+pub fn open(path: &Path, create: bool) -> Result<(Config, State)> {
+    let source = read_optional(path)?.unwrap_or(toml::to_string_pretty(&Config::default())?);
+    let config = Config::parse(&source, path)?;
+    let document: toml_edit::DocumentMut = source.parse()?;
+    let state_file = state_path(path);
+    let mut state = if let Some(raw) = read_optional(&state_file)? {
+        serde_json::from_str(&raw)
+            .with_context(|| format!("Invalid state {}", state_file.display()))?
+    } else if document.get("state").is_some() {
+        let raw: toml::Value = toml::from_str(&source)?;
+        raw.get("state")
+            .cloned()
+            .map(|v| v.try_into::<State>())
+            .transpose()
+            .context("Migrate remembered selections")?
+            .unwrap_or_default()
+    } else {
+        State::default()
+    };
+    state.baseline = Some(serde_json::to_value(&state)?);
     if create {
-        edit_document(path, |doc| {
-            // Another instance may have completed startup while we prepared the import.
-            if read_optional(path)?.is_some() {
-                return Ok(());
-            }
-            *doc = source
-                .as_deref()
-                .map(str::parse)
-                .transpose()?
-                .unwrap_or(toml::to_string_pretty(&config)?.parse()?);
-            let state_doc: toml_edit::DocumentMut =
-                toml::to_string_pretty(&config.state)?.parse()?;
-            doc["state"] = toml_edit::Item::Table(state_doc.as_table().clone());
-            Ok(())
-        })?;
-        config = Config::load(path)?;
+        if document.get("state").is_some() {
+            with_lock(path, || {
+                let latest =
+                    read_optional(path)?.context("Configuration was removed during migration")?;
+                Config::parse(&latest, path)?;
+                let mut document: toml_edit::DocumentMut = latest.parse()?;
+                if document.get("state").is_none() {
+                    return Ok(());
+                }
+                let mut backup = path.with_extension("pre-worktree-refactor.toml");
+                if read_optional(&backup)?.is_some_and(|old| old != latest) {
+                    backup = path.with_extension(format!(
+                        "pre-worktree-refactor.{}.toml",
+                        uuid::Uuid::new_v4()
+                    ));
+                }
+                if !backup.exists() {
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&backup)?;
+                    file.write_all(latest.as_bytes())?;
+                    file.sync_all()?;
+                }
+                with_lock(&state_file, || {
+                    if !state_file.exists() {
+                        let raw: toml::Value = toml::from_str(&latest)?;
+                        let imported = raw
+                            .get("state")
+                            .cloned()
+                            .context("Missing legacy state")?
+                            .try_into::<State>()?;
+                        atomic_write(&state_file, &serde_json::to_vec_pretty(&imported)?)?;
+                    }
+                    Ok(())
+                })?;
+                document.remove("state");
+                atomic_write(path, document.to_string().as_bytes())
+            })?;
+            return open(path, false);
+        } else if !path.exists() {
+            with_lock(path, || {
+                if !path.exists() {
+                    atomic_write(path, source.as_bytes())?;
+                }
+                Ok(())
+            })?;
+            return open(path, false);
+        }
     }
-    let state = config.state.clone();
     Ok((config, state))
-}
-
-fn read_optional(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(raw) => Ok(Some(raw)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
-    }
-}
-
-/// Serialize read/patch/write transactions across Tree Rail instances. The sidecar
-/// holds only an OS lock, never settings; atomic replacement keeps readers safe.
-pub fn edit_document<T>(
-    path: &Path,
-    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
-) -> Result<T> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Create configuration directory {}", parent.display()))?;
-    let mut lock_name = path.as_os_str().to_os_string();
-    lock_name.push(".lock");
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(PathBuf::from(lock_name))
-        .with_context(|| format!("Open configuration lock for {}", path.display()))?;
-    fs2::FileExt::lock_exclusive(&lock).with_context(|| format!("Lock {}", path.display()))?;
-    let source = read_optional(path)?.unwrap_or_else(|| "# Tree Rail configuration\n".into());
-    Config::parse(&source, path)
-        .with_context(|| format!("Configuration {} was not changed", path.display()))?;
-    let mut doc: toml_edit::DocumentMut = source.parse()?;
-    let result = edit(&mut doc)?;
-    let updated = doc.to_string();
-    Config::parse(&updated, path).context("Refusing to save invalid configuration")?;
-    if updated != source {
-        atomic_write(path, updated.as_bytes())?;
-    }
-    Ok(result)
-}
-
-fn replace_value(item: &mut toml_edit::Item, mut value: toml_edit::Value) {
-    if let Some(old) = item.as_value() {
-        *value.decor_mut() = old.decor().clone();
-    }
-    *item = toml_edit::Item::Value(value);
 }
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
@@ -499,13 +361,72 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(contents)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(contents)?;
+    file.as_file().sync_all()?;
+    file.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("Save {}", path.display()))?;
     Ok(())
+}
+fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    f()
+}
+pub fn save_preferences(path: &Path, baseline: &Config, desired: &Config) -> Result<Config> {
+    with_lock(path, || {
+        let raw = read_optional(path)?
+            .context("Configuration was removed; keep the draft and restore the file")?;
+        let current = Config::parse(&raw, path)?;
+        let current_value = serde_json::to_value(&current)?;
+        let before = serde_json::to_value(baseline)?;
+        let after = serde_json::to_value(desired)?;
+        let mut document: toml_edit::DocumentMut = raw.parse()?;
+        let proposed: toml_edit::DocumentMut = toml::to_string_pretty(desired)?.parse()?;
+        for key in [
+            "project_roots",
+            "recursive",
+            "publication_remote",
+            "worktrees",
+        ] {
+            if before[key] == after[key] {
+                continue;
+            }
+            anyhow::ensure!(
+                current_value[key] == before[key] || current_value[key] == after[key],
+                "'{key}' was changed by another editor; draft retained. Reopen preferences to review the latest value"
+            );
+            if let Some(item) = proposed.get(key) {
+                let mut item = item.clone();
+                if let (Some(old), Some(new)) = (
+                    document.get(key).and_then(|i| i.as_value()),
+                    item.as_value_mut(),
+                ) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                document[key] = item;
+            } else {
+                document.remove(key);
+            }
+        }
+        let updated = Config::parse(&document.to_string(), path)?;
+        atomic_write(path, document.to_string().as_bytes())?;
+        Ok(updated)
+    })
+}
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Read {}", path.display())),
+    }
 }
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let a = a.canonicalize().unwrap_or_else(|_| a.to_owned());

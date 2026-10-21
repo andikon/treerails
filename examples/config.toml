@@ -1,55 +1,25 @@
-# Tree Rail: paths may be repositories or their direct parent folders.
-# Single-quoted TOML strings preserve Windows backslashes.
-# Settings and remembered selections share this document. Tree Rail manages
-# [state] and [state.bases] automatically when saving the current session.
+# User-managed preferences only. Runtime memory belongs in state.json beside this file.
 project_roots = []
 recursive = false
-# Optional host-delivered notifications for input requests and session failures.
-desktop_notifications = false
-default_profile = 'copilot'
+# publication_remote = 'origin'
 
 [worktrees]
 path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
 
-[profiles.copilot]
-program = 'copilot'
-args = []
-cwd = '{worktree}'
-terminal = 'auto'
+[agent]
+# The SDK's compatible native Copilot runtime is bundled by default.
+# runtime = 'C:\Tools\compatible-copilot.exe'
+# Optional compatible real CLI frontend; independent of the SDK backend above:
+# cli = 'C:\Tools\copilot.exe'
+# Override the native AHP host's containing workspace if needed:
+# host_directory = 'C:\Code'
+# Optional isolated Copilot state, authentication and trust settings:
+# home = 'C:\LocalState\treerail-copilot'
+# To attach to an already-running compatible local AHP host:
+# endpoint = 'ws://127.0.0.1:12345'
+# token_env = 'TREERAIL_AHP_TOKEN'
 
-[profiles.editor]
-program = 'nvim'
-args = ['.']
-cwd = '{worktree}'
-terminal = 'auto'
-
-[profiles.terminal]
-program = ''
-args = []
-cwd = '{worktree}'
-terminal = 'auto'
-
-[theme]
-accent = '#7dd3fc'
-added = '#86efac'
-deleted = '#fda4af'
-modified = '#fde68a'
-
-[keys]
-# Navigation-context key overrides. Examples:
-# 'alt+o' = 'profiles'
-# 'ctrl+n' = 'down'
-# 'ctrl+g' = 'agent_navigation' # replaces Ctrl+] in hosted agent-input mode
-
-# Project settings take precedence over global defaults and remembered bases.
 # [[projects]]
-# path = 'C:\Code\my-project'
-# base = 'origin/develop'
-# default_profile = 'editor'
-# path_template = '{project_parent}/{project_name}.worktrees/{branch_slug}'
-
-# Custom terminals receive arguments individually. {command} inserts the tool
-# program and its argument array. {cwd} is the resolved profile directory.
-# [terminals.custom]
-# program = 'my-terminal'
-# args = ['--cwd', '{cwd}', '--', '{command}']
+# path = 'C:\Code\shop-api'
+# path_template = 'D:\Worktrees\shop-api\{branch_slug}'
+# publication_remote = 'origin'

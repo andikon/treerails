@@ -1,5 +1,7 @@
 # Store settings and remembered state in one configuration file
 
+> Revisited by [ADR 0010](0010-separate-configuration-from-remembered-state.md). The original decision is retained below for history.
+
 Tree Rail will persist both user configuration and remembered state in a single `config.toml`. The user explicitly chose one editable file over separate configuration and state files so saved project sources and session memory are kept together. These remain distinct concepts even though they share a file; automatic state updates must preserve user settings and comments.
 
 This supersedes the separate `state.json` storage decision in the original [product specification](../product-spec.md#configuration). The trade-off is that automatic session-memory updates now touch the same document users edit, so save behavior must handle concurrent edits and multiple running instances deliberately.

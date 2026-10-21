@@ -1,2682 +1,2983 @@
 use crate::{
-    config::{Config, State, same_path},
+    agent::{self, Attention, Conversation},
+    config::{self, Config, Navigation, State, same_path},
     discover,
-    feedback::{self, Event, HISTORY_LIMIT, Record, Reporter},
-    git::{self, Branch, ChangedFile, Project, PullRequest, Snapshot, Worktree},
-    launch,
-    settings::{self, Draft},
-    workflow::{self, Command as WorkflowCommand, Event as WorkflowEvent, TicketRecord},
+    git::{self, ChangedFile, Project, Snapshot, Worktree},
 };
-mod browser_ui;
-mod comment_ui;
-pub mod hosted_ui;
-pub mod workspace_ui;
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
+use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Sessions,
+    Changes,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Worktrees,
+    List,
+    Detail,
+}
+#[derive(Debug, Clone)]
+pub struct Tab {
+    pub project: Project,
+    pub trees: Vec<Worktree>,
+    pub selected: usize,
+    pub view: View,
+    pub conversation: Option<String>,
+    pub file: usize,
+}
 #[derive(Debug, Clone)]
 pub enum Operation {
     Stage(Vec<ChangedFile>, bool),
     Commit(String, String),
     Fetch,
     Pull,
-    Push,
-    Publish(String, String),
+    Push(Option<String>),
+    Remove,
     Create {
         branch: String,
         base: String,
         destination: PathBuf,
-        existing: bool,
+        source: PathBuf,
+        remote: Option<String>,
         fetch: bool,
+        session: Option<(String, Value)>,
     },
-    Branch(String, String),
-    DeleteBranch(String),
-    Remove(PathBuf),
-    Review(String, PathBuf),
-    OpenPr(String),
+}
+impl Operation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stage(_, false) => "Stage",
+            Self::Stage(_, true) => "Unstage",
+            Self::Commit(..) => "Commit",
+            Self::Fetch => "Fetch",
+            Self::Pull => "Pull",
+            Self::Push(_) => "Push / publish",
+            Self::Remove => "Remove worktree",
+            Self::Create { .. } => "Create worktree",
+        }
+    }
 }
 #[derive(Debug)]
 pub enum Job {
-    LocalWorkflow(PathBuf),
-    OpenIssue(PathBuf, u64),
-    Host(PathBuf, crate::host::runtime::HostCommand),
-    Workflow(PathBuf, PathBuf, WorkflowCommand),
     Discover(Vec<PathBuf>, bool),
-    Trees(PathBuf),
+    Trees(Project),
+    Remotes(Project),
+    Associate(PathBuf, Value),
     Status(PathBuf),
     Diff(PathBuf, ChangedFile, bool),
-    Branches(PathBuf),
-    Prs(PathBuf),
-    ReviewDiff(PathBuf, String),
-    Operation {
-        config_path: PathBuf,
-        id: u64,
+    Operate {
         project: PathBuf,
-        path: PathBuf,
-        op: Operation,
+        target: PathBuf,
+        operation: Operation,
     },
 }
-// Workflow snapshots deliberately cross the job boundary by value.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub enum Payload {
-    LocalWorkflow(workflow::WorkflowState),
-    BrowserOpened,
-    Host(crate::host::runtime::Response),
-    Workflow(WorkflowEvent),
+pub enum Completion {
     Projects(Vec<Project>, Vec<String>),
-    Trees(PathBuf, Vec<Worktree>, String),
+    Trees(Project, Vec<Worktree>),
+    Remotes(PathBuf, Vec<String>),
+    Associated(Value),
     Status(PathBuf, Snapshot),
-    Diff(String, String),
-    Branches(PathBuf, Vec<Branch>),
-    Prs(PathBuf, Vec<PullRequest>),
-    Done(PathBuf, Option<PathBuf>, String),
-}
-pub struct Completion {
-    pub epoch: u64,
-    pub token: String,
-    pub result: Result<Payload>,
+    Diff(PathBuf, PathBuf, bool, String),
+    Operated {
+        project: PathBuf,
+        target: PathBuf,
+        created: Option<PathBuf>,
+        session: Option<(String, Value)>,
+    },
 }
 impl Job {
     pub fn token(&self) -> String {
         match self {
-            Self::LocalWorkflow(_) => "local-workflow".into(),
-            Self::OpenIssue(project, number) => {
-                format!("open-issue:{}:{number}", project.display())
-            }
-            Self::Host(..) => "host".into(),
-            Self::Workflow(_, project, WorkflowCommand::Browser(command)) => {
-                browser_ui::token(project, command)
-            }
-            Self::Workflow(..) => "workflow".into(),
-            Self::Status(p) => format!("status:{}", p.display()),
-            Self::Diff(p, f, s) => diff_key(p, &f.path, *s),
-            Self::ReviewDiff(p, _) => format!("review:{}", p.display()),
-            Self::Trees(p) => format!("trees:{}", p.display()),
-            Self::Branches(p) => format!("branches:{}", p.display()),
-            Self::Prs(p) => format!("prs:{}", p.display()),
             Self::Discover(..) => "discover".into(),
-            Self::Operation { id, .. } => format!("operation:{id}"),
+            Self::Trees(p) => format!("trees:{}", p.path.display()),
+            Self::Remotes(p) => format!("remotes:{}", p.path.display()),
+            Self::Associate(_, v) => format!("associate:{}", v["resource"]),
+            Self::Status(p) => format!("status:{}", p.display()),
+            Self::Diff(p, f, s) => format!("diff:{}:{}:{s}", p.display(), f.path.display()),
+            Self::Operate { .. } => "mutation".into(),
         }
     }
-    pub async fn execute_with_feedback(
-        self,
-        sender: tokio::sync::mpsc::Sender<Event>,
-    ) -> Result<Payload> {
-        if let Self::Operation { id, .. } = &self {
-            feedback::scope(Reporter { id: *id, sender }, self.execute()).await
-        } else {
-            self.execute().await
-        }
-    }
-    pub async fn execute(self) -> Result<Payload> {
+    pub async fn execute(self) -> Result<Completion> {
         match self {
-            Self::LocalWorkflow(path) => Ok(Payload::LocalWorkflow(
-                workflow::Workflow::new(path).snapshot()?,
-            )),
-            Self::OpenIssue(project, number) => {
-                let status = tokio::process::Command::new("gh")
-                    .current_dir(project)
-                    .args(["issue", "view", &number.to_string(), "--web"])
-                    .status()
-                    .await?;
-                anyhow::ensure!(status.success(), "GitHub could not open the issue");
-                Ok(Payload::BrowserOpened)
-            }
-            Self::Host(config, command) => {
-                Ok(Payload::Host(hosted_ui::request(config, command).await?))
-            }
-            Self::Workflow(config, project, command) => Ok(Payload::Workflow(
-                workflow::Workflow::new(config)
-                    .execute(&project, command)
-                    .await?,
-            )),
             Self::Discover(roots, recursive) => {
                 let (p, w) = discover::discover(roots, recursive).await?;
-                Ok(Payload::Projects(p, w))
+                Ok(Completion::Projects(p, w))
             }
-            Self::Trees(path) => {
-                let trees = git::worktrees(&path).await?;
-                let base = git::default_base(&path).await;
-                Ok(Payload::Trees(path, trees, base))
+            Self::Trees(project) => {
+                let trees = git::worktrees(&project.path).await?;
+                Ok(Completion::Trees(project, trees))
             }
-            Self::Status(path) => {
-                let s = git::status(&path).await?;
-                Ok(Payload::Status(path, s))
+            Self::Remotes(project) => Ok(Completion::Remotes(
+                project.path.clone(),
+                git::remotes(&project.path).await?,
+            )),
+            Self::Associate(path, mut item) => {
+                let project = git::project(&path).await?;
+                item["_treerailProject"] = serde_json::to_value(project.path)?;
+                Ok(Completion::Associated(item))
             }
-            Self::Diff(path, file, staged) => {
-                let key = diff_key(&path, &file.path, staged);
-                Ok(Payload::Diff(key, git::diff(&path, &file, staged).await?))
-            }
-            Self::Branches(path) => {
-                let b = git::branches(&path).await?;
-                Ok(Payload::Branches(path, b))
-            }
-            Self::Prs(path) => {
-                let p = git::prs(&path).await?;
-                Ok(Payload::Prs(path, p))
-            }
-            Self::ReviewDiff(path, branch) => {
-                let key = format!("review:{}", path.display());
-                Ok(Payload::Diff(key, git::review_diff(&path, &branch).await?))
-            }
-            Self::Operation {
-                config_path,
+            Self::Status(path) => Ok(Completion::Status(path.clone(), git::status(&path).await?)),
+            Self::Diff(path, file, staged) => Ok(Completion::Diff(
+                path.clone(),
+                file.path.clone(),
+                staged,
+                git::diff(&path, &file, staged).await?,
+            )),
+            Self::Operate {
                 project,
-                path,
-                op,
-                ..
+                target,
+                operation,
             } => {
-                if matches!(&op, Operation::Pull | Operation::Remove(_)) {
-                    let state = workflow::Workflow::new(&config_path).snapshot()?;
-                    let target = if let Operation::Remove(target) = &op {
-                        target
-                    } else {
-                        &path
-                    };
-                    crate::work::mutation_guard(&state, target)?;
-                }
-                let (mut selected, mut message) = (None, "Completed".to_owned());
-                match op {
-                    Operation::Stage(files, undo) => {
-                        git::stage(&path, &files, undo).await?;
-                        message = if undo {
-                            "Files unstaged"
-                        } else {
-                            "Files staged"
-                        }
-                        .into();
+                let mut created = None;
+                let mut session = None;
+                match operation {
+                    Operation::Stage(files, unstage) => {
+                        git::stage(&target, &files, unstage).await?
                     }
-                    Operation::Commit(s, b) => {
-                        message = git::commit(&path, &s, &b).await?;
+                    Operation::Commit(subject, body) => {
+                        git::commit(&target, &subject, &body).await?;
                     }
                     Operation::Fetch => {
-                        git::run(&path, ["fetch", "--progress", "--all", "--prune"]).await?;
+                        git::run(&target, ["fetch", "--progress", "--all", "--prune"]).await?;
                     }
-                    Operation::Pull => {
-                        git::pull(&path).await?;
+                    Operation::Pull => git::pull(&target).await?,
+                    Operation::Push(remote) => {
+                        git::push_or_publish(&target, remote.as_deref()).await?
                     }
-                    Operation::Push => {
-                        git::push(&path).await?;
-                    }
-                    Operation::Publish(r, b) => {
-                        git::publish(&path, &r, &b).await?;
-                        message = format!("Published to {r}/{b}");
-                    }
+                    Operation::Remove => git::remove_worktree(&project, &target).await?,
                     Operation::Create {
                         branch,
                         base,
                         destination,
-                        existing,
+                        source,
+                        remote,
                         fetch,
+                        session: start,
                     } => {
-                        selected = Some(
+                        let base = if base.trim().is_empty() {
+                            anyhow::ensure!(
+                                fetch,
+                                "Choose an explicit cached reference when Fetch is off"
+                            );
+                            git::fresh_default_base(&project, remote.as_deref()).await?
+                        } else if base == "HEAD" {
+                            git::text(&source, &["rev-parse", "HEAD"]).await?
+                        } else {
+                            if fetch {
+                                git::run(&project, ["fetch", "--progress", "--all", "--prune"])
+                                    .await?;
+                            }
+                            base
+                        };
+                        created = Some(
                             git::create_worktree(
                                 &project,
                                 &branch,
                                 &base,
                                 &destination,
-                                existing,
-                                fetch,
+                                false,
+                                false,
                             )
                             .await?,
                         );
-                        message = "Worktree ready".into();
-                    }
-                    Operation::Branch(branch, base) => {
-                        git::run(&project, ["check-ref-format", "--branch", &branch]).await?;
-                        git::run(&project, ["branch", "--no-track", "--", &branch, &base]).await?;
-                        message = "Branch created".into();
-                    }
-                    Operation::DeleteBranch(branch) => {
-                        git::run(&project, ["branch", "-d", "--", &branch]).await?;
-                        message = "Branch deleted".into();
-                    }
-                    Operation::Remove(target) => {
-                        git::remove_worktree(&project, &target).await?;
-                        message = "Worktree removed; branch retained".into();
-                    }
-                    Operation::Review(number, destination) => {
-                        selected = Some(git::review(&project, &number, &destination).await?);
-                        message = "PR review worktree ready".into();
-                    }
-                    Operation::OpenPr(branch) => {
-                        git::open_pr(&path, &branch).await?;
+                        session = start;
                     }
                 }
-                Ok(Payload::Done(project, selected, message))
+                Ok(Completion::Operated {
+                    project,
+                    target,
+                    created,
+                    session,
+                })
             }
         }
     }
 }
-pub fn diff_key(path: &std::path::Path, file: &std::path::Path, staged: bool) -> String {
-    format!("diff:{}:{}:{staged}", path.display(), file.display())
-}
-
-#[derive(Debug, Clone)]
-pub enum FormKind {
-    LocalTask(PathBuf),
-    TicketCreate(String),
-    Create { existing: bool },
-    Branch,
-    Commit,
-    Publish,
-    Review,
-}
-#[derive(Debug, Clone)]
-pub struct Field {
-    pub label: String,
+#[derive(Debug, Clone, Default)]
+pub struct Input {
     pub value: String,
-    pub multiline: bool,
     pub cursor: usize,
-    pub readonly: bool,
 }
-impl Field {
-    pub(crate) fn new(label: &str, value: String, multiline: bool) -> Self {
+impl Input {
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
         let cursor = value.len();
-        Self {
-            label: label.into(),
-            value,
-            multiline,
-            cursor,
-            readonly: false,
+        Self { value, cursor }
+    }
+    pub fn insert(&mut self, value: &str) {
+        self.value.insert_str(self.cursor, value);
+        self.cursor += value.len();
+    }
+    pub fn key(&mut self, key: KeyEvent, multiline: bool) {
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert(&c.to_string())
+            }
+            KeyCode::Left => {
+                self.cursor = self.value[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
+            KeyCode::Right => {
+                self.cursor += self.value[self.cursor..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(0)
+            }
+            KeyCode::Home => {
+                self.cursor = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    0
+                } else {
+                    self.value[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+                }
+            }
+            KeyCode::End => {
+                self.cursor = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.value.len()
+                } else {
+                    self.value[self.cursor..]
+                        .find('\n')
+                        .map_or(self.value.len(), |i| self.cursor + i)
+                }
+            }
+            KeyCode::Up | KeyCode::Down if multiline => {
+                let start = self.value[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+                let column = self.value[start..self.cursor].chars().count();
+                let bounds = if key.code == KeyCode::Up && start > 0 {
+                    let end = start - 1;
+                    Some((self.value[..end].rfind('\n').map_or(0, |i| i + 1), end))
+                } else if key.code == KeyCode::Down {
+                    self.value[self.cursor..].find('\n').map(|i| {
+                        let start = self.cursor + i + 1;
+                        let end = self.value[start..]
+                            .find('\n')
+                            .map_or(self.value.len(), |i| start + i);
+                        (start, end)
+                    })
+                } else {
+                    None
+                };
+                if let Some((start, end)) = bounds {
+                    self.cursor = start
+                        + self.value[start..end]
+                            .char_indices()
+                            .nth(column)
+                            .map_or(end - start, |(i, _)| i);
+                }
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                let prev = self.value[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.value.drain(prev..self.cursor);
+                self.cursor = prev;
+            }
+            KeyCode::Delete => {
+                if let Some(c) = self.value[self.cursor..].chars().next() {
+                    self.value.drain(self.cursor..self.cursor + c.len_utf8());
+                }
+            }
+            KeyCode::Enter if multiline => self.insert("\n"),
+            _ => {}
         }
     }
 }
 #[derive(Debug, Clone)]
+pub enum FieldType {
+    Text,
+    Multiline,
+    Toggle,
+    Choice(Vec<String>),
+}
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub key: String,
+    pub label: String,
+    pub input: Input,
+    pub kind: FieldType,
+}
+impl Field {
+    fn text(key: &str, label: &str, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            input: Input::new(value),
+            kind: FieldType::Text,
+        }
+    }
+    fn toggle(key: &str, label: &str, on: bool) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            input: Input::new(if on { "yes" } else { "no" }),
+            kind: FieldType::Toggle,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormKind {
+    Session,
+    Worktree,
+    Commit,
+    AddPath,
+    Attach,
+    Preferences,
+    Question,
+    SessionOptions,
+    PublishRemote,
+}
+#[derive(Debug, Clone)]
 pub struct Form {
-    pub title: String,
     pub kind: FormKind,
     pub fields: Vec<Field>,
-    pub active: usize,
-    pub path_custom: bool,
-}
-#[derive(Debug, Clone)]
-pub enum PickerKind {
-    LinkWork(String),
-    TicketAdopt(String),
-    TicketImport(String),
-    Operations,
-    Branches,
-    Base(Form),
-    Profiles,
-    Prs,
-}
-#[derive(Debug, Clone)]
-pub struct Picker {
+    pub focused: usize,
+    pub advanced: bool,
     pub title: String,
-    pub kind: PickerKind,
-    pub entries: Vec<(String, String)>,
-    pub query: String,
-    pub selected: usize,
-    pub editing: bool,
-    pub top_prefix: bool,
+    pub context: Value,
 }
-impl Picker {
-    pub fn visible(&self) -> Vec<&(String, String)> {
-        self.entries
+impl Form {
+    pub fn value(&self, key: &str) -> String {
+        self.fields
             .iter()
-            .filter(|e| e.0.to_lowercase().contains(&self.query.to_lowercase()))
+            .find(|f| f.key == key)
+            .map(|f| f.input.value.clone())
+            .unwrap_or_default()
+    }
+    pub fn visible(&self) -> Vec<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| match self.kind {
+                FormKind::Session => match f.key.as_str() {
+                    "branch" | "base" | "destination" | "fetch" | "remote" => {
+                        self.value("new_tree") == "yes"
+                    }
+                    "name" | "model" => self.advanced,
+                    k if k.starts_with("config:") => self.advanced,
+                    _ => true,
+                },
+                _ => true,
+            })
+            .map(|(i, _)| i)
             .collect()
     }
 }
 #[derive(Debug, Clone)]
-pub enum Modal {
-    Cleanup(Box<workflow::CleanupPreview>),
-    Requirements(Box<workflow::RequirementsReview>),
-    OperationDetails,
-    Form(Form),
-    Picker(Picker),
-    Confirm(String, Operation),
-    Help,
+pub enum Confirm {
+    Close(usize),
+    Quit,
+    Remove,
+    Trust { id: String, path: PathBuf },
 }
-
+#[derive(Debug, Clone)]
+pub enum Modal {
+    Projects { query: Input, selected: usize },
+    Help(usize),
+    Form(Form),
+    Confirm(Confirm),
+    Activity(usize),
+    Host,
+    Notice(String),
+    Sources(usize),
+    Approval(Value),
+    Completions { items: Vec<Value>, selected: usize },
+}
+#[derive(Debug, Clone)]
+pub enum Action {
+    Project(usize),
+    Tab(usize),
+    Close(usize),
+    Tree(usize),
+    Session(String),
+    File(usize),
+    Switch(View),
+    NewTree,
+    NewSession,
+    NewSessionOptions,
+    Help,
+    Projects,
+    Confirm,
+    Cancel,
+    Git(&'static str),
+    Stop,
+    Archive,
+    History,
+    Quit,
+    Activity,
+    Host,
+    Resume,
+    FocusTerminal,
+    CloseTerminal,
+    Options,
+    Attach,
+    Preferences,
+    Field(usize),
+    ToggleAdvanced,
+    Scroll(i16),
+    Expand,
+    Respond,
+    Approve(bool, Option<String>),
+    Completion(usize),
+    Details,
+    Retry,
+    WorktreeInfo,
+    Sources,
+    ForgetSource(usize),
+}
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub rect: Rect,
+    pub action: Action,
+}
 pub struct App {
-    pub workspace: Option<crate::workspace::Workspace>,
-    pub workspace_open: bool,
-    pub workspace_start_pending: bool,
-    pub workspace_tab: workspace_ui::WorkspaceTab,
-    pub work_mode: bool,
-    pub work_cursor: usize,
-    pub comment_editor: Option<crate::ticket_comments::Editor>,
-    pub browser: crate::browser::Browser,
-    pub browser_return: Option<workspace_ui::BrowserPreview>,
-    pub hosted: hosted_ui::HostedUi,
-    pub ticket_mode: bool,
-    pub issues: Vec<workflow::Issue>,
-    pub issue_cursor: usize,
-    pub ticket: Option<TicketRecord>,
-    pub task_cursor: usize,
-    pub ticket_scroll: u16,
-    pub issue_warning: String,
-    pub pending_revision: Option<workflow::RevisionRequest>,
-    pub pending_cleanup_stop: Option<String>,
+    pub terminals: crate::cli_terminal::Terminals,
+    pub terminal_area: Rect,
+    terminal_requested: BTreeMap<String, Option<String>>,
     pub config: Config,
     pub state: State,
     pub config_path: PathBuf,
     pub roots: Vec<PathBuf>,
-    pub temporary_roots: Vec<PathBuf>,
-    pub settings: Option<Draft>,
-    pub settings_open: bool,
-    pub discovery_warnings: Vec<String>,
     pub recursive: bool,
     pub projects: Vec<Project>,
-    pub project_cursor: usize,
-    pub project: Option<Project>,
-    pub trees: Vec<Worktree>,
-    pub tree: usize,
-    pub snapshots: BTreeMap<PathBuf, Snapshot>,
-    pub file: usize,
-    pub marked: BTreeSet<PathBuf>,
-    pub focus: usize,
-    pub filter: String,
-    pub searching: bool,
-    pub search_before: String,
+    pub tabs: Vec<Tab>,
+    pub selected_tab: usize,
+    pub pane: Pane,
     pub modal: Option<Modal>,
+    pub snapshots: BTreeMap<PathBuf, Snapshot>,
+    pub remotes: BTreeMap<PathBuf, Vec<String>>,
     pub diff: String,
-    pub diff_token: String,
-    pub diff_scroll: usize,
-    pub staged: bool,
-    pub pr_diff: bool,
-    pub branches: Vec<Branch>,
-    pub prs: Vec<PullRequest>,
-    pub default_base: String,
-    pub busy: bool,
-    pub latest_operation: Option<Record>,
-    pub operation_history: VecDeque<Record>,
-    pub inspected_operation_id: Option<u64>,
-    pub history_evicted: u64,
-    pub next_operation_id: u64,
-    pub operation_scroll: usize,
-    pub notice: String,
-    pub error: bool,
-    pub quit: bool,
-    pub epoch: u64,
+    pub diff_staged: bool,
+    pub diff_scroll: u16,
+    pub transcript_scroll: u16,
+    pub marked: BTreeSet<PathBuf>,
+    pub composer: Input,
+    pub cli_focused: bool,
+    pub attachments: Vec<Value>,
+    pub expanded: bool,
     pub jobs: Vec<Job>,
-    pub inflight: BTreeSet<String>,
-    pub prefix: Option<(char, Instant)>,
-    pub last_refresh: Instant,
-    pub last_summary: Instant,
-    pub desired_tree: Option<PathBuf>,
-    pub waiting_prs: bool,
-    pub recover_form: Option<Form>,
-    pub deferred_commit: Option<Form>,
-    pub viewport_height: usize,
-    pub viewport_width: usize,
+    pub agent_commands: Vec<agent::Command>,
+    pending: BTreeSet<String>,
+    pub mutation: Option<(PathBuf, String)>,
+    pub notice: Option<(String, bool, Instant)>,
+    pub operation_output: String,
+    pub connected: bool,
+    pub attached: BTreeSet<String>,
+    pub connection_url: Option<String>,
+    pub agents: Value,
+    pub provider_options: Value,
+    pub completions: Value,
+    pub hits: Vec<Hit>,
+    pub quit: bool,
+    pub confirm_yes: bool,
+    failed_form: Option<Form>,
+    last_refresh: Instant,
+    last_agent_refresh: Instant,
+    last_save: Instant,
+    dirty: bool,
 }
 impl App {
-    pub fn new(
-        config: Config,
-        state: State,
-        config_path: PathBuf,
-        roots: Vec<PathBuf>,
-        recursive: bool,
-    ) -> Self {
-        let temporary_roots = roots
-            .iter()
-            .filter(|root| {
-                !config
-                    .project_roots
-                    .iter()
-                    .any(|saved| same_path(root, saved))
-            })
-            .cloned()
-            .collect();
-        Self {
-            workspace: None,
-            workspace_open: false,
-            workspace_start_pending: false,
-            workspace_tab: workspace_ui::WorkspaceTab::Overview,
-            work_mode: false,
-            work_cursor: 0,
-            hosted: hosted_ui::HostedUi::default(),
-            comment_editor: None,
-            browser: crate::browser::Browser::default(),
-            browser_return: None,
-            ticket_mode: true,
-            issues: vec![],
-            issue_cursor: 0,
-            ticket: None,
-            task_cursor: 0,
-            ticket_scroll: 0,
-            issue_warning: String::new(),
-            pending_revision: None,
-            pending_cleanup_stop: None,
-            config,
-            state,
-            config_path,
-            roots: roots.clone(),
-            temporary_roots,
-            settings: None,
-            settings_open: false,
-            discovery_warnings: Vec::new(),
-            recursive,
-            projects: vec![],
-            project_cursor: 0,
-            project: None,
-            trees: vec![],
-            tree: 0,
-            snapshots: BTreeMap::new(),
-            file: 0,
-            marked: BTreeSet::new(),
-            focus: 0,
-            filter: String::new(),
-            searching: false,
-            search_before: String::new(),
-            modal: None,
-            diff: String::new(),
-            diff_token: String::new(),
-            diff_scroll: 0,
-            staged: false,
-            pr_diff: false,
-            branches: vec![],
-            prs: vec![],
-            default_base: "HEAD".into(),
-            busy: false,
-            latest_operation: None,
-            operation_history: VecDeque::new(),
-            inspected_operation_id: None,
-            history_evicted: 0,
-            next_operation_id: 1,
-            operation_scroll: usize::MAX,
-            notice: "Discovering projects…".into(),
-            error: false,
-            quit: false,
-            epoch: 0,
-            jobs: vec![Job::Discover(roots, recursive)],
-            inflight: BTreeSet::new(),
-            prefix: None,
-            last_refresh: Instant::now() - Duration::from_secs(10),
-            last_summary: Instant::now() - Duration::from_secs(10),
-            desired_tree: None,
-            waiting_prs: false,
-            recover_form: None,
-            deferred_commit: None,
-            viewport_height: 24,
-            viewport_width: 120,
+    pub fn new(session: crate::startup::Session) -> Self {
+        let mut state = session.state;
+        for c in &mut state.conversations {
+            if let Some(prompt) = c.initial_prompt.take()
+                && c.draft.is_empty()
+            {
+                c.draft = prompt;
+            }
+            if c.attention.busy() {
+                c.attention = Attention::Interrupted;
+            }
         }
-    }
-    pub fn say(&mut self, message: impl Into<String>, error: bool) {
-        self.notice = message.into();
-        self.error = error;
-    }
-    pub fn visible_projects(&self) -> Vec<&Project> {
-        self.projects
+        let projects = state.known_projects.clone();
+        let tabs = state
+            .tabs
             .iter()
-            .filter(|p| p.name.to_lowercase().contains(&self.filter.to_lowercase()))
-            .collect()
-    }
-    pub fn visible_trees(&self) -> Vec<&Worktree> {
-        self.trees
-            .iter()
-            .filter(|t| {
-                self.focus != 0
-                    || t.branch
-                        .to_lowercase()
-                        .contains(&self.filter.to_lowercase())
+            .map(|path| {
+                let nav = state
+                    .navigation
+                    .get(&path.to_string_lossy().to_string())
+                    .cloned()
+                    .unwrap_or_default();
+                let project = projects
+                    .iter()
+                    .find(|p| same_path(&p.path, path))
+                    .cloned()
+                    .unwrap_or(Project {
+                        path: path.clone(),
+                        name: path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into(),
+                    });
+                Tab {
+                    project,
+                    trees: vec![],
+                    selected: 0,
+                    view: if nav.changes {
+                        View::Changes
+                    } else {
+                        View::Sessions
+                    },
+                    conversation: nav.conversation,
+                    file: 0,
+                }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let selected_tab = tabs
+            .iter()
+            .position(|t| {
+                state
+                    .last_project
+                    .as_ref()
+                    .is_some_and(|p| same_path(p, &t.project.path))
+            })
+            .unwrap_or(0);
+        let mut app = Self {
+            terminals: Default::default(),
+            terminal_area: Rect::default(),
+            terminal_requested: BTreeMap::new(),
+            config: session.config,
+            state,
+            config_path: session.config_path,
+            roots: session.roots,
+            recursive: session.recursive,
+            projects,
+            tabs,
+            selected_tab,
+            pane: Pane::Worktrees,
+            modal: Some(Modal::Projects {
+                query: Input::default(),
+                selected: 0,
+            }),
+            snapshots: BTreeMap::new(),
+            remotes: BTreeMap::new(),
+            diff: String::new(),
+            diff_staged: false,
+            diff_scroll: 0,
+            transcript_scroll: 0,
+            marked: BTreeSet::new(),
+            composer: Input::default(),
+            cli_focused: false,
+            attachments: vec![],
+            expanded: false,
+            jobs: vec![],
+            agent_commands: vec![],
+            pending: BTreeSet::new(),
+            mutation: None,
+            notice: None,
+            operation_output: String::new(),
+            connected: false,
+            attached: BTreeSet::new(),
+            connection_url: None,
+            agents: json!([]),
+            provider_options: json!({}),
+            completions: Value::Null,
+            hits: vec![],
+            quit: false,
+            confirm_yes: false,
+            failed_form: None,
+            last_refresh: Instant::now(),
+            last_agent_refresh: Instant::now(),
+            last_save: Instant::now(),
+            dirty: false,
+        };
+        app.enqueue(Job::Discover(app.roots.clone(), app.recursive));
+        for project in app
+            .tabs
+            .iter()
+            .map(|t| t.project.clone())
+            .collect::<Vec<_>>()
+        {
+            app.enqueue(Job::Trees(project));
+        }
+        app
     }
-    pub fn selected_tree(&self) -> Option<&Worktree> {
-        self.visible_trees().get(self.tree).copied()
+    pub fn tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.selected_tab)
+    }
+    pub fn tree(&self) -> Option<&Worktree> {
+        self.tab().and_then(|t| t.trees.get(t.selected))
     }
     pub fn snapshot(&self) -> Option<&Snapshot> {
-        self.selected_tree()
-            .and_then(|w| self.snapshots.get(&w.path))
+        self.tree().and_then(|t| self.snapshots.get(&t.path))
     }
-    pub fn visible_files(&self) -> Vec<&ChangedFile> {
-        self.snapshot()
-            .map(|s| {
-                s.files
+    pub fn conversation(&self) -> Option<&Conversation> {
+        self.tab()
+            .and_then(|t| t.conversation.as_ref())
+            .and_then(|id| self.state.conversations.iter().find(|c| &c.id == id))
+    }
+    pub fn sessions(&self) -> Vec<&Conversation> {
+        self.tree()
+            .map(|t| {
+                self.state
+                    .conversations
                     .iter()
-                    .filter(|f| {
-                        self.focus != 1
-                            || f.path
-                                .to_string_lossy()
-                                .to_lowercase()
-                                .contains(&self.filter.to_lowercase())
+                    .filter(|c| {
+                        same_path(&c.worktree, &t.path) && (!c.archived || self.show_archived())
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
-    pub fn selected_file(&self) -> Option<&ChangedFile> {
-        self.visible_files().get(self.file).copied()
+    pub fn show_archived(&self) -> bool {
+        self.state
+            .navigation
+            .get("@archived")
+            .is_some_and(|n| n.changes)
+    }
+    pub fn busy(&self, path: &Path) -> bool {
+        self.state
+            .conversations
+            .iter()
+            .any(|c| same_path(&c.worktree, path) && c.attention.busy())
+    }
+    pub fn say(&mut self, message: impl Into<String>, error: bool) {
+        self.notice = Some((message.into(), error, Instant::now()));
     }
     pub fn enqueue(&mut self, job: Job) {
-        let token = job.token();
-        if self.inflight.insert(token) {
+        if self.pending.insert(job.token()) {
             self.jobs.push(job);
         }
     }
-    pub fn operation(&mut self, op: Operation) {
-        if self.workspace_open
-            && self.workspace_tab == workspace_ui::WorkspaceTab::Changes
-            && !self.workspace_changes_ready()
+    pub fn visible_projects(&self, query: &str) -> Vec<usize> {
+        let q = query.to_lowercase();
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.name.to_lowercase().contains(&q)
+                    || p.path.to_string_lossy().to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+    pub fn open_project(&mut self, index: usize) {
+        let Some(project) = self.projects.get(index).cloned() else {
+            return;
+        };
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| same_path(&t.project.path, &project.path))
+        {
+            self.selected_tab = index;
+        } else {
+            let nav = self
+                .state
+                .navigation
+                .get(&project.path.to_string_lossy().to_string())
+                .cloned()
+                .unwrap_or_default();
+            self.tabs.push(Tab {
+                project: project.clone(),
+                trees: vec![],
+                selected: 0,
+                view: if nav.changes {
+                    View::Changes
+                } else {
+                    View::Sessions
+                },
+                conversation: nav.conversation,
+                file: 0,
+            });
+            self.selected_tab = self.tabs.len() - 1;
+        }
+        self.modal = None;
+        self.cli_focused = false;
+        self.dirty = true;
+        self.enqueue(Job::Remotes(project.clone()));
+        self.enqueue(Job::Trees(project));
+        self.restore_composer();
+    }
+    pub fn accept(&mut self, token: String, result: Result<Completion>) {
+        self.pending.remove(&token);
+        if token == "mutation" {
+            self.mutation = None;
+        }
+        let completion = match result {
+            Ok(c) => c,
+            Err(e) => {
+                self.say(format!("{e:#}"), true);
+                if token == "mutation" && self.modal.is_none() {
+                    self.modal = self.failed_form.clone().map(Modal::Form);
+                }
+                return;
+            }
+        };
+        match completion {
+            Completion::Remotes(path, remotes) => {
+                self.remotes.insert(path, remotes);
+            }
+            Completion::Associated(item) => self.agent_event(agent::Event::Catalog(vec![item])),
+            Completion::Projects(projects, warnings) => {
+                let mut projects = projects;
+                for old in &self.projects {
+                    if !old.path.is_dir() && !projects.iter().any(|p| same_path(&p.path, &old.path))
+                    {
+                        projects.push(old.clone());
+                    }
+                }
+                self.projects = projects;
+                self.state.known_projects = self.projects.clone();
+                self.dirty = true;
+                if !warnings.is_empty() {
+                    self.say(warnings.join("; "), true);
+                }
+            }
+            Completion::Trees(project, mut trees) => {
+                // Missing checkouts keep their saved conversations readable.
+                for c in &self.state.conversations {
+                    if same_path(&c.project, &project.path)
+                        && !trees.iter().any(|t| same_path(&t.path, &c.worktree))
+                    {
+                        trees.push(Worktree {
+                            path: c.worktree.clone(),
+                            branch: "(removed)".into(),
+                            head: String::new(),
+                            original: false,
+                            locked: false,
+                            prunable: true,
+                        });
+                    }
+                }
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|t| same_path(&t.project.path, &project.path))
+                {
+                    let previous =
+                        tab.trees
+                            .get(tab.selected)
+                            .map(|t| t.path.clone())
+                            .or_else(|| {
+                                self.state
+                                    .navigation
+                                    .get(&project.path.to_string_lossy().to_string())
+                                    .and_then(|n| n.worktree.clone())
+                            });
+                    tab.selected = previous
+                        .and_then(|p| trees.iter().position(|t| same_path(&t.path, &p)))
+                        .unwrap_or(0);
+                    tab.trees = trees;
+                }
+                let paths = self
+                    .tabs
+                    .iter()
+                    .find(|t| same_path(&t.project.path, &project.path))
+                    .into_iter()
+                    .flat_map(|t| &t.trees)
+                    .filter(|t| !t.prunable)
+                    .map(|t| t.path.clone())
+                    .collect::<Vec<_>>();
+                for path in paths {
+                    self.enqueue(Job::Status(path));
+                }
+                self.selection_changed();
+            }
+            Completion::Status(path, snapshot) => {
+                let selected = self
+                    .tree()
+                    .filter(|t| same_path(&t.path, &path))
+                    .and_then(|_| self.selected_file().map(|f| f.path.clone()));
+                if let Some(tab) = self.tabs.get_mut(self.selected_tab)
+                    && tab
+                        .trees
+                        .get(tab.selected)
+                        .is_some_and(|t| same_path(&t.path, &path))
+                {
+                    tab.file = selected
+                        .and_then(|p| snapshot.files.iter().position(|f| f.path == p))
+                        .unwrap_or_else(|| tab.file.min(snapshot.files.len().saturating_sub(1)));
+                }
+                self.snapshots.insert(path.clone(), snapshot);
+                if self.tree().is_some_and(|t| same_path(&t.path, &path)) {
+                    self.request_diff();
+                }
+            }
+            Completion::Diff(path, file, staged, text) => {
+                if self.tree().is_some_and(|t| same_path(&t.path, &path))
+                    && self.selected_file().is_some_and(|f| f.path == file)
+                    && self.diff_staged == staged
+                {
+                    self.diff = text;
+                }
+            }
+            Completion::Operated {
+                project,
+                target,
+                created,
+                session,
+            } => {
+                self.say("Operation completed", false);
+                self.failed_form = None;
+                self.marked.clear();
+                if let Some(path) = created {
+                    self.state
+                        .navigation
+                        .entry(project.to_string_lossy().into())
+                        .or_default()
+                        .worktree = Some(path.clone());
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| same_path(&t.project.path, &project))
+                    {
+                        tab.trees.push(Worktree {
+                            path: path.clone(),
+                            branch: String::new(),
+                            head: String::new(),
+                            original: false,
+                            locked: false,
+                            prunable: false,
+                        });
+                        tab.selected = tab.trees.len() - 1;
+                    }
+                    if let Some((prompt, config)) = session {
+                        self.start_conversation(
+                            project.clone(),
+                            path,
+                            prompt,
+                            String::new(),
+                            config,
+                        );
+                    }
+                }
+                self.enqueue(Job::Trees(Project {
+                    name: project
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into(),
+                    path: project,
+                }));
+                if target.is_dir() {
+                    self.enqueue(Job::Status(target));
+                }
+            }
+        }
+    }
+    pub fn selected_file(&self) -> Option<&ChangedFile> {
+        self.snapshot().and_then(|s| s.files.get(self.tab()?.file))
+    }
+    pub fn request_diff(&mut self) {
+        if self.tab().is_none_or(|t| t.view != View::Changes) {
+            return;
+        }
+        if let (Some(tree), Some(file)) = (self.tree(), self.selected_file()) {
+            self.enqueue(Job::Diff(tree.path.clone(), file.clone(), self.diff_staged));
+        } else {
+            self.diff.clear();
+        }
+    }
+    pub fn selection_changed(&mut self) {
+        self.diff_scroll = 0;
+        self.transcript_scroll = 0;
+        self.marked.clear();
+        self.cli_focused = false;
+        self.dirty = true;
+        if let Some(path) = self.tree().filter(|t| !t.prunable).map(|t| t.path.clone()) {
+            self.enqueue(Job::Status(path));
+        }
+        let current = self.tab().and_then(|t| t.conversation.clone());
+        let sessions = self.sessions();
+        let chosen = sessions
+            .iter()
+            .find(|s| Some(&s.id) == current.as_ref())
+            .or_else(|| sessions.first())
+            .map(|s| s.id.clone());
+        if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+            tab.conversation = chosen;
+        }
+        self.restore_composer();
+        self.request_diff();
+    }
+    fn restore_composer(&mut self) {
+        self.composer = Input::new(
+            self.conversation()
+                .map(|c| c.draft.clone())
+                .unwrap_or_default(),
+        );
+        self.attachments.clear();
+    }
+    fn sync_draft(&mut self) {
+        if let Some(id) = self.tab().and_then(|t| t.conversation.clone())
+            && let Some(c) = self.state.conversations.iter_mut().find(|c| c.id == id)
+        {
+            c.draft = self.composer.value.clone();
+            self.dirty = true;
+        }
+    }
+    pub fn operate(&mut self, operation: Operation) {
+        let (Some(project), Some(tree)) = (
+            self.tab().map(|t| t.project.path.clone()),
+            self.tree().cloned(),
+        ) else {
+            return;
+        };
+        if self.mutation.is_some() {
+            self.say("Wait for the current Git operation", true);
+            return;
+        }
+        if !matches!(operation, Operation::Fetch | Operation::Create { .. })
+            && self.busy(&tree.path)
         {
             self.say(
-                "Workspace checkout is unavailable; Git action refused",
+                "Agent active: wait for idle or stop its turn before Git writes",
                 true,
             );
             return;
         }
-        if self.busy {
-            self.say("A Git operation is already running", true);
+        if tree.prunable && !matches!(operation, Operation::Create { .. }) {
+            self.say(
+                "This checkout is missing; its conversations are read-only",
+                true,
+            );
             return;
         }
-        let Some(project) = self.project.clone() else {
-            return;
-        };
-        let path = self
-            .selected_tree()
-            .map(|t| t.path.clone())
-            .unwrap_or(project.path.clone());
-        if let Operation::Remove(target) = &op {
-            match workflow::Workflow::new(&self.config_path).snapshot() {
-                Ok(state) if workflow::deletion_owner(&state, target).is_none() => {}
-                Ok(_) => {
-                    self.say("Managed session has not been verified stopped; use ticket cleanup to stop it explicitly", true);
-                    return;
-                }
-                Err(error) => {
-                    self.say(format!("Cannot verify managed ownership: {error:#}"), true);
-                    return;
-                }
-            }
-        }
-        self.busy = true;
-        self.epoch += 1;
-        let id = self.next_operation_id;
-        self.next_operation_id += 1;
-        let action = match &op {
-            Operation::Stage(_, true) => "Unstage".into(),
-            Operation::Stage(_, false) => "Stage".into(),
-            Operation::Commit(..) => "Commit".into(),
-            Operation::Fetch => "Fetch".into(),
-            Operation::Pull => "Pull".into(),
-            Operation::Push => "Push".into(),
-            Operation::Publish(remote, branch) => format!("Publish → {remote}/{branch}"),
-            Operation::Create { branch, .. } => format!("Create worktree {branch}"),
-            Operation::Branch(branch, _) => format!("Create branch {branch}"),
-            Operation::DeleteBranch(branch) => format!("Delete branch {branch}"),
-            Operation::Remove(_) => "Remove worktree".into(),
-            Operation::Review(number, _) => format!("Prepare PR review {number}"),
-            Operation::OpenPr(_) => "Open pull request".into(),
-        };
-        let target = match &op {
-            Operation::Remove(target) => target.clone(),
-            Operation::Create { destination, .. } | Operation::Review(_, destination) => {
-                destination.clone()
-            }
-            _ => path.clone(),
-        };
-        let selected = if matches!(self.modal, Some(Modal::OperationDetails)) {
-            self.inspected_operation_id
-        } else {
-            None
-        };
-        if let Some(previous) = self.latest_operation.take() {
-            self.operation_history.push_back(previous);
-        }
-        while self.operation_history.len() >= HISTORY_LIMIT {
-            let oldest = self
-                .operation_history
-                .iter()
-                .position(|record| Some(record.id) != selected)
-                .unwrap_or(0);
-            self.operation_history.remove(oldest);
-            self.history_evicted = self.history_evicted.saturating_add(1);
-        }
-        self.latest_operation = Some(Record::new(id, action, project.path.clone(), target));
-        if selected.is_none() {
-            self.operation_scroll = usize::MAX;
-        }
-        self.refresh_operation_picker();
-        self.say("Running Git operation…", false);
-        self.jobs.push(Job::Operation {
-            config_path: self.config_path.clone(),
-            id,
-            project: project.path,
-            path,
-            op,
+        self.mutation = Some((tree.path.clone(), operation.label().into()));
+        self.operation_output.clear();
+        self.enqueue(Job::Operate {
+            project,
+            target: tree.path,
+            operation,
         });
     }
-    pub fn accept_feedback(&mut self, event: Event) {
-        if let Some(record) = &mut self.latest_operation
-            && record.id == event.id
-            && record.running()
-        {
-            record.apply(event.update);
-        }
-        self.refresh_operation_picker();
-    }
-    pub fn operation_records(&self) -> Vec<&Record> {
-        self.latest_operation
-            .iter()
-            .chain(self.operation_history.iter().rev())
-            .collect()
-    }
-    pub fn inspected_operation(&self) -> Option<&Record> {
-        let id = self.inspected_operation_id?;
-        self.operation_records()
-            .into_iter()
-            .find(|record| record.id == id)
-    }
-    fn operation_entries(&self) -> Vec<(String, String)> {
-        self.operation_records()
-            .into_iter()
-            .map(|record| {
-                let outcome = match &record.result {
-                    Some(Ok(message)) => message
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(120)
-                        .collect::<String>(),
-                    Some(Err(message)) => message
-                        .lines()
-                        .rev()
-                        .find(|line| !line.trim().is_empty())
-                        .unwrap_or("")
-                        .chars()
-                        .take(120)
-                        .collect::<String>(),
-                    None => record.phase.clone(),
-                };
-                (
-                    format!(
-                        "#{} {} · {}: {}\nProject: {} · {}\nTarget: {} · {}",
-                        record.id,
-                        record.action_label(),
-                        record.phase,
-                        outcome,
-                        record
-                            .project
-                            .file_name()
-                            .unwrap_or(record.project.as_os_str())
-                            .to_string_lossy(),
-                        record.project.display(),
-                        record
-                            .target
-                            .file_name()
-                            .unwrap_or(record.target.as_os_str())
-                            .to_string_lossy(),
-                        record.target.display()
-                    ),
-                    record.id.to_string(),
-                )
-            })
-            .collect()
-    }
-    fn refresh_operation_picker(&mut self) {
-        if !matches!(&self.modal, Some(Modal::Picker(picker)) if matches!(picker.kind, PickerKind::Operations))
-        {
-            return;
-        }
-        let entries = self.operation_entries();
-        if let Some(Modal::Picker(picker)) = &mut self.modal {
-            let selected = picker
-                .visible()
-                .get(picker.selected)
-                .map(|entry| entry.1.clone());
-            picker.entries = entries;
-            picker.selected = selected
-                .and_then(|selected| {
-                    picker
-                        .visible()
-                        .iter()
-                        .position(|entry| entry.1 == selected)
-                })
-                .unwrap_or(
-                    picker
-                        .selected
-                        .min(picker.visible().len().saturating_sub(1)),
-                );
-        }
-    }
-    fn show_operation_history(&mut self) {
-        self.picker(
-            "Recent Git operations",
-            PickerKind::Operations,
-            self.operation_entries(),
-        );
-    }
-    pub fn accept(&mut self, done: Completion) {
-        self.inflight.remove(&done.token);
-        let operation = done.token.starts_with("operation:");
-        if operation {
-            let Some(record) = &mut self.latest_operation else {
-                return;
-            };
-            if record.token() != done.token || !record.running() {
-                return;
-            }
-            let result = match &done.result {
-                Ok(Payload::Done(_, _, message)) => Ok(message.clone()),
-                Err(error) => Err(format!("{error:#}")),
-                _ => return,
-            };
-            record.finish(result);
-            self.refresh_operation_picker();
-            self.busy = false;
-            self.epoch += 1;
-        } else if done.epoch != self.epoch && done.token != "host" {
-            return;
-        }
-        match done.result {
-            Ok(Payload::LocalWorkflow(state)) => self.state.workflow = state,
-            Ok(Payload::BrowserOpened) => self.say("Opened ticket in GitHub", false),
-            Ok(Payload::Host(response)) => self.accept_host(response),
-            Err(error) => {
-                if done.token == "workflow" {
-                    self.workspace_start_pending = false;
-                }
-                if done.token == "workflow"
-                    && let Some(editor) = &mut self.comment_editor
-                {
-                    editor.posting = false;
-                    editor.status = format!("{error:#}");
-                }
-                if done.token.starts_with("browser:")
-                    && !self.browser_failed(&done.token, format!("{error:#}"))
-                {
-                    return;
-                }
-                if done.token == "host" {
-                    self.hosted_request_failed(format!("{error:#}"));
-                } else {
-                    self.say(format!("{error:#}"), true);
-                }
-                if operation && let Some(form) = self.recover_form.take() {
-                    if self.modal.is_none() {
-                        self.modal = Some(Modal::Form(form));
-                    } else if matches!(form.kind, FormKind::Commit) {
-                        // A result being inspected keeps focus. Offer the failed
-                        // commit draft the next time its form is opened.
-                        self.deferred_commit = Some(form);
-                    }
-                }
-            }
-            Ok(Payload::Workflow(event)) => match event {
-                WorkflowEvent::Workspace(workspace) => {
-                    if let Ok(state) = workflow::Workflow::new(&self.config_path).snapshot() {
-                        self.state.workflow = state;
-                    }
-                    // A completed save remains durable after navigation, but must
-                    // not reopen an unrelated workspace or launch its review.
-                    let same_checkout = workspace.worktree.as_ref().is_some_and(|checkout| {
-                        self.current_workspace()
-                            .and_then(|w| w.worktree)
-                            .map(|current| same_path(&current.path, &checkout.path))
-                            .unwrap_or_else(|| {
-                                self.selected_tree()
-                                    .is_some_and(|tree| same_path(&tree.path, &checkout.path))
-                            })
-                    });
-                    if !self.workspace_open
-                        || !same_checkout
-                        || self
-                            .project
-                            .as_ref()
-                            .is_none_or(|project| !same_path(&project.path, &workspace.project))
-                    {
-                        self.workspace_start_pending = false;
-                        return;
-                    }
-                    self.task_cursor = workspace
-                        .tasks
-                        .iter()
-                        .position(|task| Some(&task.id) == workspace.selected_task.as_ref())
-                        .unwrap_or(0);
-                    self.ticket = self.state.workflow.tickets.get(&workspace.id).cloned();
-                    self.workspace = Some(workspace);
-                    self.workspace_open = true;
-                    self.sync_workspace_checkout();
-                    if self.workspace_start_pending {
-                        self.workspace_start_pending = false;
-                        self.workspace_tab = workspace_ui::WorkspaceTab::Agent;
-                        self.begin_agent(false);
-                    }
-                }
-                WorkflowEvent::Comment(event) => self.accept_comment(event),
-                WorkflowEvent::Browser(event) => self.accept_browser(event),
-                WorkflowEvent::Issues(issues) => {
-                    self.issue_warning.clear();
-                    self.issues = issues;
-                    self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
-                    self.say("Select a GitHub issue · w basic worktrees", false);
-                }
-                WorkflowEvent::CachedIssues { issues, warning } => {
-                    self.issues = issues;
-                    self.issue_cursor = self.issue_cursor.min(self.issues.len().saturating_sub(1));
-                    self.issue_warning = warning.clone();
-                    self.say(warning, true);
-                }
-                WorkflowEvent::CleanupPreview(preview) => {
-                    self.ticket_scroll = 0;
-                    self.modal = Some(Modal::Cleanup(Box::new(preview)));
-                }
-                WorkflowEvent::Requirements(review) => {
-                    self.ticket_scroll = 0;
-                    self.modal = Some(Modal::Requirements(Box::new(review)));
-                }
-                WorkflowEvent::RevisionRequested(request) => {
-                    self.pending_revision = Some(request);
-                    self.say(
-                        "Revised requirements approved; awaiting the selected live session",
-                        false,
-                    );
-                }
-                WorkflowEvent::Ticket(ticket) => {
-                    if !self.workspace_open
-                        || self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id())
-                    {
-                        self.workspace_tab = workspace_ui::WorkspaceTab::Overview;
-                    }
-                    if self.ticket.as_ref().map(TicketRecord::id) != Some(ticket.id()) {
-                        self.task_cursor = ticket
-                            .tasks
-                            .iter()
-                            .position(|task| Some(&task.id) == ticket.selected_task.as_ref())
-                            .unwrap_or(0);
-                        self.ticket_scroll = 0;
-                    }
-                    let warning = ticket.github_error.clone();
-                    let updated = ticket.issue_updated();
-                    self.state
-                        .workflow
-                        .tickets
-                        .insert(ticket.id(), ticket.clone());
-                    let id = ticket.id();
-                    self.ticket = Some(ticket);
-                    self.workspace = crate::workspace::resolve(&self.state.workflow, &id).ok();
-                    self.workspace_open = true;
-                    self.sync_workspace_checkout();
-                    let unavailable = warning.is_some();
-                    let message = warning.unwrap_or_else(|| {
-                        if updated {
-                            "Issue updated · v inspect requirements · R refresh".into()
-                        } else {
-                            "Ticket ready · c create or a adopt shared worktree · i import tasks · R refresh".into()
-                        }
-                    });
-                    self.say(message, unavailable);
-                }
-            },
-            Ok(Payload::Projects(projects, warnings)) => {
-                self.discovery_warnings = warnings.clone();
-                if let Some(draft) = &mut self.settings {
-                    draft.update_warnings(&warnings);
-                }
-                self.projects = projects;
-                if self.project.as_ref().is_some_and(|current| {
-                    !self
-                        .projects
-                        .iter()
-                        .any(|project| same_path(&current.path, &project.path))
-                }) {
-                    self.project = None;
-                    self.trees.clear();
-                    self.snapshots.clear();
-                    self.diff.clear();
-                }
-                self.project_cursor = self
-                    .state
-                    .last_project
-                    .as_ref()
-                    .and_then(|p| self.projects.iter().position(|x| same_path(&x.path, p)))
-                    .unwrap_or(0);
-                self.say(
-                    if warnings.is_empty() {
-                        format!("{} projects · ? actions", self.projects.len())
-                    } else {
-                        format!("{} projects · {}", self.projects.len(), warnings.join("; "))
-                    },
-                    !warnings.is_empty(),
-                );
-            }
-            Ok(Payload::Trees(path, trees, base)) => {
-                if self
-                    .project
-                    .as_ref()
-                    .is_some_and(|p| same_path(&p.path, &path))
-                {
-                    let previous = self.selected_tree().map(|t| t.path.clone());
-                    let old = self
-                        .desired_tree
-                        .take()
-                        .or_else(|| previous.clone())
-                        .or_else(|| self.state.last_worktree.clone());
-                    self.trees = trees;
-                    self.tree = old
-                        .and_then(|p| {
-                            self.visible_trees()
-                                .iter()
-                                .position(|t| same_path(&t.path, &p))
-                        })
-                        .unwrap_or(self.tree.min(self.visible_trees().len().saturating_sub(1)));
-                    self.default_base = base;
-                    if previous != self.selected_tree().map(|t| t.path.clone()) {
-                        self.selection_changed();
-                    }
-                }
-            }
-            Ok(Payload::Status(path, snapshot)) => {
-                let selected = self.selected_file().map(|f| f.path.clone());
-                let active = self
-                    .selected_tree()
-                    .is_some_and(|w| same_path(&w.path, &path));
-                self.snapshots.insert(path, snapshot);
-                if active {
-                    self.file = selected
-                        .and_then(|p| self.visible_files().iter().position(|f| f.path == p))
-                        .unwrap_or(self.file.min(self.visible_files().len().saturating_sub(1)));
-                    self.request_diff(true);
-                }
-            }
-            Ok(Payload::Diff(token, diff)) => {
-                if token == self.diff_token {
-                    self.diff = diff;
-                }
-            }
-            Ok(Payload::Branches(path, branches)) => {
-                if self
-                    .project
-                    .as_ref()
-                    .is_some_and(|p| same_path(&p.path, &path))
-                {
-                    self.branches = branches;
-                }
-            }
-            Ok(Payload::Prs(path, prs)) => {
-                if self
-                    .project
-                    .as_ref()
-                    .is_some_and(|p| same_path(&p.path, &path))
-                {
-                    self.prs = prs;
-                    if self.waiting_prs {
-                        self.waiting_prs = false;
-                        if self.modal.is_none() {
-                            self.open_pr_picker();
-                        }
-                    }
-                }
-            }
-            Ok(Payload::Done(project, path, message)) => {
-                self.recover_form = None;
-                self.say(message, false);
-                if self
-                    .project
-                    .as_ref()
-                    .is_some_and(|p| same_path(&p.path, &project))
-                {
-                    if path.is_some() {
-                        self.filter.clear();
-                        self.focus = 0;
-                    }
-                    self.desired_tree = path;
-                    self.enqueue(Job::Trees(project.clone()));
-                    self.enqueue(Job::Branches(project));
-                    self.last_refresh = Instant::now() - Duration::from_secs(10);
-                    self.last_summary = Instant::now() - Duration::from_secs(10);
-                }
-            }
-        }
-    }
-    pub fn open_basic_project(&mut self) {
-        self.open_project();
-        self.ticket_mode = false;
-        self.jobs.retain(|job| !matches!(job, Job::Workflow(..)));
-        self.inflight.remove("workflow");
-        self.say("Basic worktrees · T tickets", false);
-    }
-    pub fn open_project(&mut self) {
-        if let Some(project) = self
-            .visible_projects()
-            .get(self.project_cursor)
-            .cloned()
-            .cloned()
-        {
-            self.epoch += 1;
-            self.recover_form = None;
-            self.deferred_commit = None;
-            self.project = Some(project.clone());
-            self.state.last_project = Some(project.path.clone());
-            self.trees.clear();
-            self.tree = 0;
-            self.file = 0;
-            self.focus = 0;
-            self.filter.clear();
-            self.branches.clear();
-            self.prs.clear();
-            self.diff.clear();
-            self.enqueue(Job::Trees(project.path.clone()));
-            self.enqueue(Job::Branches(project.path.clone()));
-            self.ticket = None;
-            self.workspace = None;
-            self.workspace_open = false;
-            self.work_mode = false;
-            self.issues.clear();
-            self.ticket_mode = true;
-            self.browser = crate::browser::Browser::default();
-            let entry = self
-                .state
-                .workspace_views
-                .get(&project.path.to_string_lossy().to_string())
-                .cloned()
-                .unwrap_or_else(|| "tickets".into());
-            self.switch_entry(&entry);
-            self.say(
-                match entry.as_str() {
-                    "work" => "Project work · T tickets · w worktrees",
-                    "worktrees" => "Worktrees · W work · T tickets",
-                    _ => "Loading GitHub tickets… · W work · w worktrees",
-                },
-                false,
-            );
-        }
-    }
-    pub fn selection_changed(&mut self) {
-        self.recover_form = None;
-        self.deferred_commit = None;
-        self.file = 0;
-        self.marked.clear();
-        self.pr_diff = false;
-        self.diff_scroll = 0;
-        self.diff.clear();
-        self.diff_token.clear();
-        if let Some(w) = self.selected_tree() {
-            let path = w.path.clone();
-            self.state.last_worktree = Some(path.clone());
-            self.enqueue(Job::Status(path));
-        }
-    }
-    pub fn request_diff(&mut self, force: bool) {
-        let Some(wt) = self.selected_tree().cloned() else {
+    fn creation_form(&mut self, session: bool) {
+        let Some(tree) = self.tree().cloned() else {
             return;
         };
-        if self.pr_diff {
-            let token = format!("review:{}", wt.path.display());
-            if force || self.diff_token != token {
-                self.diff_token = token;
-                self.enqueue(Job::ReviewDiff(wt.path, wt.branch));
-            }
-            return;
-        }
-        let Some(file) = self.selected_file().cloned() else {
-            self.diff.clear();
-            self.diff_token.clear();
+        let Some(project) = self.tab().map(|t| t.project.path.clone()) else {
             return;
         };
-        let key = diff_key(&wt.path, &file.path, self.staged);
-        if force || key != self.diff_token {
-            self.diff_token = key;
-            self.enqueue(Job::Diff(wt.path, file, self.staged));
+        let mut fields = Vec::new();
+        if session {
+            fields.push(Field {
+                key: "prompt".into(),
+                label: "First prompt (optional)".into(),
+                input: Input::default(),
+                kind: FieldType::Multiline,
+            });
+            fields.push(Field::toggle("new_tree", "Create in a new worktree", false));
         }
-    }
-    pub fn tick(&mut self) {
-        self.browser_tick();
-        self.hosted_tick();
-        if self
-            .prefix
-            .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
-        {
-            self.prefix = None;
-        }
-        if self.project.is_some()
-            && !self.busy
-            && self.last_refresh.elapsed() > Duration::from_millis(1500)
-        {
-            self.last_refresh = Instant::now();
-            if let Some(wt) = self.selected_tree() {
-                self.enqueue(Job::Status(wt.path.clone()));
-            }
-        }
-        if self.project.is_some()
-            && !self.busy
-            && self.last_summary.elapsed() > Duration::from_secs(5)
-        {
-            self.last_summary = Instant::now();
-            if let Some(p) = self.project.clone() {
-                self.enqueue(Job::Trees(p.path));
-            }
-            for wt in self
-                .trees
-                .iter()
-                .skip(self.tree.saturating_sub(8))
-                .take(20)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                if wt.path.exists() {
-                    self.enqueue(Job::Status(wt.path));
-                }
-            }
-        }
-    }
-    fn base(&self) -> String {
-        let Some(p) = &self.project else {
-            return "HEAD".into();
-        };
-        self.config
-            .project(&p.path)
-            .and_then(|p| p.base.clone())
-            .or_else(|| {
-                self.state
-                    .bases
-                    .get(&p.path.to_string_lossy().into_owned())
-                    .cloned()
-            })
-            .unwrap_or(self.default_base.clone())
-    }
-    pub fn create_form(&mut self, branch: String, existing: bool, branch_only: bool) {
-        let Some(p) = &self.project else { return };
-        let base = if existing {
-            branch.clone()
-        } else {
-            self.base()
-        };
-        let destination = self
-            .config
-            .worktree_path(&p.path, &branch)
-            .display()
-            .to_string();
-        let mut fields = if branch_only {
-            vec![
-                Field::new("Branch name", branch, false),
-                Field::new("Starting point · Ctrl+b picker", base, false),
-            ]
-        } else {
-            vec![
-                Field::new("Branch name", branch, false),
-                Field::new("Starting point · Ctrl+b picker", base, false),
-                Field::new("Worktree directory", destination, false),
-                Field::new("Fetch first? yes/no", "no".into(), false),
-            ]
-        };
-        if existing {
-            fields[0].readonly = true;
-            fields[1].readonly = true;
-            fields[1].label = "Existing branch · fixed starting point".into();
+        fields.extend([
+            Field::text("branch", "New branch", ""),
+            Field::text(
+                "base",
+                "Starting point · blank = latest remote default; HEAD = selected commit",
+                "",
+            ),
+            Field::text(
+                "destination",
+                "Directory · blank = configured worktree location",
+                "",
+            ),
+            Field::toggle("fetch", "Fetch before creation", true),
+            Field::text(
+                "remote",
+                "Remote · blank = configured / origin / sole remote",
+                self.config.remote(&project).unwrap_or_default(),
+            ),
+        ]);
+        if session {
+            fields.push(Field::text("name", "Conversation name · optional", ""));
+            fields.push(self.model_field(None));
+            fields.extend(config_fields(&self.provider_options));
         }
         self.modal = Some(Modal::Form(Form {
-            title: if branch_only {
-                "Create branch"
-            } else if existing {
-                "Use existing branch"
+            kind: if session {
+                FormKind::Session
             } else {
-                "Create worktree"
-            }
-            .into(),
-            kind: if branch_only {
-                FormKind::Branch
-            } else {
-                FormKind::Create { existing }
+                FormKind::Worktree
             },
             fields,
-            active: if existing { 2 } else { 0 },
-            path_custom: false,
+            focused: 0,
+            advanced: false,
+            title: if session {
+                "New Copilot session"
+            } else {
+                "New worktree"
+            }
+            .into(),
+            context: json!({"worktree":tree.path}),
         }));
+        self.agent_commands.push(agent::Command::Options {
+            worktree: tree.path,
+        });
     }
-    fn picker(&mut self, title: &str, kind: PickerKind, entries: Vec<(String, String)>) {
-        self.modal = Some(Modal::Picker(Picker {
-            title: title.into(),
-            kind,
-            entries,
-            query: String::new(),
-            selected: 0,
-            editing: false,
-            top_prefix: false,
-        }));
+    fn start_conversation(
+        &mut self,
+        project: PathBuf,
+        worktree: PathBuf,
+        prompt: String,
+        name: String,
+        config: Value,
+    ) {
+        if self.busy(&worktree) {
+            self.say("This worktree already has an active turn", true);
+            return;
+        }
+        let id = format!("ahp-session:/{}", uuid::Uuid::new_v4());
+        let name = if name.trim().is_empty() {
+            config
+                .get("_treerailName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            name
+        };
+        let title = if name.trim().is_empty() {
+            prompt
+                .lines()
+                .next()
+                .unwrap_or("New conversation")
+                .chars()
+                .take(64)
+                .collect()
+        } else {
+            name
+        };
+        self.state.conversations.push(Conversation {
+            id: id.clone(),
+            project: project.clone(),
+            worktree,
+            title,
+            session_uri: id.clone(),
+            chat_uri: None,
+            attention: Attention::Running,
+            archived: false,
+            draft: String::new(),
+            chat: None,
+            error: None,
+            pending: vec![],
+            options: Value::Null,
+            owned: true,
+            initial_prompt: (!prompt.trim().is_empty()).then_some(prompt.clone()),
+            creation_failed: false,
+            model: config
+                .get("_treerailModel")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|t| same_path(&t.project.path, &project))
+        {
+            tab.conversation = Some(id.clone());
+            tab.view = View::Sessions;
+        }
+        let worktree = self
+            .state
+            .conversations
+            .last()
+            .expect("created")
+            .worktree
+            .clone();
+        self.agent_commands.push(agent::Command::Create {
+            id: id.clone(),
+            worktree,
+            prompt,
+            config,
+        });
+        let model = self
+            .state
+            .conversations
+            .last()
+            .and_then(|c| c.model.clone());
+        self.terminal_requested.insert(id, model);
+        self.modal = None;
+        self.dirty = true;
+        self.restore_composer();
     }
-    fn open_pr_picker(&mut self) {
-        let entries = self
-            .prs
-            .iter()
-            .map(|p| {
-                (
-                    format!(
-                        "#{}  {}  [{} → {}]",
-                        p.number, p.title, p.head_ref_name, p.base_ref_name
-                    ),
-                    p.number.to_string(),
-                )
-            })
-            .collect();
-        self.picker("Pull requests", PickerKind::Prs, entries);
+    fn submit_form(&mut self, form: Form) -> Result<()> {
+        match form.kind {
+            FormKind::Session | FormKind::Worktree => {
+                anyhow::ensure!(
+                    self.mutation.is_none(),
+                    "Wait for the current Git operation"
+                );
+                let is_session = form.kind == FormKind::Session;
+                let makes_tree = !is_session || form.value("new_tree") == "yes";
+                let prompt = form.value("prompt");
+                let project = self.tab().context("Choose a project")?.project.path.clone();
+                let tree = self.tree().context("Choose a worktree")?.path.clone();
+                let mut options = self.provider_options["values"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                if !form.value("model").is_empty() {
+                    options.insert("_treerailModel".into(), json!(form.value("model")));
+                }
+                if !form.value("name").is_empty() {
+                    options.insert("_treerailName".into(), json!(form.value("name")));
+                }
+                for field in &form.fields {
+                    if let Some(key) = field.key.strip_prefix("config:") {
+                        options.insert(
+                            key.into(),
+                            field_value(
+                                field,
+                                &self.provider_options["schema"]["properties"][key],
+                            )?,
+                        );
+                    }
+                }
+                if makes_tree {
+                    self.failed_form = Some(form.clone());
+                    let branch = form.value("branch");
+                    anyhow::ensure!(!branch.trim().is_empty(), "Enter a new branch name");
+                    let dest = form.value("destination");
+                    let destination = if dest.trim().is_empty() {
+                        self.config.worktree_path(&project, &branch)
+                    } else {
+                        PathBuf::from(dest)
+                    };
+                    self.operate(Operation::Create {
+                        branch,
+                        base: form.value("base"),
+                        destination,
+                        source: tree,
+                        remote: if form.value("remote").is_empty() {
+                            None
+                        } else {
+                            Some(form.value("remote"))
+                        },
+                        fetch: form.value("fetch") == "yes",
+                        session: if is_session {
+                            Some((prompt, Value::Object(options)))
+                        } else {
+                            None
+                        },
+                    });
+                    anyhow::ensure!(self.mutation.is_some(), "Worktree creation could not start");
+                } else {
+                    anyhow::ensure!(
+                        !self.busy(&tree),
+                        "Agent active: stop its turn or create a new worktree"
+                    );
+                    anyhow::ensure!(
+                        self.mutation
+                            .as_ref()
+                            .is_none_or(|(p, _)| !same_path(p, &tree)),
+                        "Wait for Git to finish"
+                    );
+                    anyhow::ensure!(tree.is_dir(), "Checkout is missing");
+                    self.failed_form = Some(form.clone());
+                    self.start_conversation(
+                        project,
+                        tree,
+                        prompt,
+                        form.value("name"),
+                        Value::Object(options),
+                    );
+                }
+            }
+            FormKind::Commit => {
+                anyhow::ensure!(
+                    !form.value("subject").trim().is_empty(),
+                    "Enter a commit subject"
+                );
+                anyhow::ensure!(
+                    self.snapshot()
+                        .is_some_and(|s| s.files.iter().any(ChangedFile::staged)),
+                    "Stage files before committing"
+                );
+                self.operate(Operation::Commit(form.value("subject"), form.value("body")));
+            }
+            FormKind::AddPath => {
+                let path = std::path::absolute(form.value("path"))?;
+                anyhow::ensure!(path.is_dir(), "That directory does not exist");
+                if !self
+                    .state
+                    .remembered_sources
+                    .iter()
+                    .any(|p| same_path(p, &path))
+                {
+                    self.state.remembered_sources.push(path.clone());
+                }
+                if !self.roots.iter().any(|p| same_path(p, &path)) {
+                    self.roots.push(path);
+                }
+                self.dirty = true;
+                self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+            }
+            FormKind::Attach => {
+                let path = PathBuf::from(form.value("path"));
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    self.tree().context("Choose a worktree")?.path.join(path)
+                };
+                let path = path.canonicalize()?;
+                anyhow::ensure!(path.is_file(), "Choose a file");
+                let uri = url::Url::from_file_path(&path)
+                    .map_err(|_| anyhow::anyhow!("Invalid file path"))?;
+                self.attachments.push(json!({"type":"resource","label":path.file_name().unwrap_or_default().to_string_lossy(),"uri":uri.as_str()}));
+            }
+            FormKind::Question => {
+                let mut answers = serde_json::Map::new();
+                for field in &form.fields {
+                    let kind = form.context["questions"]
+                        .as_array()
+                        .and_then(|qs| qs.iter().find(|q| q["id"].as_str() == Some(&field.key)))
+                        .and_then(|q| q["kind"].as_str())
+                        .unwrap_or("text");
+                    let (kind, value) = match kind {
+                        "number" => (
+                            "number",
+                            serde_json::from_str::<Value>(&field.input.value)
+                                .context("Enter a valid number")?,
+                        ),
+                        "boolean" => ("boolean", json!(field.input.value == "yes")),
+                        "single-select" => ("selected", json!(field.input.value)),
+                        "multi-select" => (
+                            "selected-many",
+                            json!(
+                                field
+                                    .input
+                                    .value
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                            ),
+                        ),
+                        _ => ("text", json!(field.input.value)),
+                    };
+                    answers.insert(
+                        field.key.clone(),
+                        json!({"state":"submitted","value":{"kind":kind,"value":value}}),
+                    );
+                }
+                let channel = form.context["chat"]
+                    .as_str()
+                    .context("Question has no chat channel")?
+                    .to_owned();
+                self.agent_commands.push(agent::Command::Dispatch{channel,worktree:None,action:json!({"type":"chat/inputCompleted","requestId":form.context["requestId"],"response":"accept","answers":answers})});
+            }
+            FormKind::SessionOptions => {
+                let mut values = serde_json::Map::new();
+                for field in &form.fields {
+                    if field.key == "model" {
+                        continue;
+                    }
+                    let key = field.key.trim_start_matches("config:");
+                    values.insert(
+                        key.into(),
+                        field_value(field, &form.context["schema"]["properties"][key])?,
+                    );
+                }
+                let channel = self
+                    .conversation()
+                    .context("Choose a conversation")?
+                    .session_uri
+                    .clone();
+                if let Some(c) = self
+                    .state
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.session_uri == channel)
+                {
+                    c.model = if form.value("model").is_empty() {
+                        None
+                    } else {
+                        Some(form.value("model"))
+                    };
+                    self.dirty = true;
+                }
+                if !values.is_empty() {
+                    self.agent_commands.push(agent::Command::Dispatch {
+                        channel,
+                        worktree: None,
+                        action: json!({"type":"session/configChanged","config":values}),
+                    });
+                }
+            }
+            FormKind::PublishRemote => {
+                self.operate(Operation::Push(Some(form.value("remote"))));
+            }
+            FormKind::Preferences => {
+                let baseline: Config = serde_json::from_value(form.context.clone())
+                    .unwrap_or_else(|_| self.config.clone());
+                let mut desired = baseline.clone();
+                desired.recursive = form.value("recursive") == "yes";
+                desired.worktrees.path_template = form.value("template");
+                let source_paths = form
+                    .value("sources")
+                    .lines()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                desired.project_roots = crate::startup::normalize_sources(
+                    source_paths,
+                    self.config_path.parent().unwrap_or(Path::new(".")),
+                )?;
+                let remote = form.value("remote");
+                desired.publication_remote = if remote.is_empty() {
+                    None
+                } else {
+                    Some(remote)
+                };
+                self.config = config::save_preferences(&self.config_path, &baseline, &desired)?;
+                self.recursive = self.config.recursive;
+                self.roots = crate::startup::normalize_sources(
+                    self.config
+                        .project_roots
+                        .iter()
+                        .cloned()
+                        .chain(self.state.remembered_sources.clone()),
+                    self.config_path.parent().unwrap_or(Path::new(".")),
+                )?;
+                if self.roots.is_empty() {
+                    self.roots.push(std::env::current_dir()?);
+                }
+                self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+                self.say(
+                    "Preferences saved; remembered paths remain in state.json",
+                    false,
+                );
+            }
+        }
+        self.modal = None;
+        Ok(())
     }
-    fn review_form(&mut self, number: String) {
+    fn simple_form(&mut self, kind: FormKind, title: &str, fields: Vec<Field>) {
+        let context = if kind == FormKind::Preferences {
+            serde_json::to_value(&self.config).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
         self.modal = Some(Modal::Form(Form {
-            title: "Review pull request".into(),
-            kind: FormKind::Review,
-            fields: vec![Field::new("PR number or URL", number, false)],
-            active: 0,
-            path_custom: false,
+            kind,
+            title: title.into(),
+            fields,
+            focused: 0,
+            advanced: false,
+            context,
         }));
+    }
+    pub fn action(&mut self, action: Action) {
+        if matches!(self.modal, Some(Modal::Confirm(Confirm::Trust { .. })))
+            && matches!(
+                action,
+                Action::Projects | Action::Preferences | Action::Close(_)
+            )
+        {
+            self.action(Action::Cancel);
+        }
+        match action {
+            Action::Project(i) => self.open_project(i),
+            Action::Tab(i) => {
+                if i < self.tabs.len() {
+                    self.selected_tab = i;
+                    self.modal = None;
+                    self.selection_changed();
+                }
+            }
+            Action::Close(i) => {
+                if let Some(tab) = self.tabs.get(i) {
+                    if self
+                        .state
+                        .conversations
+                        .iter()
+                        .any(|c| same_path(&c.project, &tab.project.path) && c.attention.busy())
+                    {
+                        self.modal = Some(Modal::Confirm(Confirm::Close(i)));
+                        self.confirm_yes = false;
+                    } else {
+                        self.close_tab(i);
+                    }
+                }
+            }
+            Action::Tree(i) => {
+                self.pane = Pane::Worktrees;
+                if let Some(tab) = self.tabs.get_mut(self.selected_tab)
+                    && i < tab.trees.len()
+                {
+                    tab.selected = i;
+                    tab.file = 0;
+                    self.selection_changed();
+                }
+            }
+            Action::Session(id) => {
+                self.cli_focused = false;
+                self.pane = Pane::List;
+                if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+                    tab.conversation = Some(id);
+                }
+                self.restore_composer();
+                self.transcript_scroll = 0;
+                self.dirty = true;
+            }
+            Action::File(i) => {
+                self.pane = Pane::List;
+                if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+                    tab.file = i;
+                }
+                self.diff_scroll = 0;
+                self.request_diff();
+            }
+            Action::Switch(view) => {
+                if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+                    tab.view = view;
+                }
+                self.cli_focused = false;
+                self.dirty = true;
+                self.request_diff();
+            }
+            Action::NewTree => self.creation_form(false),
+            Action::NewSession => {
+                if let (Some(tree), Some(project)) = (
+                    self.tree().cloned(),
+                    self.tab().map(|t| t.project.path.clone()),
+                ) {
+                    if !tree.path.is_dir() || tree.prunable {
+                        self.say("Checkout is missing", true);
+                    } else if self
+                        .mutation
+                        .as_ref()
+                        .is_some_and(|(p, _)| same_path(p, &tree.path))
+                    {
+                        self.say("Wait for Git to finish", true);
+                    } else {
+                        self.failed_form = None;
+                        self.start_conversation(
+                            project,
+                            tree.path,
+                            String::new(),
+                            String::new(),
+                            json!({}),
+                        );
+                        self.pane = Pane::Detail;
+                    }
+                }
+            }
+            Action::NewSessionOptions => self.creation_form(true),
+            Action::Help => self.modal = Some(Modal::Help(0)),
+            Action::Projects => {
+                self.modal = Some(Modal::Projects {
+                    query: Input::default(),
+                    selected: 0,
+                })
+            }
+            Action::Cancel => {
+                if let Some(Modal::Confirm(Confirm::Trust { id, .. })) = &self.modal {
+                    self.agent_commands.push(agent::Command::TrustWorkspace {
+                        id: id.clone(),
+                        approved: false,
+                    });
+                }
+                self.modal = None;
+                self.cli_focused = false;
+            }
+            Action::Confirm => {
+                if let Some(modal) = self.modal.clone() {
+                    match modal {
+                        Modal::Confirm(Confirm::Trust { id, .. }) => {
+                            self.modal = None;
+                            self.agent_commands
+                                .push(agent::Command::TrustWorkspace { id, approved: true });
+                        }
+                        Modal::Confirm(Confirm::Close(i)) => self.close_tab(i),
+                        Modal::Confirm(Confirm::Quit) => {
+                            self.quit = true;
+                            self.modal = None;
+                        }
+                        Modal::Confirm(Confirm::Remove) => {
+                            self.modal = None;
+                            self.operate(Operation::Remove);
+                        }
+                        Modal::Form(form) => {
+                            if let Err(e) = self.submit_form(form) {
+                                self.say(format!("{e:#}"), true);
+                            }
+                        }
+                        Modal::Projects { query, selected } => {
+                            if let Some(i) = self.visible_projects(&query.value).get(selected) {
+                                self.open_project(*i);
+                            }
+                        }
+                        Modal::Help(selected) => {
+                            if let Some((_, _, action)) = self.help_actions().get(selected).cloned()
+                            {
+                                self.modal = None;
+                                self.action(action);
+                            }
+                        }
+                        Modal::Activity(selected) => {
+                            if let Some(c) = self
+                                .state
+                                .conversations
+                                .iter()
+                                .filter(|c| c.attention.busy())
+                                .nth(selected)
+                                .cloned()
+                                && let Some(index) = self
+                                    .projects
+                                    .iter()
+                                    .position(|p| same_path(&p.path, &c.project))
+                            {
+                                self.open_project(index);
+                                if let Some(tab) = self.tabs.get_mut(self.selected_tab) {
+                                    tab.conversation = Some(c.id);
+                                    if let Some(i) = tab
+                                        .trees
+                                        .iter()
+                                        .position(|t| same_path(&t.path, &c.worktree))
+                                    {
+                                        tab.selected = i;
+                                    }
+                                }
+                                self.restore_composer();
+                            }
+                        }
+                        _ => {
+                            self.modal = None;
+                        }
+                    }
+                }
+            }
+            Action::Git(which) => match which {
+                "add-path" => self.simple_form(
+                    FormKind::AddPath,
+                    "Remember a project path",
+                    vec![Field::text("path", "Repository or discovery folder", "")],
+                ),
+                "stage" | "unstage" => {
+                    if self.tab().is_none_or(|t| t.view != View::Changes) {
+                        self.say("Select files in Changes before staging or unstaging", true);
+                        return;
+                    }
+                    let files = self
+                        .snapshot()
+                        .map(|s| {
+                            s.files
+                                .iter()
+                                .filter(|f| {
+                                    if self.marked.is_empty() {
+                                        self.selected_file()
+                                            .is_some_and(|selected| selected.path == f.path)
+                                    } else {
+                                        self.marked.contains(&f.path)
+                                    }
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.operate(Operation::Stage(files, which == "unstage"));
+                }
+                "commit" => self.simple_form(
+                    FormKind::Commit,
+                    "Commit staged changes",
+                    vec![
+                        Field::text("subject", "Subject", ""),
+                        Field {
+                            key: "body".into(),
+                            label: "Body · optional".into(),
+                            input: Input::default(),
+                            kind: FieldType::Multiline,
+                        },
+                    ],
+                ),
+                "fetch" => self.operate(Operation::Fetch),
+                "pull" => self.operate(Operation::Pull),
+                "push" => {
+                    let remote = self.tab().and_then(|t| self.config.remote(&t.project.path));
+                    let choices = self
+                        .tab()
+                        .and_then(|t| self.remotes.get(&t.project.path))
+                        .cloned()
+                        .unwrap_or_default();
+                    if remote.is_none()
+                        && self.snapshot().is_some_and(|s| s.upstream.is_none())
+                        && choices.len() > 1
+                        && !choices.iter().any(|r| r == "origin")
+                    {
+                        let field = Field {
+                            key: "remote".into(),
+                            label: "Publish to remote".into(),
+                            input: Input::new(choices[0].clone()),
+                            kind: FieldType::Choice(choices),
+                        };
+                        self.simple_form(FormKind::PublishRemote, "Publish branch", vec![field]);
+                        return;
+                    }
+                    self.operate(Operation::Push(remote));
+                }
+                "remove" => {
+                    if let Some(tree) = self.tree() {
+                        if tree.original
+                            || tree.prunable
+                            || self.busy(&tree.path)
+                            || self.snapshot().is_none_or(|s| !s.files.is_empty())
+                        {
+                            self.say("Removal requires a clean, idle linked worktree", true);
+                        } else {
+                            self.modal = Some(Modal::Confirm(Confirm::Remove));
+                            self.confirm_yes = false;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Action::Stop => {
+                let active = self
+                    .tree()
+                    .and_then(|tree| {
+                        self.state
+                            .conversations
+                            .iter()
+                            .find(|c| same_path(&c.worktree, &tree.path) && c.attention.busy())
+                    })
+                    .cloned();
+                if let Some(c) = active
+                    && let Some(turn) = c.chat.as_ref().and_then(|chat| chat.active_turn.as_ref())
+                    && let Some(channel) = c.chat_uri
+                {
+                    self.agent_commands.push(agent::Command::Dispatch {
+                        channel,
+                        worktree: None,
+                        action: json!({"type":"chat/turnCancelled","turnId":turn.id,"duration":0}),
+                    });
+                }
+            }
+            Action::Resume => {
+                if let Some(c) = self.conversation().cloned() {
+                    if c.worktree.is_dir() {
+                        if self.terminals.get(&c.id).is_some_and(|t| !t.running()) {
+                            self.terminals.close(&c.id);
+                        }
+                        self.terminal_requested.insert(c.id.clone(), None);
+                        self.agent_commands
+                            .push(agent::Command::Observe { id: c.session_uri });
+                        self.say(
+                            "Connecting to saved conversation; no prompt was resent",
+                            false,
+                        );
+                    } else {
+                        self.say("Checkout is missing; history is read-only", true);
+                    }
+                }
+            }
+            Action::Archive => {
+                if let Some(id) = self
+                    .conversation()
+                    .filter(|c| !c.attention.busy())
+                    .map(|c| c.id.clone())
+                {
+                    if let Some(c) = self.state.conversations.iter_mut().find(|c| c.id == id) {
+                        c.archived = !c.archived;
+                        self.dirty = true;
+                    }
+                    self.selection_changed();
+                }
+            }
+            Action::History => {
+                let nav = self.state.navigation.entry("@archived".into()).or_default();
+                nav.changes = !nav.changes;
+                self.dirty = true;
+                self.selection_changed();
+            }
+            Action::Quit => {
+                if self.mutation.is_some() {
+                    self.say("Wait for the Git operation to finish before quitting", true);
+                    return;
+                }
+                if self.state.conversations.iter().any(|c| c.attention.busy()) {
+                    self.modal = Some(Modal::Confirm(Confirm::Quit));
+                    self.confirm_yes = false;
+                } else {
+                    self.quit = true;
+                }
+            }
+            Action::Activity => self.modal = Some(Modal::Activity(0)),
+            Action::Host => self.modal = Some(Modal::Host),
+            Action::FocusTerminal => {
+                let live = self
+                    .conversation()
+                    .is_some_and(|c| self.terminals.get(&c.id).is_some_and(|t| t.running()));
+                if live {
+                    self.cli_focused = true;
+                    self.pane = Pane::Detail;
+                } else {
+                    self.action(Action::Resume);
+                }
+            }
+            Action::CloseTerminal => {
+                if let Some(id) = self.conversation().map(|c| c.id.clone()) {
+                    self.terminals.close(&id);
+                    self.terminal_requested.remove(&id);
+                }
+                self.cli_focused = false;
+            }
+            Action::ToggleAdvanced => {
+                if let Some(Modal::Form(form)) = &mut self.modal {
+                    form.advanced = !form.advanced;
+                }
+            }
+            Action::Options => {
+                if let Some(c) = self.conversation() {
+                    let options = c.options.clone();
+                    let mut fields = config_fields(&options);
+                    fields.insert(0, self.model_field(c.model.as_deref()));
+                    if fields.is_empty() {
+                        self.modal = Some(Modal::Notice(
+                            "Resume the conversation to load its provider options.".into(),
+                        ));
+                    } else {
+                        self.modal = Some(Modal::Form(Form {
+                            kind: FormKind::SessionOptions,
+                            title: "Copilot session options".into(),
+                            fields,
+                            focused: 0,
+                            advanced: true,
+                            context: options,
+                        }));
+                    }
+                }
+            }
+            Action::Attach => self.simple_form(
+                FormKind::Attach,
+                "Attach a file or image",
+                vec![Field::text("path", "File path", "")],
+            ),
+            Action::Preferences => self.simple_form(
+                FormKind::Preferences,
+                "Preferences",
+                vec![
+                    Field {
+                        key: "sources".into(),
+                        label: "Declared discovery sources · one per line".into(),
+                        input: Input::new(
+                            self.config
+                                .project_roots
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        kind: FieldType::Multiline,
+                    },
+                    Field::toggle(
+                        "recursive",
+                        "Recursive project discovery",
+                        self.config.recursive,
+                    ),
+                    Field::text(
+                        "template",
+                        "Worktree directory template",
+                        self.config.worktrees.path_template.clone(),
+                    ),
+                    Field::text(
+                        "remote",
+                        "Publication remote · optional",
+                        self.config.publication_remote.clone().unwrap_or_default(),
+                    ),
+                ],
+            ),
+            Action::Field(i) => {
+                if let Some(Modal::Form(form)) = &mut self.modal {
+                    form.focused = i;
+                    if let Some(field) = form.fields.get_mut(i)
+                        && matches!(field.kind, FieldType::Toggle)
+                    {
+                        field.input = Input::new(if field.input.value == "yes" {
+                            "no"
+                        } else {
+                            "yes"
+                        });
+                    }
+                }
+            }
+            Action::Scroll(delta) => {
+                self.pane = Pane::Detail;
+                if self.tab().is_some_and(|t| t.view == View::Changes) {
+                    self.diff_scroll = self.diff_scroll.saturating_add_signed(delta);
+                } else {
+                    self.transcript_scroll = self.transcript_scroll.saturating_add_signed(delta);
+                }
+            }
+            Action::Expand => {
+                self.expanded = !self.expanded;
+                self.pane = Pane::Detail;
+            }
+            Action::Respond => {
+                if let Some(request) = self.conversation().and_then(|c| c.pending.first()).cloned()
+                {
+                    if request["kind"] == "toolConfirmation" {
+                        self.modal = Some(Modal::Approval(request));
+                    } else if request["kind"] == "chatInput" {
+                        let mut fields = vec![];
+                        for question in request["request"]["questions"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(id) = question["id"].as_str() else {
+                                continue;
+                            };
+                            let label = question["title"]
+                                .as_str()
+                                .or_else(|| question["message"].as_str())
+                                .unwrap_or(id);
+                            let mut field = Field::text(id, label, "");
+                            if question["kind"] == "boolean" {
+                                field = Field::toggle(id, label, false);
+                            } else if question["kind"] == "single-select" {
+                                let choices = question["options"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|o| o["id"].as_str().map(str::to_owned))
+                                    .collect::<Vec<_>>();
+                                field.input =
+                                    Input::new(choices.first().cloned().unwrap_or_default());
+                                field.kind = FieldType::Choice(choices);
+                            }
+                            fields.push(field);
+                        }
+                        if fields.is_empty() {
+                            fields.push(Field::toggle("confirm", "Accept this request", true));
+                        }
+                        self.modal = Some(Modal::Form(Form {
+                            kind: FormKind::Question,
+                            title: request["request"]["message"]
+                                .as_str()
+                                .unwrap_or("Copilot needs input")
+                                .into(),
+                            fields,
+                            focused: 0,
+                            advanced: false,
+                            context: json!({"chat":request["chat"],"requestId":request["request"]["id"],"questions":request["request"]["questions"]}),
+                        }));
+                    } else {
+                        self.modal = Some(Modal::Notice(
+                            serde_json::to_string_pretty(&request).unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            Action::Approve(approved, option) => {
+                if let Some(Modal::Approval(request)) = &self.modal {
+                    let channel = request["chat"].as_str().unwrap_or_default().to_owned();
+                    let result = request["toolCall"]["status"] == "pending-result-confirmation";
+                    let action = json!({"type":if result{"chat/toolCallResultConfirmed"}else{"chat/toolCallConfirmed"},"turnId":request["turnId"],"toolCallId":request["toolCall"]["toolCallId"],"approved":approved,"confirmed":if approved{Some("user-action")}else{None},"reason":if approved{None}else{Some("denied")},"selectedOptionId":option});
+                    self.agent_commands.push(agent::Command::Dispatch {
+                        channel,
+                        action,
+                        worktree: None,
+                    });
+                    self.modal = None;
+                }
+            }
+            Action::Completion(index) => {
+                if let Some(Modal::Completions { items, .. }) = &self.modal
+                    && let Some(item) = items.get(index)
+                {
+                    let start = item["rangeStart"]
+                        .as_u64()
+                        .and_then(|i| utf16_byte(&self.composer.value, i as usize))
+                        .unwrap_or(self.composer.cursor);
+                    let end = item["rangeEnd"]
+                        .as_u64()
+                        .and_then(|i| utf16_byte(&self.composer.value, i as usize))
+                        .unwrap_or(self.composer.cursor);
+                    if start <= end && end <= self.composer.value.len() {
+                        self.composer.value.replace_range(
+                            start..end,
+                            item["insertText"].as_str().unwrap_or_default(),
+                        );
+                        self.composer.cursor =
+                            start + item["insertText"].as_str().unwrap_or_default().len();
+                        if let Some(attachment) = item.get("attachment") {
+                            self.attachments.push(attachment.clone());
+                        }
+                    }
+                }
+                self.modal = None;
+                self.sync_draft();
+            }
+            Action::Details => {
+                self.modal = Some(Modal::Notice(format!(
+                    "{}\n\n{}",
+                    self.notice
+                        .as_ref()
+                        .map(|(m, _, _)| m.as_str())
+                        .unwrap_or("No operation result yet"),
+                    self.operation_output
+                )))
+            }
+            Action::Retry => {
+                if let Some(form) = &self.failed_form {
+                    self.modal = Some(Modal::Form(form.clone()));
+                } else {
+                    self.say("No failed form to retry", false);
+                }
+            }
+            Action::WorktreeInfo => {
+                if let Some(tree) = self.tree() {
+                    let tracking = self
+                        .snapshot()
+                        .map(|s| {
+                            format!(
+                                "{} · ↑{} ↓{}",
+                                s.upstream.as_deref().unwrap_or("No upstream"),
+                                s.ahead,
+                                s.behind
+                            )
+                        })
+                        .unwrap_or_else(|| "Git status loading".into());
+                    self.modal = Some(Modal::Notice(format!(
+                        "Worktree: {}\nBranch: {}\nHEAD: {}\nTracking: {}\n\n{}",
+                        tree.path.file_name().unwrap_or_default().to_string_lossy(),
+                        tree.branch,
+                        tree.head,
+                        tracking,
+                        tree.path.display()
+                    )));
+                }
+            }
+            Action::Sources => self.modal = Some(Modal::Sources(0)),
+            Action::ForgetSource(index) => {
+                if index < self.state.remembered_sources.len() {
+                    let path = self.state.remembered_sources.remove(index);
+                    if !self
+                        .config
+                        .project_roots
+                        .iter()
+                        .any(|p| same_path(p, &path))
+                    {
+                        self.roots.retain(|p| !same_path(p, &path));
+                    }
+                    self.dirty = true;
+                    self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+                }
+                self.modal = Some(Modal::Sources(
+                    index.min(self.state.remembered_sources.len().saturating_sub(1)),
+                ));
+            }
+        }
+    }
+    fn close_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.remember_navigation();
+            self.tabs.remove(index);
+            self.selected_tab = self.selected_tab.min(self.tabs.len().saturating_sub(1));
+            self.modal = if self.tabs.is_empty() {
+                Some(Modal::Projects {
+                    query: Input::default(),
+                    selected: 0,
+                })
+            } else {
+                None
+            };
+            self.dirty = true;
+            self.restore_composer();
+        }
+    }
+    pub fn help_actions(&self) -> Vec<(&'static str, &'static str, Action)> {
+        vec![
+            ("New worktree", "a", Action::NewTree),
+            ("New session", "n", Action::NewSession),
+            (
+                "New session with options / new worktree",
+                "",
+                Action::NewSessionOptions,
+            ),
+            ("Worktree details", "", Action::WorktreeInfo),
+            ("Remove worktree", "d", Action::Git("remove")),
+            ("Stage selected files", "s", Action::Git("stage")),
+            ("Unstage selected files", "u", Action::Git("unstage")),
+            ("Commit staged files", "c", Action::Git("commit")),
+            ("Fetch", "f", Action::Git("fetch")),
+            ("Pull · fast-forward only", "P", Action::Git("pull")),
+            ("Push / publish branch", "p", Action::Git("push")),
+            ("Resume conversation", "r", Action::Resume),
+            ("Stop active turn", "Ctrl+C", Action::Stop),
+            ("Open / focus Copilot CLI", "i", Action::FocusTerminal),
+            ("Return from Copilot CLI", "Ctrl+]", Action::Cancel),
+            ("Close terminal view", "", Action::CloseTerminal),
+            ("Archive / restore conversation", "e", Action::Archive),
+            ("Show archived & removed", "", Action::History),
+            ("Projects", "Ctrl+P", Action::Projects),
+            ("Remember a path", "+", Action::Git("add-path")),
+            ("Remembered locations", "", Action::Sources),
+            ("Agent activity", "", Action::Activity),
+            ("AHP connection details", "", Action::Host),
+            ("Preferences", "Ctrl+,", Action::Preferences),
+            ("Operation details", "", Action::Details),
+            ("Retry last failed form", "", Action::Retry),
+            ("Quit Tree Rail", "Ctrl+Q", Action::Quit),
+        ]
+    }
+    fn model_field(&self, selected: Option<&str>) -> Field {
+        let mut choices = vec![String::new()];
+        for agent in self
+            .agents
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|a| a["provider"] == "copilot")
+        {
+            for model in agent["models"].as_array().into_iter().flatten() {
+                if let Some(id) = model["id"].as_str()
+                    && !choices.iter().any(|s| s == id)
+                {
+                    choices.push(id.into());
+                }
+            }
+        }
+        Field {
+            key: "model".into(),
+            label: "Model · provider default when empty".into(),
+            input: Input::new(selected.unwrap_or_default()),
+            kind: if choices.len() > 1 {
+                FieldType::Choice(choices)
+            } else {
+                FieldType::Text
+            },
+        }
+    }
+    fn cli_input_blocked(&self) -> bool {
+        self.conversation().is_some_and(|selected| {
+            !selected.worktree.is_dir()
+                || self
+                    .mutation
+                    .as_ref()
+                    .is_some_and(|(path, _)| same_path(path, &selected.worktree))
+                || (!selected.attention.busy()
+                    && self.state.conversations.iter().any(|c| {
+                        c.id != selected.id
+                            && same_path(&c.worktree, &selected.worktree)
+                            && c.attention.busy()
+                    }))
+        })
+    }
+    fn open_terminal(&mut self, id: &str) {
+        if !self.connected {
+            return;
+        }
+        let Some(c) = self
+            .state
+            .conversations
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        if !self.attached.contains(&c.session_uri)
+            || c.chat_uri.is_none()
+            || c.initial_prompt.is_some()
+            || c.creation_failed
+            || c.error.is_some()
+            || !c.worktree.is_dir()
+        {
+            return;
+        }
+        let Some(endpoint) = self.connection_url.clone() else {
+            return;
+        };
+        let (rows, cols) = if self.terminal_area.is_empty() {
+            (24, 80)
+        } else {
+            (self.terminal_area.height, self.terminal_area.width)
+        };
+        self.terminals.open(
+            id.into(),
+            crate::cli_terminal::CopilotLaunch {
+                program: self.config.agent.cli.clone(),
+                directory: c.worktree,
+                home: self.config.agent.home.clone(),
+                endpoint,
+                session: c.session_uri,
+                model: self.terminal_requested.get(id).cloned().flatten(),
+            },
+            rows,
+            cols,
+        );
+        self.terminal_requested.remove(id);
+        if self.conversation().is_some_and(|c| c.id == id) {
+            self.cli_focused = true;
+            self.pane = Pane::Detail;
+        }
     }
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if self.comment_key(key) {
-            return;
-        }
-        if self.ticket_mode && self.ticket.is_none() && self.browser.editor.is_some() {
-            self.browser_editor_key(key);
-            return;
-        }
-        if self.hosted_key(key) {
-            return;
-        }
-        let repeating = key.kind == KeyEventKind::Repeat;
-        if self.settings_open && self.modal.is_none() {
-            if !repeating
-                && matches!(key.code, KeyCode::Char('i' | 'H'))
-                && key.modifiers == KeyModifiers::NONE
-                && self.settings.as_ref().is_some_and(|draft| {
-                    draft.input.is_none() && matches!(draft.mode, settings::Mode::Edit)
-                })
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.cli_focused
+            && self.modal.is_none()
+            && self.tab().is_some_and(|t| t.view == View::Sessions)
+        {
+            if ctrl && key.code == KeyCode::Char(']') {
+                self.cli_focused = false;
+                self.pane = Pane::List;
+            } else if self.cli_input_blocked() && !(ctrl && key.code == KeyCode::Char('c')) {
+                self.say(
+                    "Another conversation is active in this worktree. Ctrl+] returns to Tree Rail",
+                    true,
+                );
+            } else if let Some(id) = self.conversation().map(|c| c.id.clone())
+                && let Some(terminal) = self.terminals.get_mut(&id)
             {
-                self.action(if key.code == KeyCode::Char('H') {
-                    "operation_history"
-                } else {
-                    "operation_details"
-                });
+                terminal.key(key);
+            }
+            return;
+        }
+        if key.kind == KeyEventKind::Repeat
+            && !matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Char('j' | 'k' | 'h' | 'l')
+            )
+            && !self.cli_focused
+            && !matches!(self.modal, Some(Modal::Form(_) | Modal::Projects { .. }))
+        {
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('q') {
+            self.action(Action::Quit);
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('p') {
+            self.action(Action::Projects);
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char(',') {
+            self.action(Action::Preferences);
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('w') {
+            self.action(Action::Close(self.selected_tab));
+            return;
+        }
+        if let Some(mut modal) = self.modal.take() {
+            if key.code == KeyCode::Esc {
+                self.modal = Some(modal);
+                self.action(Action::Cancel);
+                self.cli_focused = false;
                 return;
             }
-            if repeating
-                && self
-                    .settings
-                    .as_ref()
-                    .is_some_and(|draft| draft.input.is_none())
-                && !matches!(
-                    key.code,
-                    KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
-                )
-            {
-                return;
-            }
-            let Some(draft) = self.settings.as_mut() else {
-                self.settings_open = false;
-                return;
-            };
-            match draft.key(key, &self.config_path, self.viewport_height) {
-                settings::Action::None => {}
-                settings::Action::Close => self.settings_open = false,
-                settings::Action::Save(resolution) => self.save_settings(resolution),
-                settings::Action::Help => self.modal = Some(Modal::Help),
-                settings::Action::Quit => {
-                    if !self.busy {
-                        self.request_quit();
+            let mut confirm = false;
+            let mut add_path = false;
+            let mut followup = None;
+            match &mut modal {
+                Modal::Sources(selected) => match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1)
+                            .min(self.state.remembered_sources.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                    KeyCode::Delete => followup = Some(Action::ForgetSource(*selected)),
+                    KeyCode::Char('+') => add_path = true,
+                    _ => {}
+                },
+                Modal::Approval(request) => {
+                    if key.kind == KeyEventKind::Press {
+                        if let Some(options) = request["toolCall"]["options"].as_array() {
+                            if let KeyCode::Char(c) = key.code
+                                && let Some(option) = c
+                                    .to_digit(10)
+                                    .and_then(|i| i.checked_sub(1))
+                                    .and_then(|i| options.get(i as usize))
+                            {
+                                followup = Some(Action::Approve(
+                                    option["kind"] == "approve",
+                                    option["id"].as_str().map(str::to_owned),
+                                ));
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Char('y') => followup = Some(Action::Approve(true, None)),
+                                KeyCode::Char('n') => followup = Some(Action::Approve(false, None)),
+                                _ => {}
+                            }
+                        }
                     }
                 }
-                settings::Action::Discard(quit) => match Config::load(&self.config_path) {
-                    Ok(config) => {
-                        self.settings = Some(Draft::new(config));
-                        if quit {
-                            self.quit = true;
-                        }
+                Modal::Completions { items, selected } => match key.code {
+                    KeyCode::Down | KeyCode::Tab => {
+                        *selected = (*selected + 1).min(items.len().saturating_sub(1))
                     }
-                    Err(error) => {
-                        if let Some(draft) = &mut self.settings {
-                            draft.fail(error);
-                            draft.mode = settings::Mode::Edit;
-                        }
+                    KeyCode::Up | KeyCode::BackTab => *selected = selected.saturating_sub(1),
+                    KeyCode::Enter => followup = Some(Action::Completion(*selected)),
+                    _ => {}
+                },
+                Modal::Projects { query, selected } => match key.code {
+                    KeyCode::Down => {
+                        *selected = (*selected + 1)
+                            .min(self.visible_projects(&query.value).len().saturating_sub(1))
+                    }
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Enter => confirm = true,
+                    KeyCode::Char('+') if query.value.is_empty() => add_path = true,
+                    _ => {
+                        query.key(key, false);
+                        *selected = 0;
                     }
                 },
-            }
-            return;
-        }
-        if self.modal.is_some() {
-            if !repeating
-                || matches!(
-                    key.code,
-                    KeyCode::Char(_)
-                        | KeyCode::Backspace
-                        | KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Up
-                        | KeyCode::Down
-                )
-            {
-                self.modal_key(key);
-            }
-            return;
-        }
-        if self.workspace_key(key) {
-            return;
-        }
-        if !self.workspace_open
-            && self.ticket_mode
-            && self.project.is_some()
-            && (!repeating
-                || matches!(
-                    key.code,
-                    KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up
-                ))
-            && self.ticket_key(key)
-        {
-            return;
-        }
-        if self.searching {
-            match key.code {
-                KeyCode::Esc => {
-                    self.filter = self.search_before.clone();
-                    self.searching = false;
-                    self.reset_cursor();
-                }
-                KeyCode::Enter => {
-                    self.searching = false;
-                    if self.focus == 2 {
-                        self.find_diff(1);
+                Modal::Help(selected) => match key.code {
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                        *selected = (*selected + 1) % self.help_actions().len()
+                    }
+                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                        *selected = selected
+                            .checked_sub(1)
+                            .unwrap_or(self.help_actions().len() - 1)
+                    }
+                    KeyCode::Enter => confirm = true,
+                    _ => {}
+                },
+                Modal::Activity(selected) => match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(
+                            self.state
+                                .conversations
+                                .iter()
+                                .filter(|c| c.attention.busy())
+                                .count()
+                                .saturating_sub(1),
+                        )
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                    KeyCode::Enter => confirm = true,
+                    _ => {}
+                },
+                Modal::Confirm(_) => {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                                self.confirm_yes = !self.confirm_yes
+                            }
+                            KeyCode::Char('y') => confirm = true,
+                            KeyCode::Char('n') => followup = Some(Action::Cancel),
+                            KeyCode::Enter => {
+                                if self.confirm_yes {
+                                    confirm = true;
+                                } else {
+                                    followup = Some(Action::Cancel);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                    self.reset_cursor();
+                Modal::Form(form) => {
+                    let visible = form.visible();
+                    match key.code {
+                        KeyCode::Enter if ctrl => confirm = true,
+                        KeyCode::Char('o') if ctrl => form.advanced = !form.advanced,
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            let pos = visible.iter().position(|i| *i == form.focused).unwrap_or(0);
+                            form.focused = visible[if key.code == KeyCode::Tab {
+                                (pos + 1) % visible.len()
+                            } else {
+                                (pos + visible.len() - 1) % visible.len()
+                            }];
+                        }
+                        _ => {
+                            if let Some(field) = form.fields.get_mut(form.focused) {
+                                match &field.kind {
+                                    FieldType::Toggle
+                                        if matches!(
+                                            key.code,
+                                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                                        ) =>
+                                    {
+                                        field.input = Input::new(if field.input.value == "yes" {
+                                            "no"
+                                        } else {
+                                            "yes"
+                                        })
+                                    }
+                                    FieldType::Choice(choices)
+                                        if matches!(
+                                            key.code,
+                                            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                                        ) && !choices.is_empty() =>
+                                    {
+                                        let i = choices
+                                            .iter()
+                                            .position(|s| s == &field.input.value)
+                                            .unwrap_or(0);
+                                        field.input = Input::new(
+                                            choices[if key.code == KeyCode::Left {
+                                                (i + choices.len() - 1) % choices.len()
+                                            } else {
+                                                (i + 1) % choices.len()
+                                            }]
+                                            .clone(),
+                                        );
+                                    }
+                                    FieldType::Text | FieldType::Multiline => field
+                                        .input
+                                        .key(key, matches!(field.kind, FieldType::Multiline)),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.filter.push(c);
-                    self.reset_cursor();
+                _ => {
+                    if key.code == KeyCode::Enter {
+                        confirm = true;
+                    }
                 }
-                _ => {}
             }
-            self.request_diff(false);
-            return;
-        }
-        if self.ticket_mode && !self.workspace_open && self.project.is_some() && repeating {
-            return;
-        }
-        let action = self.config.keys.get(&key_name(key)).cloned();
-        if let Some(action) = action {
-            if !repeating || matches!(action.as_str(), "down" | "up") {
-                self.action(&action);
-            }
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('w') if !repeating => self.prefix = Some(('w', Instant::now())),
-                KeyCode::Char('d') => self.move_by(self.half_page()),
-                KeyCode::Char('u') => self.move_by(-self.half_page()),
-                KeyCode::Char('c') if !self.busy => self.request_quit(),
-                _ => {}
-            }
-            return;
-        }
-        if let Some((prefix, _)) = self.prefix.take() {
-            if prefix == 'g' && key.code == KeyCode::Char('g') {
-                self.first_last(false);
+            self.modal = Some(modal);
+            if let Some(action) = followup {
+                self.action(action);
                 return;
             }
-            if prefix == 'w' {
-                match key.code {
-                    KeyCode::Char('h') | KeyCode::Char('k') => self.change_focus(-1),
-                    KeyCode::Char('l') | KeyCode::Char('j') => self.change_focus(1),
-                    _ => {}
-                }
-                return;
+            if confirm {
+                self.action(Action::Confirm);
             }
+            if add_path {
+                self.simple_form(
+                    FormKind::AddPath,
+                    "Remember a project path",
+                    vec![Field::text("path", "Repository or discovery folder", "")],
+                );
+            }
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.action(Action::Stop);
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('d' | 'u')) {
+            self.action(Action::Scroll(if key.code == KeyCode::Char('d') {
+                10
+            } else {
+                -10
+            }));
+            return;
+        }
+        if ctrl && key.code == KeyCode::Tab && !self.tabs.is_empty() {
+            self.action(Action::Tab((self.selected_tab + 1) % self.tabs.len()));
+            return;
         }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
-            KeyCode::PageDown => self.move_by(20),
-            KeyCode::PageUp => self.move_by(-20),
-            KeyCode::Home => self.first_last(false),
-            KeyCode::End | KeyCode::Char('G') => self.first_last(true),
-            KeyCode::Tab => self.change_focus(1),
-            KeyCode::BackTab => self.change_focus(-1),
-            KeyCode::Char('g') if !repeating => self.prefix = Some(('g', Instant::now())),
-            KeyCode::Char('/') if !repeating => {
-                self.search_before = self.filter.clone();
-                self.searching = true;
-            }
-            KeyCode::Char('n') => {
-                if self.focus == 2 && !self.filter.is_empty() {
-                    self.find_diff(1)
+            KeyCode::Char('?') => self.action(Action::Help),
+            KeyCode::Char('v') => self.action(Action::Switch(
+                if self.tab().is_some_and(|t| t.view == View::Sessions) {
+                    View::Changes
                 } else {
-                    self.move_by(1)
-                }
-            }
-            KeyCode::Char('N') => {
-                if self.focus == 2 && !self.filter.is_empty() {
-                    self.find_diff(-1)
-                } else {
-                    self.move_by(-1)
-                }
-            }
-            KeyCode::Char('h') | KeyCode::Left => self.change_focus(-1),
-            KeyCode::Char('l') | KeyCode::Right => self.change_focus(1),
-            KeyCode::Char(c) if !repeating => self.action(&c.to_string()),
-            KeyCode::Enter if !repeating => {
-                if self.project.is_none() {
-                    self.open_project();
-                } else {
-                    self.change_focus(1);
-                }
-            }
-            KeyCode::Esc => {
-                if !self.filter.is_empty() {
-                    self.clear_filter();
-                } else {
-                    self.back();
-                }
-            }
-            _ => {}
-        }
-    }
-    fn reset_cursor(&mut self) {
-        if self.project.is_none() {
-            self.project_cursor = 0;
-        } else if self.focus == 0 {
-            self.tree = 0;
-            self.selection_changed();
-        } else if self.focus == 1 {
-            self.file = 0;
-        } else {
-            self.diff_scroll = 0;
-        }
-    }
-    fn move_by(&mut self, delta: isize) {
-        if self.project.is_none() {
-            self.project_cursor = step(self.project_cursor, delta, self.visible_projects().len());
-        } else if self.focus == 0 {
-            let next = step(self.tree, delta, self.visible_trees().len());
-            if next != self.tree {
-                self.tree = next;
-                self.selection_changed();
-            }
-        } else if self.focus == 1 {
-            self.file = step(self.file, delta, self.visible_files().len());
-            self.diff_scroll = 0;
-            self.request_diff(false);
-        } else {
-            self.diff_scroll = step(self.diff_scroll, delta, self.diff.lines().count());
-        }
-    }
-    fn first_last(&mut self, last: bool) {
-        self.move_by(if last { isize::MAX / 2 } else { isize::MIN / 2 });
-    }
-    fn change_focus(&mut self, delta: isize) {
-        if self.project.is_some() {
-            self.clear_filter();
-            self.focus = if self.workspace_open {
-                1 + (self.focus as isize - 1 + delta).rem_euclid(2) as usize
-            } else {
-                (self.focus as isize + delta).rem_euclid(3) as usize
-            };
-            self.request_diff(false);
-        }
-    }
-    fn clear_filter(&mut self) {
-        if self.project.is_none() {
-            self.filter.clear();
-            self.project_cursor = 0;
-            return;
-        }
-        let tree = self.selected_tree().map(|w| w.path.clone());
-        let file = self.selected_file().map(|f| f.path.clone());
-        self.filter.clear();
-        self.tree = tree
-            .and_then(|p| self.trees.iter().position(|w| w.path == p))
-            .unwrap_or(0);
-        self.file = file
-            .and_then(|p| self.visible_files().iter().position(|f| f.path == p))
-            .unwrap_or(0);
-        self.request_diff(false);
-    }
-    fn half_page(&self) -> isize {
-        let row_height = if self.project.is_none() {
-            2
-        } else if self.focus == 0 {
-            3
-        } else {
-            1
-        };
-        (self.viewport_height.saturating_sub(8) / row_height / 2).max(1) as isize
-    }
-    fn find_diff(&mut self, direction: isize) {
-        let indices: Vec<usize> = self
-            .diff
-            .lines()
-            .enumerate()
-            .filter(|(_, s)| s.to_lowercase().contains(&self.filter.to_lowercase()))
-            .map(|(i, _)| i)
-            .collect();
-        if direction > 0 {
-            if let Some(i) = indices
-                .iter()
-                .find(|i| **i > self.diff_scroll)
-                .or_else(|| indices.first())
-            {
-                self.diff_scroll = *i;
-            }
-        } else if let Some(i) = indices
-            .iter()
-            .rev()
-            .find(|i| **i < self.diff_scroll)
-            .or_else(|| indices.last())
-        {
-            self.diff_scroll = *i;
-        }
-    }
-    fn back(&mut self) {
-        if self.project.is_some() {
-            self.epoch += 1;
-            self.project = None;
-            self.recover_form = None;
-            self.deferred_commit = None;
-            self.filter.clear();
-            self.modal = None;
-        } else if self.busy {
-            self.say("Wait for the running Git operation before quitting", true);
-        } else {
-            self.request_quit();
-        }
-    }
-    fn request_quit(&mut self) {
-        if let Some(draft) = &mut self.settings
-            && draft.dirty()
-        {
-            draft.mode = settings::Mode::Discard { quit: true };
-            self.settings_open = true;
-        } else {
-            self.quit = true;
-        }
-    }
-    fn open_settings(&mut self) {
-        if self.settings.is_none() {
-            match Config::load(&self.config_path) {
-                Ok(config) => self.settings = Some(Draft::new(config)),
-                Err(error) => {
-                    self.say(format!("{error:#}"), true);
-                    return;
-                }
-            }
-        }
-        if let Some(draft) = &mut self.settings {
-            let context = self
-                .project
-                .as_ref()
-                .map(|project| project.path.clone())
-                .or_else(|| {
-                    self.projects
-                        .get(self.project_cursor)
-                        .map(|project| project.path.clone())
-                });
-            draft.project_context = context.map(|path| {
-                draft
-                    .config
-                    .project(&path)
-                    .map(|project| project.path.clone())
-                    .unwrap_or(path)
-            });
-            draft.update_warnings(&self.discovery_warnings);
-        }
-        self.settings_open = true;
-    }
-    fn save_settings(&mut self, resolution: settings::Resolution) {
-        let Some(draft) = &mut self.settings else {
-            return;
-        };
-        match draft.save(&self.config_path, resolution) {
-            Ok(Some(config)) => {
-                let sources_changed = self.config.project_roots != config.project_roots;
-                let discovery_changed = self.config.recursive != config.recursive;
-                self.config = config;
-                if !sources_changed && !discovery_changed {
-                    return;
-                }
-                self.roots = self
-                    .config
-                    .project_roots
-                    .iter()
-                    .cloned()
-                    .chain(self.temporary_roots.clone())
-                    .collect();
-                if discovery_changed {
-                    self.recursive = self.config.recursive;
-                }
-                self.epoch += 1;
-                self.jobs.retain(|job| !matches!(job, Job::Discover(..)));
-                self.inflight.clear();
+                    View::Sessions
+                },
+            )),
+            KeyCode::Char('a') => self.action(Action::NewTree),
+            KeyCode::Char('n') => self.action(Action::NewSession),
+            KeyCode::Char('r') => self.action(Action::Resume),
+            KeyCode::Char('e') => self.action(Action::Archive),
+            KeyCode::Char('R') => {
                 self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
+                if let Some(project) = self.tab().map(|t| t.project.clone()) {
+                    self.enqueue(Job::Trees(project));
+                }
+                self.agent_commands.push(agent::Command::Discover);
             }
-            Ok(None) => {}
-            Err(error) => draft.fail(error),
-        }
-    }
-    pub fn action(&mut self, action: &str) {
-        if action == "," || action == "settings" {
-            self.open_settings();
-            return;
-        }
-        match action {
-            "down" => {
-                self.move_by(1);
-                return;
-            }
-            "up" => {
-                self.move_by(-1);
-                return;
-            }
-            "first" => {
-                self.first_last(false);
-                return;
-            }
-            "last" => {
-                self.first_last(true);
-                return;
-            }
-            "focus_left" => {
-                self.change_focus(-1);
-                return;
-            }
-            "focus_right" => {
-                self.change_focus(1);
-                return;
-            }
-            "search" => {
-                self.search_before = self.filter.clone();
-                self.searching = true;
-                return;
-            }
-            _ => {}
-        }
-        if action == "?" || action == "help" {
-            self.modal = Some(Modal::Help);
-            return;
-        }
-        if action == "i" || action == "operation_details" {
-            if let Some(record) = &self.latest_operation {
-                self.inspected_operation_id = Some(record.id);
-                self.operation_scroll = usize::MAX;
-                self.modal = Some(Modal::OperationDetails);
-            }
-            return;
-        }
-        if action == "H" || action == "operation_history" {
-            self.show_operation_history();
-            return;
-        }
-        if action == "q" || action == "back" {
-            self.back();
-            return;
-        }
-        if action == "S" || action == "save_roots" {
-            self.open_settings();
-            return;
-        }
-        if action == "R" || action == "refresh" {
-            if let Some(p) = self.project.clone() {
-                self.enqueue(Job::Trees(p.path.clone()));
-                self.enqueue(Job::Branches(p.path));
-                self.last_refresh = Instant::now() - Duration::from_secs(10);
-            } else {
-                self.enqueue(Job::Discover(self.roots.clone(), self.recursive));
-            }
-            return;
-        }
-        if self.project.is_none() {
-            if action == "w" || action == "basic_worktrees" {
-                self.open_basic_project();
-            }
-            return;
-        }
-        let Some(project) = self.project.clone() else {
-            return;
-        };
-        match action {
-            "T" | "tickets" => {
-                self.ticket_mode = true;
-                self.load_browser();
-            }
-            "a" | "create_worktree" => self.create_form(String::new(), false, false),
-            "b" | "branches" => {
-                let entries = self
-                    .branches
-                    .iter()
-                    .map(|b| {
-                        (
-                            format!(
-                                "{}{}",
-                                if b.remote { "remote  " } else { "local   " },
-                                b.name
-                            ),
-                            b.name.clone(),
-                        )
-                    })
-                    .collect();
-                self.picker("Branches", PickerKind::Branches, entries);
-            }
-            "o" | "launch" => {
-                let name = self
-                    .config
-                    .project(&project.path)
-                    .and_then(|p| p.default_profile.clone())
-                    .unwrap_or(self.config.default_profile.clone());
-                self.launch_profile(&name);
-            }
-            "O" | "profiles" => {
-                let entries = self
-                    .config
-                    .profiles
-                    .keys()
-                    .map(|n| (n.clone(), n.clone()))
-                    .collect();
-                self.picker("Launch profile", PickerKind::Profiles, entries);
-            }
-            "s" | "stage" | "u" | "unstage" if self.focus == 1 => {
-                let files = self
-                    .snapshot()
-                    .map(|s| {
-                        s.files
-                            .iter()
-                            .filter(|f| self.marked.contains(&f.path))
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let files = if files.is_empty() {
-                    self.selected_file().cloned().into_iter().collect()
-                } else {
-                    files
-                };
-                if !files.is_empty() {
-                    self.operation(Operation::Stage(
-                        files,
-                        action == "u" || action == "unstage",
-                    ));
-                    self.marked.clear();
+            KeyCode::Char('s') => self.action(Action::Git("stage")),
+            KeyCode::Char('u') => self.action(Action::Git("unstage")),
+            KeyCode::Char('c') => self.action(Action::Git("commit")),
+            KeyCode::Char('f') => self.action(Action::Git("fetch")),
+            KeyCode::Char('p') => self.action(Action::Git("push")),
+            KeyCode::Char('P') => self.action(Action::Git("pull")),
+            KeyCode::Char('d') => self.action(Action::Git("remove")),
+            KeyCode::Char('q') => self.action(Action::Quit),
+            KeyCode::Esc => self.notice = None,
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => {
+                self.pane = match self.pane {
+                    Pane::Worktrees => Pane::List,
+                    Pane::List => Pane::Detail,
+                    Pane::Detail => Pane::Worktrees,
                 }
             }
-            " " if self.focus == 1 => {
-                if let Some(f) = self.selected_file() {
-                    let path = f.path.clone();
+            KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => {
+                self.pane = match self.pane {
+                    Pane::Worktrees => Pane::Detail,
+                    Pane::List => Pane::Worktrees,
+                    Pane::Detail => Pane::List,
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Enter => {
+                if self.pane == Pane::Detail {
+                    self.action(Action::Expand);
+                } else if self.tab().is_some_and(|t| t.view == View::Sessions) {
+                    self.action(Action::FocusTerminal);
+                }
+            }
+            KeyCode::Char('i') => self.action(Action::FocusTerminal),
+            KeyCode::Char(' ') => {
+                if let Some(file) = self.selected_file() {
+                    let path = file.path.clone();
                     if !self.marked.remove(&path) {
                         self.marked.insert(path);
                     }
                 }
             }
-            "c" | "commit" => {
-                if let Some(form) = self.deferred_commit.take() {
-                    self.modal = Some(Modal::Form(form));
-                    return;
-                }
-                self.modal = Some(Modal::Form(Form {
-                    title: "Commit staged changes · Ctrl+s commit".into(),
-                    kind: FormKind::Commit,
-                    fields: vec![
-                        Field::new("Subject", String::new(), false),
-                        Field::new("Body", String::new(), true),
-                    ],
-                    active: 0,
-                    path_custom: false,
-                }))
-            }
-            "f" | "fetch" => self.operation(Operation::Fetch),
-            "P" | "pull" => self.operation(Operation::Pull),
-            "p" | "push" => {
-                if self.snapshot().is_some_and(|s| s.upstream.is_some()) {
-                    self.operation(Operation::Push);
-                } else {
-                    let branch = self
-                        .selected_tree()
-                        .map(|t| t.branch.clone())
-                        .unwrap_or_default();
-                    self.modal = Some(Modal::Form(Form {
-                        title: "Publish branch · set upstream".into(),
-                        kind: FormKind::Publish,
-                        fields: vec![
-                            Field::new("Remote", "origin".into(), false),
-                            Field::new("Remote branch", branch, false),
-                        ],
-                        active: 0,
-                        path_custom: false,
-                    }));
-                }
-            }
-            "d" | "remove_worktree" if self.focus == 0 => {
-                if let Some(w) = self.selected_tree() {
-                    if w.original {
-                        self.say("The original checkout cannot be removed", true);
-                    } else {
-                        self.modal = Some(Modal::Confirm(
-                            format!(
-                                "Remove {}?\n{}\nIts branch will be retained. Dirty or locked worktrees are refused.",
-                                w.branch,
-                                w.path.display()
-                            ),
-                            Operation::Remove(w.path.clone()),
-                        ));
-                    }
-                }
-            }
-            "r" | "prs" => {
-                self.waiting_prs = true;
-                self.say("Loading pull requests…", false);
-                self.enqueue(Job::Prs(project.path));
-            }
-            "v" | "review_diff" => {
-                self.pr_diff = !self.pr_diff;
-                self.diff_scroll = 0;
-                self.request_diff(true);
-            }
-            "w" | "open_pr" => {
-                if let Some(w) = self.selected_tree() {
-                    self.operation(Operation::OpenPr(w.branch.clone()));
-                }
-            }
-            "t" | "toggle_staged" => {
-                self.staged = !self.staged;
-                self.pr_diff = false;
-                self.diff_scroll = 0;
-                self.request_diff(true);
+            KeyCode::Char('t') => {
+                self.diff_staged = !self.diff_staged;
+                self.request_diff();
             }
             _ => {}
         }
     }
-    fn launch_profile(&mut self, name: &str) {
-        if let Some(w) = self.selected_tree() {
-            match launch::launch(&self.config, name, &w.path, &w.branch) {
-                Ok(()) => self.say(format!("Launched {name} in a new terminal"), false),
-                Err(e) => self.say(format!("{e:#}"), true),
-            }
-        }
-    }
-    fn modal_key(&mut self, key: KeyEvent) {
-        let Some(modal) = self.modal.take() else {
-            return;
-        };
-        if key.code == KeyCode::Esc {
-            if matches!(modal, Modal::OperationDetails) {
-                self.inspected_operation_id = None;
-            }
-            if let Modal::Picker(mut picker) = modal
-                && picker.editing
-            {
-                picker.editing = false;
-                self.modal = Some(Modal::Picker(picker));
-            }
-            return;
-        }
-        match modal {
-            Modal::Cleanup(preview) => self.cleanup_key(key, preview),
-            Modal::Requirements(review) => self.requirements_key(key, review),
-            Modal::OperationDetails => {
-                let count = self
-                    .inspected_operation()
-                    .map(|r| {
-                        r.details_lines(self.viewport_width.min(112).saturating_sub(2))
-                            .len()
-                    })
-                    .unwrap_or(0);
-                let last = count.saturating_sub(self.viewport_height.saturating_sub(9));
-                let current = self.operation_scroll.min(last);
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('i') => {
-                        self.inspected_operation_id = None;
-                        return;
-                    }
-                    KeyCode::Char('H') => {
-                        self.show_operation_history();
-                        return;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        self.operation_scroll = current.saturating_add(1).min(last)
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.operation_scroll = current.saturating_sub(1)
-                    }
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.operation_scroll =
-                            current.saturating_add(self.half_page() as usize).min(last)
-                    }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.operation_scroll = current.saturating_sub(self.half_page() as usize)
-                    }
-                    KeyCode::Char('g') | KeyCode::Home => self.operation_scroll = 0,
-                    KeyCode::Char('G') | KeyCode::End => self.operation_scroll = usize::MAX,
-                    _ => {}
-                }
-                self.modal = Some(Modal::OperationDetails);
-            }
-            Modal::Help => {
-                if !matches!(
-                    key.code,
-                    KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter
-                ) {
-                    self.modal = Some(Modal::Help);
+    fn move_selection(&mut self, delta: i16) {
+        match self.pane {
+            Pane::Worktrees => {
+                if let Some(tab) = self.tab() {
+                    let i = tab
+                        .selected
+                        .saturating_add_signed(delta as isize)
+                        .min(tab.trees.len().saturating_sub(1));
+                    self.action(Action::Tree(i));
                 }
             }
-            Modal::Confirm(prompt, op) => {
-                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter)
-                    && key.kind == KeyEventKind::Press
-                {
-                    self.operation(op);
-                } else if !matches!(key.code, KeyCode::Char('n') | KeyCode::Char('q')) {
-                    self.modal = Some(Modal::Confirm(prompt, op));
-                }
-            }
-            Modal::Picker(mut picker) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
-                    picker.selected = step(picker.selected, 1, picker.visible().len());
-                } else if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('p')
-                {
-                    picker.selected = step(picker.selected, -1, picker.visible().len());
+            Pane::List => {
+                if self.tab().is_some_and(|t| t.view == View::Changes) {
+                    let len = self.snapshot().map_or(0, |s| s.files.len());
+                    let i = self
+                        .tab()
+                        .map_or(0, |t| t.file)
+                        .saturating_add_signed(delta as isize)
+                        .min(len.saturating_sub(1));
+                    self.action(Action::File(i));
                 } else {
-                    match key.code {
-                        KeyCode::Char('/') if !picker.editing => {
-                            picker.editing = true;
-                        }
-                        KeyCode::Char('j') if !picker.editing => {
-                            picker.selected = step(picker.selected, 1, picker.visible().len())
-                        }
-                        KeyCode::Char('k') if !picker.editing => {
-                            picker.selected = step(picker.selected, -1, picker.visible().len())
-                        }
-                        KeyCode::Char('g') if !picker.editing => {
-                            if picker.top_prefix {
-                                picker.selected = 0;
-                                picker.top_prefix = false;
-                            } else {
-                                picker.top_prefix = true;
-                            }
-                        }
-                        KeyCode::Char('G') | KeyCode::End if !picker.editing => {
-                            picker.selected = picker.visible().len().saturating_sub(1)
-                        }
-                        KeyCode::Home => picker.selected = 0,
-                        KeyCode::Char('q') if !picker.editing => return,
-                        KeyCode::Down => {
-                            picker.selected = step(picker.selected, 1, picker.visible().len())
-                        }
-                        KeyCode::Up => {
-                            picker.selected = step(picker.selected, -1, picker.visible().len())
-                        }
-                        KeyCode::Enter => {
-                            let value = picker.visible().get(picker.selected).map(|e| e.1.clone());
-                            if let Some(v) = value {
-                                self.choose(picker.kind, v);
-                                return;
-                            }
-                        }
-                        KeyCode::Char('a')
-                            if !picker.editing && matches!(picker.kind, PickerKind::Branches) =>
-                        {
-                            self.create_form(String::new(), false, true);
-                            return;
-                        }
-                        KeyCode::Char('a')
-                            if !picker.editing && matches!(picker.kind, PickerKind::Prs) =>
-                        {
-                            self.review_form(String::new());
-                            return;
-                        }
-                        KeyCode::Char('d')
-                            if !picker.editing && matches!(picker.kind, PickerKind::Branches) =>
-                        {
-                            if let Some(value) =
-                                picker.visible().get(picker.selected).map(|e| e.1.clone())
-                                && self.branches.iter().any(|b| b.name == value && !b.remote)
-                            {
-                                self.modal = Some(Modal::Confirm(
-                                    format!(
-                                        "Delete local branch {value}?\nGit will refuse an unmerged or checked-out branch."
-                                    ),
-                                    Operation::DeleteBranch(value),
-                                ));
-                                return;
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            picker.query.pop();
-                            picker.selected = 0;
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            picker.editing = true;
-                            picker.query.push(c);
-                            picker.selected = 0;
-                        }
-                        _ => {}
-                    }
-                }
-                self.modal = Some(Modal::Picker(picker));
-            }
-            Modal::Form(mut form) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-                    self.submit(form);
-                    return;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('b')
-                    && matches!(
-                        form.kind,
-                        FormKind::Create { existing: false }
-                            | FormKind::Branch
-                            | FormKind::TicketCreate(_)
-                    )
-                {
-                    let entries = self
-                        .branches
+                    let sessions = self.sessions();
+                    let i = sessions
                         .iter()
-                        .map(|b| (b.name.clone(), b.name.clone()))
-                        .collect();
-                    self.picker("Starting point", PickerKind::Base(form), entries);
-                    return;
-                }
-                match key.code {
-                    KeyCode::Tab => form.active = (form.active + 1) % form.fields.len(),
-                    KeyCode::BackTab => {
-                        form.active = (form.active + form.fields.len() - 1) % form.fields.len()
-                    }
-                    KeyCode::Enter if !form.fields[form.active].multiline => {
-                        if form.active + 1 == form.fields.len() {
-                            self.submit(form);
-                            return;
-                        }
-                        form.active += 1;
-                    }
-                    _ => {
-                        let active = form.active;
-                        edit(&mut form.fields[active], key);
-                        if active == 2 {
-                            form.path_custom = true;
-                        }
-                        if active == 0
-                            && !form.path_custom
-                            && matches!(
-                                form.kind,
-                                FormKind::Create { .. } | FormKind::TicketCreate(_)
-                            )
-                            && let Some(p) = &self.project
-                        {
-                            let destination =
-                                self.config.worktree_path(&p.path, &form.fields[0].value);
-                            form.fields[2].value = destination.display().to_string();
-                            form.fields[2].cursor = form.fields[2].value.len();
-                        }
+                        .position(|c| {
+                            self.tab().and_then(|t| t.conversation.as_ref()) == Some(&c.id)
+                        })
+                        .unwrap_or(0)
+                        .saturating_add_signed(delta as isize)
+                        .min(sessions.len().saturating_sub(1));
+                    if let Some(c) = sessions.get(i) {
+                        self.action(Action::Session(c.id.clone()));
                     }
                 }
-                self.modal = Some(Modal::Form(form));
             }
+            Pane::Detail => self.action(Action::Scroll(delta)),
         }
     }
     pub fn paste(&mut self, text: &str) {
-        if self.comment_paste(text) {
+        if self.cli_focused && self.modal.is_none() {
+            if self.cli_input_blocked() {
+                self.say(
+                    "Wait for the active worktree operation before sending CLI input",
+                    true,
+                );
+                return;
+            }
+            if let Some(id) = self.conversation().map(|c| c.id.clone())
+                && let Some(terminal) = self.terminals.get_mut(&id)
+            {
+                terminal.paste(text);
+            }
             return;
         }
-        if let Some(editor) = self.browser.editor.as_mut() {
-            match editor {
-                crate::browser::Editor::Filters { fields, cursor } => {
-                    fields[*cursor].push_str(&text.replace(['\r', '\n'], " "))
-                }
-                crate::browser::Editor::Name { text: value, .. } => {
-                    value.push_str(&text.replace(['\r', '\n'], " "))
+        let text = text.replace('\r', "");
+        if let Some(Modal::Form(form)) = &mut self.modal {
+            if let Some(field) = form.fields.get_mut(form.focused)
+                && matches!(field.kind, FieldType::Text | FieldType::Multiline)
+            {
+                field.input.insert(&text);
+            }
+        } else if let Some(Modal::Projects { query, .. }) = &mut self.modal {
+            query.insert(&text);
+        } else if self.cli_focused {
+            self.composer.insert(&text);
+            self.sync_draft();
+        }
+    }
+    pub fn mouse(&mut self, event: MouseEvent) {
+        if self.modal.is_none()
+            && self.tab().is_some_and(|t| t.view == View::Sessions)
+            && self
+                .terminal_area
+                .contains((event.column, event.row).into())
+            && self.cli_input_blocked()
+        {
+            self.say(
+                "Wait for the active worktree operation before sending CLI input",
+                true,
+            );
+            return;
+        }
+        if self.modal.is_none()
+            && self.tab().is_some_and(|t| t.view == View::Sessions)
+            && self
+                .terminal_area
+                .contains((event.column, event.row).into())
+            && let Some(id) = self.conversation().map(|c| c.id.clone())
+            && let Some(terminal) = self.terminals.get_mut(&id)
+            && terminal.running()
+        {
+            if matches!(event.kind, MouseEventKind::Down(_)) {
+                self.cli_focused = true;
+                self.pane = Pane::Detail;
+            }
+            terminal.mouse(event, self.terminal_area);
+            return;
+        }
+        if self.modal.is_some()
+            && matches!(
+                event.kind,
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+            )
+        {
+            self.key(KeyEvent::new(
+                if event.kind == MouseEventKind::ScrollDown {
+                    KeyCode::Down
+                } else {
+                    KeyCode::Up
+                },
+                KeyModifiers::NONE,
+            ));
+            return;
+        }
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) && let Some(hit) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|h| h.rect.contains((event.column, event.row).into()))
+        {
+            match hit.action {
+                Action::Tree(_) => self.pane = Pane::Worktrees,
+                Action::Session(_) | Action::File(_) => self.pane = Pane::List,
+                Action::Expand | Action::FocusTerminal | Action::Scroll(_) => {
+                    self.pane = Pane::Detail
                 }
                 _ => {}
             }
-            return;
         }
-        if self.hosted_paste(text) {
-            return;
-        }
-        if self.settings_open {
-            if let Some(draft) = &mut self.settings {
-                draft.paste(text);
-            }
-            return;
-        }
-        if let Some(Modal::Form(form)) = &mut self.modal {
-            let field = &mut form.fields[form.active];
-            if field.readonly {
-                return;
-            }
-            let value = if field.multiline {
-                text.replace("\r\n", "\n")
-            } else {
-                text.replace(['\r', '\n'], " ")
-            };
-            field.value.insert_str(field.cursor, &value);
-            field.cursor += value.len();
-            if form.active == 0
-                && !form.path_custom
-                && matches!(
-                    form.kind,
-                    FormKind::Create { .. } | FormKind::TicketCreate(_)
-                )
-                && let Some(p) = &self.project
-            {
-                form.fields[2].value = self
-                    .config
-                    .worktree_path(&p.path, &form.fields[0].value)
-                    .display()
-                    .to_string();
-                form.fields[2].cursor = form.fields[2].value.len();
-            }
-        } else if self.searching {
-            self.filter.push_str(&text.replace(['\r', '\n'], " "));
-            self.reset_cursor();
-        } else if let Some(Modal::Picker(p)) = &mut self.modal {
-            p.editing = true;
-            p.query.push_str(text.trim());
-            p.selected = 0;
-        }
-    }
-    fn choose(&mut self, kind: PickerKind, value: String) {
-        match kind {
-            PickerKind::LinkWork(local) => self.workflow_command(WorkflowCommand::LinkLocal {
-                local,
-                ticket: value,
-            }),
-            PickerKind::TicketAdopt(ticket) => self.workflow_command(WorkflowCommand::Prepare {
-                ticket,
-                preparation: workflow::Preparation::Adopt { path: value.into() },
-            }),
-            PickerKind::TicketImport(ticket) => {
-                self.workflow_command(WorkflowCommand::ImportTasks {
-                    ticket,
-                    titles: vec![value],
-                })
-            }
-            PickerKind::Operations => {
-                if let Ok(id) = value.parse() {
-                    self.inspected_operation_id = Some(id);
-                    self.operation_scroll = usize::MAX;
-                    self.modal = Some(Modal::OperationDetails);
-                }
-            }
-            PickerKind::Profiles => self.launch_profile(&value),
-            PickerKind::Prs => self.review_form(value),
-            PickerKind::Base(mut form) => {
-                form.fields[1].value = value;
-                form.fields[1].cursor = form.fields[1].value.len();
-                self.modal = Some(Modal::Form(form));
-            }
-            PickerKind::Branches => {
-                let remote = self.branches.iter().any(|b| b.name == value && b.remote);
-                if remote {
-                    let branch = value
-                        .split_once('/')
-                        .map(|(_, n)| n)
-                        .unwrap_or(&value)
-                        .to_owned();
-                    self.create_form(branch, false, false);
-                    if let Some(Modal::Form(f)) = &mut self.modal {
-                        f.fields[1].value = value;
-                        f.fields[1].cursor = f.fields[1].value.len();
-                    }
-                } else if let Some(index) = self.trees.iter().position(|w| w.branch == value) {
-                    self.tree = index;
-                    self.focus = 0;
-                    self.filter.clear();
-                    self.selection_changed();
-                } else {
-                    self.create_form(value, true, false);
-                }
-            }
-        }
-    }
-    fn submit(&mut self, form: Form) {
-        if self.busy {
-            self.say("Wait for the running Git operation before submitting", true);
-            self.modal = Some(Modal::Form(form));
-            return;
-        }
-        let recovery = form.clone();
-        let values: Vec<String> = form
-            .fields
-            .iter()
-            .map(|f| f.value.trim().to_owned())
-            .collect();
-        if let FormKind::LocalTask(path) = &form.kind {
-            if values[0].is_empty() {
-                self.say("A task objective is required", true);
-                self.modal = Some(Modal::Form(form));
-                return;
-            }
-            self.workspace_start_pending = true;
-            self.workflow_command(WorkflowCommand::CreateLocal {
-                path: path.clone(),
-                objective: values[0].clone(),
-            });
-            return;
-        }
-        if let FormKind::TicketCreate(ticket) = &form.kind {
-            if values.iter().take(3).any(|v| v.is_empty()) {
-                self.say("Branch, starting point and directory are required", true);
-                self.modal = Some(Modal::Form(form));
-                return;
-            }
-            if let Some(p) = &self.project {
-                self.state
-                    .bases
-                    .insert(p.path.to_string_lossy().into_owned(), values[1].clone());
-            }
-            self.workflow_command(WorkflowCommand::Prepare {
-                ticket: ticket.clone(),
-                preparation: workflow::Preparation::Create {
-                    branch: values[0].clone(),
-                    base: values[1].clone(),
-                    destination: values[2].clone().into(),
-                    fetch: matches!(values[3].to_lowercase().as_str(), "yes" | "y" | "true"),
-                },
-            });
-            return;
-        }
-        let operation = match form.kind {
-            FormKind::TicketCreate(_) | FormKind::LocalTask(_) => unreachable!(),
-            FormKind::Create { existing } => {
-                if values[0].is_empty() || values[1].is_empty() || values[2].is_empty() {
-                    self.say("Branch, starting point, and directory are required", true);
-                    self.modal = Some(Modal::Form(form));
-                    return;
-                }
-                if let Some(p) = &self.project {
-                    self.state
-                        .bases
-                        .insert(p.path.to_string_lossy().into_owned(), values[1].clone());
-                }
-                Operation::Create {
-                    branch: values[0].clone(),
-                    base: values[1].clone(),
-                    destination: PathBuf::from(&values[2]),
-                    existing,
-                    fetch: matches!(
-                        values[3].to_ascii_lowercase().as_str(),
-                        "yes" | "y" | "true"
-                    ),
-                }
-            }
-            FormKind::Branch => Operation::Branch(values[0].clone(), values[1].clone()),
-            FormKind::Commit => Operation::Commit(values[0].clone(), form.fields[1].value.clone()),
-            FormKind::Publish => Operation::Publish(values[0].clone(), values[1].clone()),
-            FormKind::Review => {
-                let value = values[0].trim_end_matches('/');
-                let number = value.rsplit('/').next().unwrap_or(value);
-                if number.parse::<u64>().is_err() {
-                    self.say("Enter a PR number or a PR URL ending in its number", true);
-                    self.modal = Some(Modal::Form(form));
-                    return;
-                }
-                let Some(p) = &self.project else { return };
-                let path = self
-                    .config
-                    .worktree_path(&p.path, &format!("review/pr-{number}"));
-                Operation::Review(value.into(), path)
-            }
-        };
-        self.recover_form = Some(recovery);
-        self.operation(operation);
-    }
-    pub fn workflow_command(&mut self, command: WorkflowCommand) {
-        if let Some(project) = &self.project {
-            self.enqueue(Job::Workflow(
-                self.config_path.clone(),
-                project.path.clone(),
-                command,
-            ));
-        }
-    }
-    fn ticket_key(&mut self, key: KeyEvent) -> bool {
-        if self.ticket.is_none() && self.browser_key(key) {
-            return true;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return false;
-        }
-        match key.code {
-            KeyCode::Char('b') => self.begin_handover(),
-            KeyCode::Char('r') => self.reconcile_agent_dialog(),
-            KeyCode::Char('u') => self.retry_agent_dialog(),
-            KeyCode::Char('s') => self.begin_agent(false),
-            KeyCode::Char('n') => self.begin_agent(true),
-            KeyCode::Char('x') => self.stop_agent_dialog(),
-            KeyCode::Char('X') => self.hosted.dialog = Some(hosted_ui::Dialog::StopHost),
-            KeyCode::Char('d') => self.detach_agent(),
-            KeyCode::Char('!') => self.hosted.dialog = Some(hosted_ui::Dialog::Takeover),
-            KeyCode::Char('g') => self.show_sessions(),
-            KeyCode::Char('w') => {
-                self.ticket_mode = false;
-                self.say("Basic worktrees · T tickets", false);
-            }
-            KeyCode::Char('q') | KeyCode::Esc => match self.ticket.take() {
-                Some(_) => {}
-                None => {
-                    self.project = None;
-                    self.epoch += 1;
-                }
-            },
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(ticket) = &self.ticket {
-                    self.task_cursor = step(self.task_cursor, 1, ticket.tasks.len());
-                } else {
-                    self.issue_cursor = step(self.issue_cursor, 1, self.issues.len());
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(ticket) = &self.ticket {
-                    self.task_cursor = step(self.task_cursor, -1, ticket.tasks.len());
-                } else {
-                    self.issue_cursor = step(self.issue_cursor, -1, self.issues.len());
-                }
-            }
-            KeyCode::Enter => {
-                if self.hosted.terminal.is_some()
-                    && self.hosted.token.is_some()
-                    && self.hosted.record.as_ref().is_some_and(|record| {
-                        self.ticket.as_ref().is_some_and(|ticket| {
-                            ticket.id() == record.ticket
-                                && ticket
-                                    .tasks
-                                    .get(self.task_cursor)
-                                    .is_some_and(|task| task.id == record.task)
-                        })
-                    })
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(hit) = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|h| h.rect.contains((event.column, event.row).into()))
+                    .cloned()
                 {
-                    self.hosted.input = true;
-                    return true;
-                }
-                if let Some(ticket) = &self.ticket {
-                    if let Some(task) = ticket.tasks.get(self.task_cursor) {
-                        self.workflow_command(WorkflowCommand::SelectTask {
-                            ticket: ticket.id(),
-                            task: task.id.clone(),
-                        });
-                    }
-                } else if let Some(issue) = self.issues.get(self.issue_cursor) {
-                    self.task_cursor = 0;
-                    self.workflow_command(WorkflowCommand::Open {
-                        number: issue.number,
-                    });
+                    self.action(hit.action);
                 }
             }
-            KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
-            KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
-            KeyCode::Char('R') => {
-                let command = self
-                    .ticket
-                    .as_ref()
-                    .map(|record| WorkflowCommand::Refresh {
-                        ticket: record.id(),
-                    })
-                    .unwrap_or(WorkflowCommand::List);
-                self.workflow_command(command);
-            }
-            KeyCode::Char('D') => {
-                if let Some(ticket) = &self.ticket {
-                    self.workflow_command(WorkflowCommand::PreviewCleanup {
-                        ticket: ticket.id(),
-                    });
+            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => self.move_selection(-1),
+            _ => {}
+        }
+    }
+    pub fn agent_event(&mut self, event: agent::Event) {
+        match event {
+            agent::Event::FolderTrust { id, path } => {
+                if let Some(c) = self.state.conversations.iter_mut().find(|c| c.id == id) {
+                    c.attention = Attention::NeedsInput;
                 }
+                self.confirm_yes = false;
+                self.modal = Some(Modal::Confirm(Confirm::Trust { id, path }));
+                self.dirty = true;
             }
-            KeyCode::Char('v') => {
-                if let Some(ticket) = &self.ticket {
-                    self.workflow_command(WorkflowCommand::InspectUpdate {
-                        ticket: ticket.id(),
-                    });
-                }
+            agent::Event::Connected {
+                connection_url,
+                agents,
+            } => {
+                self.connected = true;
+                self.connection_url = Some(connection_url);
+                self.agents = agents;
+                self.agent_commands.push(agent::Command::Discover);
             }
-            KeyCode::Char('p') => {
-                if let Some(ticket) = &self.ticket
-                    && let Some(task) = ticket.tasks.get(self.task_cursor)
+            agent::Event::Options(options) => {
+                self.provider_options = options.clone();
+                if let Some(Modal::Form(form)) = &mut self.modal
+                    && form.kind == FormKind::Session
                 {
-                    let progress = match task.progress {
-                        workflow::Progress::Pending => workflow::Progress::InProgress,
-                        workflow::Progress::InProgress => workflow::Progress::Done,
-                        workflow::Progress::Done => workflow::Progress::Pending,
-                    };
-                    self.workflow_command(WorkflowCommand::SetProgress {
-                        ticket: ticket.id(),
-                        task: task.id.clone(),
-                        progress,
-                    });
-                }
-            }
-            KeyCode::Char('i') => {
-                if let Some(ticket) = &self.ticket {
-                    let entries = workflow::import_candidates(&ticket.issue.body)
-                        .into_iter()
-                        .map(|s| (s.clone(), s))
-                        .collect();
-                    self.picker(
-                        "Inspect explicit Tasks",
-                        PickerKind::TicketImport(ticket.id()),
-                        entries,
-                    );
-                }
-            }
-            KeyCode::Char('a') => {
-                if let Some(ticket) = &self.ticket {
-                    let entries = self
-                        .trees
-                        .iter()
-                        .map(|wt| {
-                            (
-                                format!(
-                                    "{} · {}{}",
-                                    wt.branch,
-                                    wt.path.display(),
-                                    if wt.original { " [original]" } else { "" }
-                                ),
-                                wt.path.display().to_string(),
-                            )
-                        })
-                        .collect();
-                    self.picker(
-                        "Adopt registered worktree",
-                        PickerKind::TicketAdopt(ticket.id()),
-                        entries,
-                    );
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(ticket) = self.ticket.clone() {
-                    if ticket.worktree.is_some() {
-                        self.say("This ticket already has a shared worktree", false);
-                    } else {
-                        self.create_form(format!("ticket/{}", ticket.issue.number), false, false);
-                        if let Some(Modal::Form(form)) = &mut self.modal {
-                            form.kind = FormKind::TicketCreate(ticket.id());
-                            form.title = "Prepare ticket shared worktree".into();
+                    let fresh = config_fields(&options);
+                    for field in fresh {
+                        if !form.fields.iter().any(|f| f.key == field.key) {
+                            form.fields.push(field);
                         }
                     }
                 }
             }
-            KeyCode::Char(',') | KeyCode::Char('?') => return false,
-            _ => {}
-        }
-        true
-    }
-    fn requirements_key(&mut self, key: KeyEvent, review: Box<workflow::RequirementsReview>) {
-        match key.code {
-            KeyCode::Char('q') => return,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
-            }
-            KeyCode::PageDown => self.ticket_scroll = self.ticket_scroll.saturating_add(10),
-            KeyCode::PageUp => self.ticket_scroll = self.ticket_scroll.saturating_sub(10),
-            KeyCode::Char('m') if key.kind == KeyEventKind::Press => {
-                self.workflow_command(WorkflowCommand::ApplyTaskMerge {
-                    ticket: review.ticket,
-                    expected_issue: review.current,
-                });
-                return;
-            }
-            KeyCode::Char('s') if key.kind == KeyEventKind::Press => {
-                if let Some(task) = self
-                    .ticket
-                    .as_ref()
-                    .filter(|ticket| ticket.id() == review.ticket)
-                    .and_then(|ticket| ticket.selected_task.clone())
+            agent::Event::Agents(agents) => {
+                self.agents = agents;
+                let model = self.model_field(None);
+                if let Some(Modal::Form(form)) = &mut self.modal
+                    && let Some(field) = form.fields.iter_mut().find(|f| f.key == "model")
                 {
-                    self.workflow_command(WorkflowCommand::ReviseInstructions {
-                        ticket: review.ticket,
-                        task,
-                        expected_issue: review.current,
+                    field.kind = model.kind;
+                }
+            }
+            agent::Event::Catalog(items) => {
+                for item in items {
+                    let Some(id) = item["resource"].as_str() else {
+                        continue;
+                    };
+                    let directory = item["workingDirectories"]
+                        .as_array()
+                        .and_then(|d| d.first())
+                        .and_then(Value::as_str)
+                        .and_then(|uri| url::Url::parse(uri).ok())
+                        .and_then(|u| u.to_file_path().ok());
+                    let Some(worktree) = directory else {
+                        continue;
+                    };
+                    let project = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.trees.iter().any(|w| same_path(&w.path, &worktree)))
+                        .map(|t| t.project.path.clone())
+                        .or_else(|| {
+                            self.projects
+                                .iter()
+                                .find(|p| same_path(&p.path, &worktree))
+                                .map(|p| p.path.clone())
+                        });
+                    let project = project.or_else(|| {
+                        item["_treerailProject"]
+                            .as_str()
+                            .map(PathBuf::from)
+                            .filter(|path| self.projects.iter().any(|p| same_path(&p.path, path)))
                     });
-                    return;
+                    let Some(project) = project else {
+                        if item.get("_treerailProject").is_none() {
+                            self.enqueue(Job::Associate(worktree, item));
+                        }
+                        continue;
+                    };
+                    if !self.state.conversations.iter().any(|c| c.session_uri == id) {
+                        self.state.conversations.push(Conversation {
+                            id: id.into(),
+                            project,
+                            worktree,
+                            title: item["title"]
+                                .as_str()
+                                .unwrap_or("Copilot conversation")
+                                .into(),
+                            session_uri: id.into(),
+                            chat_uri: item["defaultChat"].as_str().map(str::to_owned),
+                            attention: Attention::from_status(
+                                item["status"].as_u64().unwrap_or(1) as u32
+                            ),
+                            archived: false,
+                            draft: String::new(),
+                            chat: None,
+                            error: None,
+                            pending: vec![],
+                            options: Value::Null,
+                            owned: false,
+                            initial_prompt: None,
+                            creation_failed: false,
+                            model: None,
+                        });
+                        self.dirty = true;
+                    }
+                    if item["status"]
+                        .as_u64()
+                        .is_some_and(|status| status & 8 != 0)
+                    {
+                        self.agent_commands
+                            .push(agent::Command::Observe { id: id.into() });
+                    }
                 }
-                self.say("Select a task before sending revised requirements", true);
             }
-            _ => {}
+            agent::Event::Session { id, state } => {
+                self.attached.insert(id.clone());
+                if let Some(c) = self
+                    .state
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.session_uri == id)
+                {
+                    c.chat_uri = state.default_chat.clone();
+                    if !state.title.is_empty() {
+                        c.title = state.title.clone();
+                    }
+                    if c.initial_prompt.is_none() || state.status & 8 != 0 {
+                        c.attention = Attention::from_status(state.status);
+                    }
+                    c.creation_failed = state.creation_error.is_some();
+                    c.error = state.creation_error.map(|e| format!("{e:?}"));
+                    if c.creation_failed {
+                        c.attention = Attention::Interrupted;
+                        if let Some(prompt) = c.initial_prompt.take()
+                            && c.draft.is_empty()
+                        {
+                            c.draft = prompt;
+                        }
+                    }
+                    c.pending = state
+                        .input_needed
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|r| serde_json::to_value(r).ok())
+                        .collect();
+                    c.options = state
+                        .config
+                        .and_then(|c| serde_json::to_value(c).ok())
+                        .unwrap_or(Value::Null);
+                    self.dirty = true;
+                }
+            }
+            agent::Event::Chat { session, state } => {
+                if (state.active_turn.is_some() || !state.turns.is_empty())
+                    && self
+                        .failed_form
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FormKind::Session)
+                {
+                    self.failed_form = None;
+                }
+                if let Some(c) = self.state.conversations.iter_mut().find(|c| {
+                    c.session_uri == session
+                        && c.chat_uri.as_ref().is_none_or(|uri| uri == &state.resource)
+                }) {
+                    c.chat_uri = Some(state.resource.clone());
+                    if state.active_turn.is_some() || !state.turns.is_empty() {
+                        c.initial_prompt = None;
+                    }
+                    if c.initial_prompt.is_none() {
+                        c.attention = Attention::from_status(state.status);
+                    }
+                    c.chat = Some(*state);
+                    self.dirty = true;
+                }
+            }
+            agent::Event::Completions(value) => {
+                self.completions = value.clone();
+                let items = value["items"].as_array().cloned().unwrap_or_default();
+                if items.is_empty() {
+                    self.say("No provider completions at this position", false);
+                } else {
+                    self.modal = Some(Modal::Completions { items, selected: 0 });
+                }
+            }
+            agent::Event::Error { id, message } => {
+                if let Some(c) = self.state.conversations.iter_mut().find(|c| {
+                    id.as_ref()
+                        .is_some_and(|id| &c.session_uri == id || c.chat_uri.as_ref() == Some(id))
+                }) {
+                    c.attention = if c.creation_failed {
+                        Attention::Interrupted
+                    } else {
+                        Attention::Unavailable
+                    };
+                    c.error = Some(message.clone());
+                    if let Some(prompt) = c.initial_prompt.take()
+                        && c.draft.is_empty()
+                    {
+                        c.draft = prompt;
+                    }
+                    self.dirty = true;
+                }
+                self.say(message, true);
+                if self.composer.value.is_empty() {
+                    self.restore_composer();
+                }
+            }
+            agent::Event::Disconnected => {
+                self.connected = false;
+                self.attached.clear();
+                for c in &mut self.state.conversations {
+                    if c.attention.busy() {
+                        c.attention = Attention::Interrupted;
+                    }
+                }
+                self.dirty = true;
+            }
+            agent::Event::LaunchFailed { id, message } => {
+                if let Some(c) = self.state.conversations.iter_mut().find(|c| c.id == id) {
+                    c.attention = Attention::Interrupted;
+                    c.creation_failed = true;
+                    c.error = Some(message.clone());
+                    if let Some(prompt) = c.initial_prompt.take()
+                        && c.draft.is_empty()
+                    {
+                        c.draft = prompt;
+                    }
+                }
+                self.dirty = true;
+                self.say(message, true);
+                if self.composer.value.is_empty() {
+                    self.restore_composer();
+                }
+            }
         }
-        self.modal = Some(Modal::Requirements(review));
     }
-    fn cleanup_key(&mut self, key: KeyEvent, preview: Box<workflow::CleanupPreview>) {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Char('n') => return,
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.ticket_scroll = self.ticket_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.ticket_scroll = self.ticket_scroll.saturating_sub(1)
-            }
-            KeyCode::Char('y') if key.kind == KeyEventKind::Press && preview.can_remove() => {
-                self.workflow_command(WorkflowCommand::Cleanup {
-                    ticket: preview.ticket,
-                    expected_checkout: preview.checkout,
-                });
-                return;
-            }
-            KeyCode::Char('x') if key.kind == KeyEventKind::Press => {
-                if let Some(owner) = &preview.owner {
-                    self.pending_cleanup_stop = Some(owner.id.clone());
-                    self.say(
-                        "Explicit session stop requested; reopen cleanup after verified stop",
-                        false,
-                    );
-                    return;
-                }
-            }
-            _ => {}
+    fn remember_navigation(&mut self) {
+        self.sync_draft();
+        for tab in &self.tabs {
+            self.state.navigation.insert(
+                tab.project.path.to_string_lossy().into(),
+                Navigation {
+                    worktree: tab.trees.get(tab.selected).map(|t| t.path.clone()),
+                    conversation: tab.conversation.clone(),
+                    changes: tab.view == View::Changes,
+                },
+            );
         }
-        self.modal = Some(Modal::Cleanup(preview));
+        self.state.tabs = self.tabs.iter().map(|t| t.project.path.clone()).collect();
+        self.state.last_project = self.tab().map(|t| t.project.path.clone());
+        self.state.last_worktree = self.tree().map(|t| t.path.clone());
     }
     pub fn save(&mut self) -> Result<()> {
-        if let (Some(snapshot), Some(token)) = (&self.hosted.terminal, self.hosted.token) {
-            // Detach relinquishes keyboard control; it never stops the process.
-            if let Ok(client) = crate::host::runtime::Client::for_config(&self.config_path) {
-                let _ = client.execute(crate::host::runtime::HostCommand::Detach {
-                    session: snapshot.session.clone(),
-                    client: self.hosted.client.clone(),
-                    token,
-                });
+        self.remember_navigation();
+        self.state.save(&config::state_path(&self.config_path))?;
+        self.dirty = false;
+        self.last_save = Instant::now();
+        Ok(())
+    }
+    pub fn tick(&mut self) {
+        self.terminals.poll();
+        if self
+            .conversation()
+            .and_then(|c| self.terminals.get(&c.id))
+            .is_some_and(|t| !t.running())
+        {
+            self.cli_focused = false;
+        }
+        for (id, _) in self.terminal_requested.clone() {
+            self.open_terminal(&id);
+        }
+        if self.connected && self.last_agent_refresh.elapsed() > Duration::from_secs(10) {
+            self.last_agent_refresh = Instant::now();
+            self.agent_commands.push(agent::Command::Discover);
+        }
+        if self.last_refresh.elapsed() > Duration::from_secs(2) {
+            self.last_refresh = Instant::now();
+            let paths = self
+                .tab()
+                .into_iter()
+                .flat_map(|t| &t.trees)
+                .filter(|t| !t.prunable)
+                .map(|t| t.path.clone())
+                .collect::<Vec<_>>();
+            for path in paths {
+                self.enqueue(Job::Status(path));
             }
         }
-        self.state
-            .save(&self.config_path)
-            .context("Save remembered selections")
-    }
-}
-fn step(value: usize, delta: isize, len: usize) -> usize {
-    value
-        .saturating_add_signed(delta)
-        .min(len.saturating_sub(1))
-}
-pub fn key_name(key: KeyEvent) -> String {
-    let prefix = if key.modifiers.contains(KeyModifiers::CONTROL) {
-        "ctrl+"
-    } else if key.modifiers.contains(KeyModifiers::ALT) {
-        "alt+"
-    } else {
-        ""
-    };
-    format!(
-        "{prefix}{}",
-        match key.code {
-            KeyCode::Char(c) => c.to_string(),
-            KeyCode::Enter => "enter".into(),
-            KeyCode::Tab => "tab".into(),
-            KeyCode::Esc => "esc".into(),
-            _ => format!("{:?}", key.code).to_lowercase(),
-        }
-    )
-}
-pub(crate) fn edit(field: &mut Field, key: KeyEvent) {
-    if field.readonly {
-        return;
-    }
-    let previous = |s: &str, p: usize| s[..p].char_indices().last().map(|(i, _)| i).unwrap_or(0);
-    let next = |s: &str, p: usize| s[p..].chars().next().map(|c| p + c.len_utf8()).unwrap_or(p);
-    match key.code {
-        KeyCode::Left => field.cursor = previous(&field.value, field.cursor),
-        KeyCode::Right => field.cursor = next(&field.value, field.cursor),
-        KeyCode::Home => {
-            field.cursor = field.value[..field.cursor]
-                .rfind('\n')
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        }
-        KeyCode::End => {
-            field.cursor = field.value[field.cursor..]
-                .find('\n')
-                .map(|i| field.cursor + i)
-                .unwrap_or(field.value.len())
-        }
-        KeyCode::Backspace => {
-            let p = previous(&field.value, field.cursor);
-            field.value.replace_range(p..field.cursor, "");
-            field.cursor = p;
-        }
-        KeyCode::Delete => {
-            let n = next(&field.value, field.cursor);
-            field.value.replace_range(field.cursor..n, "");
-        }
-        KeyCode::Up | KeyCode::Down if field.multiline => {
-            let start = field.value[..field.cursor]
-                .rfind('\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let col = field.value[start..field.cursor].chars().count();
-            let target = if key.code == KeyCode::Up {
-                if start == 0 {
-                    return;
-                }
-                let end = start - 1;
-                let begin = field.value[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                (begin, end)
-            } else {
-                let Some(offset) = field.value[field.cursor..].find('\n') else {
-                    return;
-                };
-                let begin = field.cursor + offset + 1;
-                let end = field.value[begin..]
-                    .find('\n')
-                    .map(|i| begin + i)
-                    .unwrap_or(field.value.len());
-                (begin, end)
-            };
-            field.cursor = field.value[target.0..target.1]
-                .char_indices()
-                .nth(col)
-                .map(|(i, _)| target.0 + i)
-                .unwrap_or(target.1);
-        }
-        KeyCode::Enter if field.multiline => {
-            field.value.insert(field.cursor, '\n');
-            field.cursor += 1;
-        }
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        if self.dirty
+            && self.last_save.elapsed() > Duration::from_secs(2)
+            && let Err(e) = self.save()
         {
-            field.value.insert(field.cursor, c);
-            field.cursor += c.len_utf8();
+            self.say(format!("State could not be saved: {e:#}"), true);
         }
-        _ => {}
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, error, t)| !error && t.elapsed() > Duration::from_secs(6))
+        {
+            self.notice = None;
+        }
+    }
+}
+fn config_fields(options: &Value) -> Vec<Field> {
+    let mut fields = vec![];
+    if let Some(properties) = options["schema"]["properties"].as_object() {
+        for (key, property) in properties {
+            if !matches!(key.as_str(), "approvalMode" | "mode") {
+                continue;
+            }
+            let label = property["title"].as_str().unwrap_or(key);
+            let value = options["values"]
+                .get(key)
+                .or_else(|| property.get("default"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let mut field = Field::text(
+                &format!("config:{key}"),
+                label,
+                value.as_str().map(str::to_owned).unwrap_or_else(|| {
+                    if value.is_null() {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    }
+                }),
+            );
+            if property["type"] == "boolean" {
+                field = Field::toggle(
+                    &format!("config:{key}"),
+                    label,
+                    value.as_bool().unwrap_or(false),
+                );
+            } else if let Some(choices) = property["enum"].as_array() {
+                field.kind = FieldType::Choice(
+                    choices
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect(),
+                );
+            }
+            if matches!(
+                property["type"].as_str(),
+                Some("string" | "boolean" | "number" | "integer")
+            ) || property.get("enum").is_some()
+            {
+                fields.push(field);
+            }
+        }
+    }
+    fields
+}
+fn field_value(field: &Field, schema: &Value) -> Result<Value> {
+    match schema["type"].as_str() {
+        Some("boolean") => Ok(json!(field.input.value == "yes")),
+        Some("number" | "integer") => Ok(serde_json::from_str(&field.input.value)
+            .with_context(|| format!("Invalid number for {}", field.label))?),
+        _ => Ok(json!(field.input.value)),
+    }
+}
+fn utf16_byte(text: &str, offset: usize) -> Option<usize> {
+    let mut count = 0;
+    for (i, c) in text.char_indices() {
+        if count == offset {
+            return Some(i);
+        }
+        count += c.len_utf16();
+    }
+    if count == offset {
+        Some(text.len())
+    } else {
+        None
     }
 }
