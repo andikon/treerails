@@ -1,3 +1,12 @@
+# Unreleased: Starting-point worktree creation
+
+- Start from the selected worktree's branch or commit, or fuzzy-search local and remote branches.
+- Choose an existing branch for review, or name a new branch from that starting point.
+- Fetch automatically and use the configured checkout location; remote, directory and Fetch controls are removed from the form.
+- Review checkouts establish upstream tracking and fast-forward only; checked-out branches, diverged commits and conflicting upstreams are protected.
+
+---
+
 # Tree Rail v0.3.0 — Worktrees and the real Copilot CLI
 
 Tree Rail now follows Project → Worktree → Conversation. The ticket, task,

@@ -8,7 +8,11 @@ Select a worktree on the left. Sessions shows its conversations in the middle an
 
 The Worktrees **+** creates a checkout without starting an agent. The Sessions **+**, or `n`, immediately starts a new idle conversation in the selected worktree and opens the real Copilot CLI. Enter your first prompt in Copilot itself; no Tree Rail setup form appears. First-use folder trust still requires explicit confirmation. Model and permission settings can be managed in Copilot.
 
-Help → **New session with options / new worktree** retains the optional setup form. **Create in a new worktree** is initially unchecked. Toggle it to reveal branch, starting reference, directory, remote and Fetch. A blank starting reference means the remote's freshly fetched actual default branch, such as `origin/develop`. `HEAD` explicitly means the selected checkout's current commit; another branch/tag/commit overrides it. Disabling Fetch requires an explicit cached reference. Dirty files are never copied into a new checkout. Fetch failures report an error; there is no silent fallback to stale references.
+The worktree form starts with **Starting point**, prefilled with the selected worktree's branch (or commit when detached). **Browse**, Down or Enter in that field opens a fuzzy picker of local and remote branches. Type a few letters, use arrows to select and Enter to confirm; Esc returns to the form without losing your draft.
+
+Next choose **Create new branch** and enter a name, or **Use existing branch** to check out the selected branch directly. For PR review, choose its remote branch and use the existing-branch option: Tree Rail creates a local tracking branch if necessary and fast-forwards an existing local branch when safe. It refuses to reset local commits, reuse a branch already checked out elsewhere, or silently reuse a branch tracking a different remote.
+
+Fetching always runs before creation, with no stale fallback on failure. Directory and remote controls are hidden: the configured worktree path template chooses the location, and fetching refreshes all configured remotes. Dirty files are never copied to the new checkout. Help offers **New session with options / new worktree** with the same starting-point and branch choices under its optional new-worktree toggle; Sessions + still opens Copilot directly.
 
 Use the creation form's Provider options to inspect the host's advertised models, permission settings and agent mode. After starting, the conversation opens immediately. The native Copilot runtime loads its own repository instructions and configured customizations. Sign in with GitHub CLI (`gh auth login`) or provide `COPILOT_GITHUB_TOKEN`; an existing login in another Copilot application does not necessarily expose a credential to an AHP client.
 
@@ -55,6 +59,7 @@ Closing a tab with running sessions asks before hiding it. Help → Agent activi
 | Leave Copilot CLI focus | Ctrl+] |
 | Scroll detail | Ctrl+u / Ctrl+d |
 | Form fields / submit / cancel | Tab / Ctrl+Enter / Esc |
+| Starting-point picker | Browse or Down/Enter in Starting point; type to fuzzy search |
 | Help | ? |
 
 These are Tree Rail navigation keys. While the CLI is focused, only Ctrl+] is reserved by Tree Rail; every other key belongs to Copilot. Letters typed into a form are text. Mouse support covers project tabs, selections, creation buttons, forms, command choices and the embedded terminal. Very small terminals ask for at least 60 columns × 16 rows while keeping background work alive.

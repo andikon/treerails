@@ -75,6 +75,96 @@ fn conversation(app: &App, id: &str, attention: Attention) -> Conversation {
 fn press(app: &mut App, code: KeyCode) {
     app.key(KeyEvent::new(code, KeyModifiers::NONE));
 }
+fn load_branches(app: &mut App) {
+    let project = app.tab().unwrap().project.path.clone();
+    app.accept(
+        format!("branches:{}", project.display()),
+        Ok(Completion::Branches(
+            project,
+            vec![
+                treerail::git::Branch {
+                    name: "feat/search".into(),
+                    remote: false,
+                    checkout_name: "feat/search".into(),
+                },
+                treerail::git::Branch {
+                    name: "origin/review/pr-42".into(),
+                    remote: true,
+                    checkout_name: "review/pr-42".into(),
+                },
+                treerail::git::Branch {
+                    name: "origin/develop".into(),
+                    remote: true,
+                    checkout_name: "develop".into(),
+                },
+            ],
+        )),
+    );
+}
+
+#[test]
+fn worktree_creation_starts_with_selected_branch_and_hides_automatic_options() {
+    let (_temp, mut app) = setup();
+    app.action(Action::NewTree);
+    let Some(Modal::Form(form)) = &app.modal else {
+        panic!()
+    };
+    assert_eq!(
+        form.fields
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect::<Vec<_>>(),
+        ["base", "mode", "branch"]
+    );
+    assert_eq!(form.value("base"), "feat/search");
+    let screen = render(&mut app, 120, 36).join("\n");
+    assert!(!screen.contains("Remote ·"));
+    assert!(!screen.contains("Directory ·"));
+    assert!(screen.find("Starting point").unwrap() < screen.find("New branch name").unwrap());
+    app.action(Action::Confirm);
+    assert!(app.mutation.is_none(), "Creation waits for branch fetch");
+}
+
+#[test]
+fn fuzzy_branch_picker_preserves_drafts_and_prepares_a_remote_review_checkout() {
+    let (_temp, mut app) = setup();
+    app.action(Action::NewTree);
+    load_branches(&mut app);
+    if let Some(Modal::Form(form)) = &mut app.modal {
+        form.fields[2].input = Input::new("keep-this-name");
+    }
+    press(&mut app, KeyCode::Down);
+    assert!(matches!(app.modal, Some(Modal::Branches { .. })));
+    app.paste("rvpr42");
+    let Some(Modal::Branches { form, query, .. }) = &app.modal else {
+        panic!()
+    };
+    assert_eq!(app.matching_branches(form, &query.value).len(), 1);
+    press(&mut app, KeyCode::Esc);
+    let Some(Modal::Form(form)) = &app.modal else {
+        panic!()
+    };
+    assert_eq!(form.value("branch"), "keep-this-name");
+    app.action(Action::PickBranch);
+    app.paste("rvpr42");
+    press(&mut app, KeyCode::Enter);
+    let Some(Modal::Form(form)) = &app.modal else {
+        panic!()
+    };
+    assert_eq!(form.value("base"), "origin/review/pr-42");
+    assert_eq!(form.context["base_ref"], "refs/remotes/origin/review/pr-42");
+    press(&mut app, KeyCode::Right);
+    let Some(Modal::Form(form)) = &app.modal else {
+        panic!()
+    };
+    assert_eq!(
+        form.visible().len(),
+        2,
+        "Existing branch hides new branch name"
+    );
+    app.action(Action::Confirm);
+    assert!(app.jobs.iter().any(|job| matches!(job, treerail::app::Job::Operate { operation: Operation::Create { base, branch, existing: true, .. }, .. } if base == "refs/remotes/origin/review/pr-42" && branch == "review/pr-42")));
+}
 fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
@@ -125,8 +215,13 @@ fn advanced_session_creation_starts_small_and_defaults_to_current_checkout() {
     assert_eq!(form.kind, FormKind::Session);
     assert_eq!(form.value("new_tree"), "no");
     assert_eq!(form.visible().len(), 2);
-    assert!(form.value("base").is_empty());
-    assert_eq!(form.value("fetch"), "yes");
+    assert_eq!(form.value("base"), "feat/search");
+    assert!(
+        !form
+            .fields
+            .iter()
+            .any(|f| ["remote", "destination", "fetch"].contains(&f.key.as_str()))
+    );
     let shown = render(&mut app, 120, 35).join("\n");
     assert!(shown.contains("First prompt"));
     assert!(!shown.contains("Starting point"));
@@ -142,7 +237,7 @@ fn advanced_session_creation_starts_small_and_defaults_to_current_checkout() {
     assert!(app.modal.is_none());
 }
 #[test]
-fn create_new_worktree_toggle_reveals_fresh_remote_defaults() {
+fn create_new_worktree_toggle_reveals_selected_start_and_branch_choice() {
     let (_temp, mut app) = setup();
     app.action(Action::NewSessionOptions);
     app.action(Action::Field(1));
@@ -151,8 +246,13 @@ fn create_new_worktree_toggle_reveals_fresh_remote_defaults() {
     };
     assert_eq!(form.value("new_tree"), "yes");
     assert!(form.visible().len() > 2);
-    assert_eq!(form.value("base"), "");
-    assert_eq!(form.value("fetch"), "yes");
+    assert_eq!(form.value("base"), "feat/search");
+    assert!(
+        !form
+            .fields
+            .iter()
+            .any(|f| ["remote", "destination", "fetch"].contains(&f.key.as_str()))
+    );
 }
 #[test]
 fn busy_worktree_blocks_all_git_writes_but_allows_fetch() {
@@ -399,6 +499,7 @@ fn failed_worktree_creation_retains_prompt_and_explicit_retry_choices() {
             .unwrap()
             .input = Input::new("feat/retry");
     }
+    load_branches(&mut app);
     app.action(Action::Confirm);
     assert!(app.mutation.is_some());
     app.accept("mutation".into(), Err(anyhow::anyhow!("Fetch failed")));
@@ -407,7 +508,7 @@ fn failed_worktree_creation_retains_prompt_and_explicit_retry_choices() {
     };
     assert_eq!(form.value("prompt"), "Keep my opening prompt");
     assert_eq!(form.value("branch"), "feat/retry");
-    assert_eq!(form.value("base"), "");
+    assert_eq!(form.value("base"), "feat/search");
     assert!(app.state.conversations.is_empty());
 }
 

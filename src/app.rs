@@ -49,8 +49,7 @@ pub enum Operation {
         base: String,
         destination: PathBuf,
         source: PathBuf,
-        remote: Option<String>,
-        fetch: bool,
+        existing: bool,
         session: Option<(String, Value)>,
     },
 }
@@ -73,6 +72,7 @@ pub enum Job {
     Discover(Vec<PathBuf>, bool),
     Trees(Project),
     Remotes(Project),
+    Branches(Project),
     Associate(PathBuf, Value),
     Status(PathBuf),
     Diff(PathBuf, ChangedFile, bool),
@@ -87,6 +87,7 @@ pub enum Completion {
     Projects(Vec<Project>, Vec<String>),
     Trees(Project, Vec<Worktree>),
     Remotes(PathBuf, Vec<String>),
+    Branches(PathBuf, Vec<git::Branch>),
     Associated(Value),
     Status(PathBuf, Snapshot),
     Diff(PathBuf, PathBuf, bool, String),
@@ -103,6 +104,7 @@ impl Job {
             Self::Discover(..) => "discover".into(),
             Self::Trees(p) => format!("trees:{}", p.path.display()),
             Self::Remotes(p) => format!("remotes:{}", p.path.display()),
+            Self::Branches(p) => format!("branches:{}", p.path.display()),
             Self::Associate(_, v) => format!("associate:{}", v["resource"]),
             Self::Status(p) => format!("status:{}", p.display()),
             Self::Diff(p, f, s) => format!("diff:{}:{}:{s}", p.display(), f.path.display()),
@@ -123,6 +125,13 @@ impl Job {
                 project.path.clone(),
                 git::remotes(&project.path).await?,
             )),
+            Self::Branches(project) => {
+                git::run(&project.path, ["fetch", "--progress", "--all", "--prune"]).await?;
+                Ok(Completion::Branches(
+                    project.path.clone(),
+                    git::branches(&project.path).await?,
+                ))
+            }
             Self::Associate(path, mut item) => {
                 let project = git::project(&path).await?;
                 item["_treerailProject"] = serde_json::to_value(project.path)?;
@@ -162,33 +171,17 @@ impl Job {
                         base,
                         destination,
                         source,
-                        remote,
-                        fetch,
+                        existing,
                         session: start,
                     } => {
-                        let base = if base.trim().is_empty() {
-                            anyhow::ensure!(
-                                fetch,
-                                "Choose an explicit cached reference when Fetch is off"
-                            );
-                            git::fresh_default_base(&project, remote.as_deref()).await?
-                        } else if base == "HEAD" {
-                            git::text(&source, &["rev-parse", "HEAD"]).await?
-                        } else {
-                            if fetch {
-                                git::run(&project, ["fetch", "--progress", "--all", "--prune"])
-                                    .await?;
-                            }
-                            base
-                        };
                         created = Some(
-                            git::create_worktree(
+                            git::create_from_start(
                                 &project,
-                                &branch,
+                                &source,
                                 &base,
+                                &branch,
                                 &destination,
-                                false,
-                                false,
+                                existing,
                             )
                             .await?,
                         );
@@ -306,6 +299,7 @@ impl Input {
 #[derive(Debug, Clone)]
 pub enum FieldType {
     Text,
+    Branch,
     Multiline,
     Toggle,
     Choice(Vec<String>),
@@ -370,13 +364,18 @@ impl Form {
             .enumerate()
             .filter(|(_, f)| match self.kind {
                 FormKind::Session => match f.key.as_str() {
-                    "branch" | "base" | "destination" | "fetch" | "remote" => {
+                    "base" | "mode" => self.value("new_tree") == "yes",
+                    "branch" => {
                         self.value("new_tree") == "yes"
+                            && self.value("mode") != "Use existing branch"
                     }
                     "name" | "model" => self.advanced,
                     k if k.starts_with("config:") => self.advanced,
                     _ => true,
                 },
+                FormKind::Worktree if f.key == "branch" => {
+                    self.value("mode") != "Use existing branch"
+                }
                 _ => true,
             })
             .map(|(i, _)| i)
@@ -392,7 +391,15 @@ pub enum Confirm {
 }
 #[derive(Debug, Clone)]
 pub enum Modal {
-    Projects { query: Input, selected: usize },
+    Branches {
+        form: Box<Form>,
+        query: Input,
+        selected: usize,
+    },
+    Projects {
+        query: Input,
+        selected: usize,
+    },
     Help(usize),
     Form(Form),
     Confirm(Confirm),
@@ -401,10 +408,15 @@ pub enum Modal {
     Notice(String),
     Sources(usize),
     Approval(Value),
-    Completions { items: Vec<Value>, selected: usize },
+    Completions {
+        items: Vec<Value>,
+        selected: usize,
+    },
 }
 #[derive(Debug, Clone)]
 pub enum Action {
+    PickBranch,
+    ChooseBranch(usize),
     Project(usize),
     Tab(usize),
     Close(usize),
@@ -465,6 +477,7 @@ pub struct App {
     pub pane: Pane,
     pub modal: Option<Modal>,
     pub snapshots: BTreeMap<PathBuf, Snapshot>,
+    pub branches: BTreeMap<PathBuf, Vec<git::Branch>>,
     pub remotes: BTreeMap<PathBuf, Vec<String>>,
     pub diff: String,
     pub diff_staged: bool,
@@ -572,6 +585,7 @@ impl App {
                 selected: 0,
             }),
             snapshots: BTreeMap::new(),
+            branches: BTreeMap::new(),
             remotes: BTreeMap::new(),
             diff: String::new(),
             diff_staged: false,
@@ -673,6 +687,30 @@ impl App {
             .map(|(i, _)| i)
             .collect()
     }
+    pub fn matching_branches(&self, form: &Form, query: &str) -> Vec<git::Branch> {
+        let project = PathBuf::from(form.context["project"].as_str().unwrap_or_default());
+        let mut matches = self
+            .branches
+            .get(&project)
+            .into_iter()
+            .flatten()
+            .filter_map(|branch| {
+                fuzzy_score(&branch.name, query).map(|score| (score, branch.clone()))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.remote.cmp(&b.1.remote))
+                .then(a.1.name.cmp(&b.1.name))
+        });
+        matches.into_iter().map(|(_, b)| b).collect()
+    }
+    pub fn branch_loading(&self, form: &Form) -> bool {
+        self.pending.contains(&format!(
+            "branches:{}",
+            form.context["project"].as_str().unwrap_or_default()
+        ))
+    }
     pub fn open_project(&mut self, index: usize) {
         let Some(project) = self.projects.get(index).cloned() else {
             return;
@@ -720,6 +758,11 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.say(format!("{e:#}"), true);
+                if token == "mutation"
+                    && let Some(project) = self.tab().map(|t| t.project.clone())
+                {
+                    self.enqueue(Job::Trees(project));
+                }
                 if token == "mutation" && self.modal.is_none() {
                     self.modal = self.failed_form.clone().map(Modal::Form);
                 }
@@ -727,6 +770,9 @@ impl App {
             }
         };
         match completion {
+            Completion::Branches(path, branches) => {
+                self.branches.insert(path, branches);
+            }
             Completion::Remotes(path, remotes) => {
                 self.remotes.insert(path, remotes);
             }
@@ -982,23 +1028,26 @@ impl App {
             fields.push(Field::toggle("new_tree", "Create in a new worktree", false));
         }
         fields.extend([
-            Field::text("branch", "New branch", ""),
-            Field::text(
-                "base",
-                "Starting point · blank = latest remote default; HEAD = selected commit",
-                "",
-            ),
-            Field::text(
-                "destination",
-                "Directory · blank = configured worktree location",
-                "",
-            ),
-            Field::toggle("fetch", "Fetch before creation", true),
-            Field::text(
-                "remote",
-                "Remote · blank = configured / origin / sole remote",
-                self.config.remote(&project).unwrap_or_default(),
-            ),
+            Field {
+                key: "base".into(),
+                label: "Starting point".into(),
+                input: Input::new(if tree.branch == "(detached)" {
+                    tree.head.clone()
+                } else {
+                    tree.branch.clone()
+                }),
+                kind: FieldType::Branch,
+            },
+            Field {
+                key: "mode".into(),
+                label: "Branch".into(),
+                input: Input::new("Create new branch"),
+                kind: FieldType::Choice(vec![
+                    "Create new branch".into(),
+                    "Use existing branch".into(),
+                ]),
+            },
+            Field::text("branch", "New branch name", ""),
         ]);
         if session {
             fields.push(Field::text("name", "Conversation name · optional", ""));
@@ -1020,11 +1069,16 @@ impl App {
                 "New worktree"
             }
             .into(),
-            context: json!({"worktree":tree.path}),
+            context: json!({"worktree":tree.path,"project":project,"base_label":tree.branch,"base_ref":format!("refs/heads/{}", tree.branch)}),
         }));
-        self.agent_commands.push(agent::Command::Options {
-            worktree: tree.path,
-        });
+        if let Some(project) = self.tab().map(|t| t.project.clone()) {
+            self.enqueue(Job::Branches(project));
+        }
+        if session {
+            self.agent_commands.push(agent::Command::Options {
+                worktree: tree.path,
+            });
+        }
     }
     fn start_conversation(
         &mut self,
@@ -1147,25 +1201,41 @@ impl App {
                 }
                 if makes_tree {
                     self.failed_form = Some(form.clone());
-                    let branch = form.value("branch");
-                    anyhow::ensure!(!branch.trim().is_empty(), "Enter a new branch name");
-                    let dest = form.value("destination");
-                    let destination = if dest.trim().is_empty() {
-                        self.config.worktree_path(&project, &branch)
+                    anyhow::ensure!(
+                        !self.branch_loading(&form),
+                        "Fetching branches; wait for the starting points to load"
+                    );
+                    let base = form.value("base").trim().to_owned();
+                    anyhow::ensure!(!base.is_empty(), "Select a starting point");
+                    let base = if form.context["base_label"].as_str() == Some(&base) {
+                        form.context["base_ref"]
+                            .as_str()
+                            .unwrap_or(&base)
+                            .to_owned()
                     } else {
-                        PathBuf::from(dest)
+                        base
                     };
+                    let existing = form.value("mode") == "Use existing branch";
+                    let branch = if existing {
+                        self.branches
+                            .get(&project)
+                            .into_iter()
+                            .flatten()
+                            .find(|b| b.reference() == base || b.name == base)
+                            .context("Choose an existing branch from the picker")?
+                            .checkout_name
+                            .clone()
+                    } else {
+                        form.value("branch").trim().to_owned()
+                    };
+                    anyhow::ensure!(!branch.is_empty(), "Enter a new branch name");
+                    let destination = self.config.worktree_path(&project, &branch);
                     self.operate(Operation::Create {
                         branch,
-                        base: form.value("base"),
+                        base,
                         destination,
                         source: tree,
-                        remote: if form.value("remote").is_empty() {
-                            None
-                        } else {
-                            Some(form.value("remote"))
-                        },
-                        fetch: form.value("fetch") == "yes",
+                        existing,
                         session: if is_session {
                             Some((prompt, Value::Object(options)))
                         } else {
@@ -1390,6 +1460,36 @@ impl App {
             self.action(Action::Cancel);
         }
         match action {
+            Action::PickBranch => {
+                if matches!(self.modal, Some(Modal::Form(_)))
+                    && let Some(Modal::Form(form)) = self.modal.take()
+                {
+                    self.modal = Some(Modal::Branches {
+                        form: Box::new(form),
+                        query: Input::default(),
+                        selected: 0,
+                    });
+                }
+            }
+            Action::ChooseBranch(index) => {
+                if let Some(Modal::Branches {
+                    mut form, query, ..
+                }) = self.modal.clone()
+                    && let Some(branch) = self.matching_branches(&form, &query.value).get(index)
+                {
+                    if let Some(field) = form.fields.iter_mut().find(|f| f.key == "base") {
+                        field.input = Input::new(&branch.name);
+                    }
+                    form.context["base_label"] = json!(branch.name);
+                    form.context["base_ref"] = json!(branch.reference());
+                    form.focused = form
+                        .fields
+                        .iter()
+                        .position(|f| f.key == "mode")
+                        .unwrap_or(0);
+                    self.modal = Some(Modal::Form(*form));
+                }
+            }
             Action::Project(i) => self.open_project(i),
             Action::Tab(i) => {
                 if i < self.tabs.len() {
@@ -1485,6 +1585,12 @@ impl App {
                 })
             }
             Action::Cancel => {
+                if matches!(self.modal, Some(Modal::Branches { .. }))
+                    && let Some(Modal::Branches { form, .. }) = self.modal.take()
+                {
+                    self.modal = Some(Modal::Form(*form));
+                    return;
+                }
                 if let Some(Modal::Confirm(Confirm::Trust { id, .. })) = &self.modal {
                     self.agent_commands.push(agent::Command::TrustWorkspace {
                         id: id.clone(),
@@ -1497,6 +1603,9 @@ impl App {
             Action::Confirm => {
                 if let Some(modal) = self.modal.clone() {
                     match modal {
+                        Modal::Branches { selected, .. } => {
+                            self.action(Action::ChooseBranch(selected))
+                        }
                         Modal::Confirm(Confirm::Trust { id, .. }) => {
                             self.modal = None;
                             self.agent_commands
@@ -1803,14 +1912,24 @@ impl App {
             Action::Field(i) => {
                 if let Some(Modal::Form(form)) = &mut self.modal {
                     form.focused = i;
-                    if let Some(field) = form.fields.get_mut(i)
-                        && matches!(field.kind, FieldType::Toggle)
-                    {
-                        field.input = Input::new(if field.input.value == "yes" {
-                            "no"
-                        } else {
-                            "yes"
-                        });
+                    if let Some(field) = form.fields.get_mut(i) {
+                        match &field.kind {
+                            FieldType::Toggle => {
+                                field.input = Input::new(if field.input.value == "yes" {
+                                    "no"
+                                } else {
+                                    "yes"
+                                })
+                            }
+                            FieldType::Choice(choices) if !choices.is_empty() => {
+                                let selected = choices
+                                    .iter()
+                                    .position(|c| *c == field.input.value)
+                                    .unwrap_or(0);
+                                field.input = Input::new(&choices[(selected + 1) % choices.len()]);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -2194,6 +2313,25 @@ impl App {
             let mut add_path = false;
             let mut followup = None;
             match &mut modal {
+                Modal::Branches {
+                    form,
+                    query,
+                    selected,
+                } => match key.code {
+                    KeyCode::Down => {
+                        *selected = (*selected + 1).min(
+                            self.matching_branches(form, &query.value)
+                                .len()
+                                .saturating_sub(1),
+                        )
+                    }
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Enter => confirm = true,
+                    _ => {
+                        query.key(key, false);
+                        *selected = 0;
+                    }
+                },
                 Modal::Sources(selected) => match key.code {
                     KeyCode::Down | KeyCode::Char('j') => {
                         *selected = (*selected + 1)
@@ -2298,6 +2436,14 @@ impl App {
                     let visible = form.visible();
                     match key.code {
                         KeyCode::Enter if ctrl => confirm = true,
+                        KeyCode::Down | KeyCode::Enter
+                            if form
+                                .fields
+                                .get(form.focused)
+                                .is_some_and(|f| matches!(f.kind, FieldType::Branch)) =>
+                        {
+                            followup = Some(Action::PickBranch)
+                        }
                         KeyCode::Char('o') if ctrl => form.advanced = !form.advanced,
                         KeyCode::Tab | KeyCode::BackTab => {
                             let pos = visible.iter().position(|i| *i == form.focused).unwrap_or(0);
@@ -2341,9 +2487,11 @@ impl App {
                                             .clone(),
                                         );
                                     }
-                                    FieldType::Text | FieldType::Multiline => field
-                                        .input
-                                        .key(key, matches!(field.kind, FieldType::Multiline)),
+                                    FieldType::Text | FieldType::Branch | FieldType::Multiline => {
+                                        field
+                                            .input
+                                            .key(key, matches!(field.kind, FieldType::Multiline))
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2514,12 +2662,21 @@ impl App {
         let text = text.replace('\r', "");
         if let Some(Modal::Form(form)) = &mut self.modal {
             if let Some(field) = form.fields.get_mut(form.focused)
-                && matches!(field.kind, FieldType::Text | FieldType::Multiline)
+                && matches!(
+                    field.kind,
+                    FieldType::Text | FieldType::Branch | FieldType::Multiline
+                )
             {
                 field.input.insert(&text);
             }
         } else if let Some(Modal::Projects { query, .. }) = &mut self.modal {
             query.insert(&text);
+        } else if let Some(Modal::Branches {
+            query, selected, ..
+        }) = &mut self.modal
+        {
+            query.insert(&text);
+            *selected = 0;
         } else if self.cli_focused {
             self.composer.insert(&text);
             self.sync_draft();
@@ -2909,6 +3066,17 @@ impl App {
             self.notice = None;
         }
     }
+}
+fn fuzzy_score(name: &str, query: &str) -> Option<usize> {
+    let name = name.to_lowercase().chars().collect::<Vec<_>>();
+    let mut position = 0;
+    let mut score = 0;
+    for c in query.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
+        let offset = name[position..].iter().position(|n| *n == c)?;
+        score += offset;
+        position += offset + 1;
+    }
+    Some(score)
 }
 fn config_fields(options: &Value) -> Vec<Field> {
     let mut fields = vec![];

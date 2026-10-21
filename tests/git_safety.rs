@@ -81,6 +81,217 @@ async fn remote_repo(temp: &TempDir) -> (PathBuf, PathBuf) {
     (source, remote)
 }
 #[tokio::test]
+async fn review_checkout_fetches_tracks_and_fast_forwards_without_overwriting_local_commits() {
+    let temp = TempDir::new().unwrap();
+    let (source, remote) = remote_repo(&temp).await;
+    let author = temp.path().join("review-author");
+    git::run(
+        temp.path(),
+        ["clone", remote.to_str().unwrap(), author.to_str().unwrap()],
+    )
+    .await
+    .unwrap();
+    for (key, value) in [
+        ("user.name", "Test"),
+        ("user.email", "test@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git::run(&author, ["config", key, value]).await.unwrap();
+    }
+    git::run(&author, ["switch", "-c", "review/pr-42"])
+        .await
+        .unwrap();
+    fs::write(author.join("review.txt"), "First review revision\n").unwrap();
+    git::run(&author, ["add", "."]).await.unwrap();
+    git::commit(&author, "Review revision", "").await.unwrap();
+    git::run(&author, ["push", "origin", "review/pr-42"])
+        .await
+        .unwrap();
+    assert!(
+        git::text(
+            &source,
+            &["rev-parse", "--verify", "refs/remotes/origin/review/pr-42"]
+        )
+        .await
+        .is_err()
+    );
+    let review = temp.path().join("review-one");
+    git::create_from_start(
+        &source,
+        &source,
+        "refs/remotes/origin/review/pr-42",
+        "review/pr-42",
+        &review,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        git::text(&review, &["rev-parse", "HEAD"]).await.unwrap(),
+        git::text(&author, &["rev-parse", "HEAD"]).await.unwrap()
+    );
+    assert_eq!(
+        git::text(&review, &["rev-parse", "--abbrev-ref", "@{upstream}"])
+            .await
+            .unwrap(),
+        "origin/review/pr-42"
+    );
+    git::remove_worktree(&source, &review).await.unwrap();
+    fs::write(author.join("review.txt"), "Second review revision\n").unwrap();
+    git::run(&author, ["add", "."]).await.unwrap();
+    git::commit(&author, "New review revision", "")
+        .await
+        .unwrap();
+    git::run(&author, ["push", "origin", "review/pr-42"])
+        .await
+        .unwrap();
+    let second = temp.path().join("review-two");
+    git::create_from_start(
+        &source,
+        &source,
+        "refs/heads/review/pr-42",
+        "review/pr-42",
+        &second,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        git::text(&second, &["rev-parse", "HEAD"]).await.unwrap(),
+        git::text(&author, &["rev-parse", "HEAD"]).await.unwrap()
+    );
+    // An already-open branch cannot be checked out a second time.
+    assert!(
+        git::create_from_start(
+            &source,
+            &source,
+            "refs/remotes/origin/review/pr-42",
+            "review/pr-42",
+            &temp.path().join("duplicate"),
+            true
+        )
+        .await
+        .is_err()
+    );
+    fs::write(second.join("local.txt"), "Preserve local work\n").unwrap();
+    git::run(&second, ["add", "."]).await.unwrap();
+    git::commit(&second, "Local review work", "").await.unwrap();
+    let local = git::text(&second, &["rev-parse", "HEAD"]).await.unwrap();
+    git::remove_worktree(&source, &second).await.unwrap();
+    let third = temp.path().join("review-three");
+    assert!(
+        git::create_from_start(
+            &source,
+            &source,
+            "refs/remotes/origin/review/pr-42",
+            "review/pr-42",
+            &third,
+            true
+        )
+        .await
+        .is_err()
+    );
+    assert!(!third.exists());
+    assert_eq!(
+        git::text(&source, &["rev-parse", "refs/heads/review/pr-42"])
+            .await
+            .unwrap(),
+        local
+    );
+    // Selecting the local branch preserves its unpushed commits.
+    git::create_from_start(
+        &source,
+        &source,
+        "refs/heads/review/pr-42",
+        "review/pr-42",
+        &third,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        git::text(&third, &["rev-parse", "HEAD"]).await.unwrap(),
+        local
+    );
+    git::remove_worktree(&source, &third).await.unwrap();
+    git::run(
+        &source,
+        ["remote", "add", "mirror", remote.to_str().unwrap()],
+    )
+    .await
+    .unwrap();
+    let error = git::create_from_start(
+        &source,
+        &source,
+        "refs/remotes/mirror/review/pr-42",
+        "review/pr-42",
+        &third,
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("different remote branch"));
+    assert!(!third.exists());
+}
+
+#[tokio::test]
+async fn new_worktree_uses_selected_checkout_and_always_requires_fetch_success() {
+    let temp = TempDir::new().unwrap();
+    let (source, _) = remote_repo(&temp).await;
+    git::run(&source, ["switch", "-c", "feature"])
+        .await
+        .unwrap();
+    fs::write(source.join("selected.txt"), "Selected branch\n").unwrap();
+    git::run(&source, ["add", "."]).await.unwrap();
+    git::commit(&source, "Selected starting point", "")
+        .await
+        .unwrap();
+    let head = git::text(&source, &["rev-parse", "HEAD"]).await.unwrap();
+    fs::write(source.join("selected.txt"), "Uncommitted edits\n").unwrap();
+    let new = temp.path().join("new-from-selected");
+    git::create_from_start(
+        &source,
+        &source,
+        "refs/heads/feature",
+        "new-branch",
+        &new,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(git::text(&new, &["rev-parse", "HEAD"]).await.unwrap(), head);
+    assert_eq!(
+        fs::read_to_string(new.join("selected.txt")).unwrap(),
+        "Selected branch\n"
+    );
+    git::run(
+        &source,
+        [
+            "remote",
+            "set-url",
+            "origin",
+            temp.path().join("missing.git").to_str().unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    let failed = temp.path().join("must-not-create");
+    assert!(
+        git::create_from_start(&source, &source, "HEAD", "must-not-exist", &failed, false)
+            .await
+            .is_err()
+    );
+    assert!(!failed.exists());
+    assert!(
+        git::text(
+            &source,
+            &["rev-parse", "--verify", "refs/heads/must-not-exist"]
+        )
+        .await
+        .is_err()
+    );
+}
+#[tokio::test]
 async fn default_worktree_uses_fresh_actual_remote_default_not_selected_head() {
     let temp = TempDir::new().unwrap();
     let (source, remote) = remote_repo(&temp).await;

@@ -1029,6 +1029,68 @@ fn modal_frame(frame: &mut Frame, area: Rect, title: &str) -> Rect {
 }
 fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
     match modal {
+        Modal::Branches {
+            form,
+            query,
+            selected,
+        } => {
+            let branches = app.matching_branches(&form, &query.value);
+            let rect = centered(area, 82, 22);
+            let inner = modal_frame(frame, rect, "Choose starting point");
+            frame.render_widget(
+                Paragraph::new(format!(" Search branches: {}▌", query.value)).style(style(ACCENT)),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let body = Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(4),
+            );
+            let start = selected.saturating_sub(body.height.saturating_sub(1) as usize);
+            for (i, branch) in branches
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(body.height as usize)
+            {
+                let row = Rect::new(body.x, body.y + (i - start) as u16, body.width, 1);
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        " {}  · {}",
+                        fit(&branch.name, body.width.saturating_sub(14) as usize),
+                        if branch.remote { "remote" } else { "local" }
+                    ))
+                    .style(Style::default().fg(FG).bg(if i == selected {
+                        SELECTED
+                    } else {
+                        SURFACE
+                    })),
+                    row,
+                );
+                hit(app, row, Action::ChooseBranch(i));
+            }
+            if branches.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(if app.branch_loading(&form) {
+                        " Fetching branches…"
+                    } else {
+                        " No matching branches"
+                    })
+                    .style(style(MUTED)),
+                    body,
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(if app.branch_loading(&form) {
+                    " Fetching latest branches…"
+                } else {
+                    " ↑ ↓ choose · Enter select · Esc back"
+                })
+                .style(style(MUTED)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
         Modal::Projects { query, selected } => {
             let projects = app.visible_projects(&query.value);
             let rect = centered(area, 82, 22);
@@ -1214,12 +1276,30 @@ fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
                             .style(style(color)),
                         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
                     );
-                    let input =
-                        Rect::new(inner.x + 1, y + 1, inner.width.saturating_sub(2), lines - 2);
+                    let input = Rect::new(
+                        inner.x + 1,
+                        y + 1,
+                        inner
+                            .width
+                            .saturating_sub(if matches!(field.kind, FieldType::Branch) {
+                                12
+                            } else {
+                                2
+                            }),
+                        lines - 2,
+                    );
                     let shown = if field.input.value.is_empty() {
                         "…".to_owned()
                     } else {
-                        field.input.value.clone()
+                        format!(
+                            "{}{}",
+                            field.input.value,
+                            if matches!(field.kind, FieldType::Choice(_)) {
+                                "  ◂ ▸"
+                            } else {
+                                ""
+                            }
+                        )
                     };
                     frame.render_widget(
                         Paragraph::new(plain(&shown))
@@ -1232,6 +1312,16 @@ fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
                         input,
                     );
                     hit(app, input, Action::Field(index));
+                    if matches!(field.kind, FieldType::Branch) {
+                        label(
+                            frame,
+                            app,
+                            Rect::new(inner.right().saturating_sub(11), y + 1, 10, 1),
+                            "[ Browse ]",
+                            ACCENT,
+                            Action::PickBranch,
+                        );
+                    }
                     if focused {
                         let before = &field.input.value[..field.input.cursor];
                         let col = before.lines().last().unwrap_or("").width() as u16;
@@ -1257,6 +1347,16 @@ fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
                     MUTED,
                     Action::ToggleAdvanced,
                 );
+            } else if form.kind == FormKind::Worktree {
+                frame.render_widget(
+                    Paragraph::new(if app.branch_loading(&form) {
+                        " Fetching branches…"
+                    } else {
+                        " Fetches automatically · location from settings"
+                    })
+                    .style(style(MUTED)),
+                    Rect::new(inner.x, bottom, inner.width, 1),
+                );
             }
             let row = inner.bottom() - 1;
             label(
@@ -1267,14 +1367,15 @@ fn overlay(frame: &mut Frame, app: &mut App, area: Rect, modal: Modal) {
                 MUTED,
                 Action::Cancel,
             );
-            label(
-                frame,
-                app,
-                Rect::new(inner.right().saturating_sub(14), row, 14, 1),
-                "[ Continue ]",
-                ACCENT,
-                Action::Confirm,
-            );
+            let submit = Rect::new(inner.right().saturating_sub(14), row, 14, 1);
+            if (form.kind == FormKind::Worktree
+                || (form.kind == FormKind::Session && form.value("new_tree") == "yes"))
+                && app.branch_loading(&form)
+            {
+                frame.render_widget(Paragraph::new("[ Fetching… ]").style(style(MUTED)), submit);
+            } else {
+                label(frame, app, submit, "[ Continue ]", ACCENT, Action::Confirm);
+            }
         }
         Modal::Confirm(kind) => {
             let (title, message) = match &kind {

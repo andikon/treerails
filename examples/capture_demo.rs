@@ -174,6 +174,41 @@ fn main() -> Result<()> {
     app.action(Action::Switch(View::Sessions));
     app.action(Action::NewSessionOptions);
     capture(&mut app, &directory, "create-session")?;
+    app.action(Action::NewTree);
+    let project = app.tab().unwrap().project.path.clone();
+    app.accept(
+        format!("branches:{}", project.display()),
+        Ok(Completion::Branches(
+            project,
+            vec![
+                treerail::git::Branch {
+                    name: "develop".into(),
+                    remote: false,
+                    checkout_name: "develop".into(),
+                },
+                treerail::git::Branch {
+                    name: "feat/worktree-search".into(),
+                    remote: false,
+                    checkout_name: "feat/worktree-search".into(),
+                },
+                treerail::git::Branch {
+                    name: "origin/review/pr-42".into(),
+                    remote: true,
+                    checkout_name: "review/pr-42".into(),
+                },
+            ],
+        )),
+    );
+    if let Some(treerail::app::Modal::Form(form)) = &mut app.modal {
+        form.fields[2].input = treerail::app::Input::new("feat/search-followup");
+    }
+    capture(&mut app, &directory, "create-worktree")?;
+    app.action(Action::PickBranch);
+    app.paste("pr42");
+    capture(&mut app, &directory, "branch-picker")?;
+    app.action(Action::ChooseBranch(0));
+    app.action(Action::Field(1));
+    capture(&mut app, &directory, "review-worktree")?;
     println!("Rendered native TUI previews in {}", directory.display());
     Ok(())
 }

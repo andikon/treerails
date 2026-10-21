@@ -75,3 +75,18 @@ Remaining manual checks are a real authenticated conversation, tool approval/den
 model selection, restart/resume and interactive VS Code handoff. The CLI AHP
 integration is experimental. Published downloads cover Windows only;
 cross-platform builds still need their CI runners.
+
+## Worktree creation follow-up (unreleased)
+
+The simplified creation flow has a starting point, an existing/new branch choice,
+and a name only for new branches. Local and remote branches are refreshed
+asynchronously and searched with a fuzzy picker; cancelling restores the form.
+Creation waits for that refresh, always fetches again before resolving the selected
+reference, and uses the configured path template.
+
+The updated suite has 52 passing Rust tests. New cases exercise field order and
+hidden automatic settings, fuzzy remote selection, draft preservation, fresh
+remote review checkouts, tracking, safe fast-forward, local commits, conflicting
+upstreams, already-checked-out branches, selected-branch creation and fetch failure.
+Production UI captures include `worktree-create-worktree.svg`,
+`worktree-branch-picker.svg` and `worktree-review-worktree.svg`.

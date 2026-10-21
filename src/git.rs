@@ -77,6 +77,16 @@ impl Snapshot {
 pub struct Branch {
     pub name: String,
     pub remote: bool,
+    pub checkout_name: String,
+}
+impl Branch {
+    pub fn reference(&self) -> String {
+        format!(
+            "refs/{}/{}",
+            if self.remote { "remotes" } else { "heads" },
+            self.name
+        )
+    }
 }
 
 fn command(program: &str, cwd: &Path) -> Command {
@@ -495,6 +505,8 @@ pub async fn diff(path: &Path, file: &ChangedFile, staged: bool) -> Result<Strin
         .join("\n"))
 }
 pub async fn branches(path: &Path) -> Result<Vec<Branch>> {
+    let mut remotes = remotes(path).await?;
+    remotes.sort_by_key(|name| std::cmp::Reverse(name.len()));
     let data = text(
         path,
         &[
@@ -513,11 +525,17 @@ pub async fn branches(path: &Path) -> Result<Vec<Branch>> {
                 .map(|n| Branch {
                     name: n.into(),
                     remote: false,
+                    checkout_name: n.into(),
                 })
                 .or_else(|| {
                     s.strip_prefix("refs/remotes/").map(|n| Branch {
                         name: n.into(),
                         remote: true,
+                        checkout_name: remotes
+                            .iter()
+                            .find_map(|r| n.strip_prefix(&format!("{r}/")))
+                            .unwrap_or(n)
+                            .into(),
                     })
                 })
         })
@@ -553,6 +571,34 @@ pub async fn create_worktree(
     existing: bool,
     fetch: bool,
 ) -> Result<PathBuf> {
+    if fetch {
+        run(project, ["fetch", "--progress", "--all", "--prune"]).await?;
+    }
+    add_worktree(
+        project,
+        branch,
+        base,
+        destination,
+        if existing {
+            WorktreeBranch::Existing
+        } else {
+            WorktreeBranch::New
+        },
+    )
+    .await
+}
+enum WorktreeBranch {
+    New,
+    Existing,
+    Tracking,
+}
+async fn add_worktree(
+    project: &Path,
+    branch: &str,
+    base: &str,
+    destination: &Path,
+    mode: WorktreeBranch,
+) -> Result<PathBuf> {
     let destination = if destination.is_absolute() {
         destination.to_owned()
     } else {
@@ -571,21 +617,167 @@ pub async fn create_worktree(
         "Destination already exists: {}",
         destination.display()
     );
-    if fetch {
-        run(project, ["fetch", "--progress", "--all", "--prune"]).await?;
-    }
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
-    if !existing {
-        args.extend(["--no-track".into(), "-b".into(), branch.into()]);
+    if !matches!(mode, WorktreeBranch::Existing) {
+        args.extend([
+            if matches!(mode, WorktreeBranch::Tracking) {
+                "--track"
+            } else {
+                "--no-track"
+            }
+            .into(),
+            "-b".into(),
+            branch.into(),
+        ]);
     }
     args.push("--".into());
     args.push(destination.as_os_str().to_owned());
-    args.push(if existing { branch.into() } else { base.into() });
+    args.push(if matches!(mode, WorktreeBranch::Existing) {
+        branch.into()
+    } else {
+        base.into()
+    });
     run(project, args).await?;
     Ok(destination)
+}
+/// Fetch before resolving the selected starting point. Existing local branches
+/// may advance only by fast-forward; no branch or checkout is ever reset.
+pub async fn create_from_start(
+    project: &Path,
+    source: &Path,
+    start: &str,
+    branch: &str,
+    destination: &Path,
+    existing: bool,
+) -> Result<PathBuf> {
+    run(project, ["fetch", "--progress", "--all", "--prune"]).await?;
+    let source = if source.is_dir() {
+        source
+    } else {
+        anyhow::ensure!(
+            start != "HEAD",
+            "The selected checkout is missing; choose an existing branch"
+        );
+        project
+    };
+    let reference = text(
+        source,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            "--end-of-options",
+            start,
+        ],
+    )
+    .await?;
+    if !existing {
+        let commit = text(
+            source,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{start}^{{commit}}"),
+            ],
+        )
+        .await?;
+        return add_worktree(project, branch, &commit, destination, WorktreeBranch::New).await;
+    }
+    anyhow::ensure!(
+        reference.starts_with("refs/heads/") || reference.starts_with("refs/remotes/"),
+        "Choose an existing local or remote branch"
+    );
+    let local_ref = format!("refs/heads/{branch}");
+    let local = text(project, &["rev-parse", "--verify", &local_ref]).await;
+    if local.is_err() {
+        anyhow::ensure!(
+            reference.starts_with("refs/remotes/"),
+            "The selected local branch no longer exists"
+        );
+        return add_worktree(
+            project,
+            branch,
+            &reference,
+            destination,
+            WorktreeBranch::Tracking,
+        )
+        .await;
+    }
+    let selected_remote = reference.starts_with("refs/remotes/");
+    let upstream = text(
+        project,
+        &[
+            "rev-parse",
+            "--symbolic-full-name",
+            "--verify",
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )
+    .await
+    .ok();
+    if selected_remote && let Some(upstream) = &upstream {
+        anyhow::ensure!(
+            *upstream == reference,
+            "Local branch '{branch}' tracks a different remote branch; create a new branch for this review"
+        );
+    }
+    let set_tracking = selected_remote && upstream.is_none();
+    let desired = if selected_remote {
+        reference
+    } else {
+        upstream.unwrap_or(local_ref.clone())
+    };
+    let local = local?;
+    let mut remote = text(project, &["rev-parse", "--verify", &desired]).await?;
+    if !selected_remote
+        && local != remote
+        && run(project, ["merge-base", "--is-ancestor", &remote, &local])
+            .await
+            .is_ok()
+    {
+        remote = local.clone();
+    }
+    if local != remote {
+        anyhow::ensure!(
+            run(project, ["merge-base", "--is-ancestor", &local, &remote])
+                .await
+                .is_ok(),
+            "Local branch '{branch}' differs from the selected branch; create a new branch to preserve its commits"
+        );
+    }
+    let path = add_worktree(
+        project,
+        branch,
+        &local_ref,
+        destination,
+        WorktreeBranch::Existing,
+    )
+    .await?;
+    if local != remote {
+        run(&path, ["merge", "--ff-only", &remote])
+            .await
+            .with_context(|| {
+                format!(
+                    "Worktree created at {}, but fast-forward failed; inspect that checkout",
+                    path.display()
+                )
+            })?;
+    }
+    if set_tracking {
+        run(&path, ["branch", "--set-upstream-to", &desired, branch])
+            .await
+            .with_context(|| {
+                format!(
+                    "Worktree created at {}, but tracking setup failed",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(path)
 }
 pub async fn stage(path: &Path, files: &[ChangedFile], unstage: bool) -> Result<()> {
     let _lease = crate::checkout::Lease::acquire(path).await?;
