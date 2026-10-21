@@ -76,7 +76,7 @@ model selection, restart/resume and interactive VS Code handoff. The CLI AHP
 integration is experimental. Published downloads cover Windows only;
 cross-platform builds still need their CI runners.
 
-## Worktree creation follow-up (unreleased)
+## Worktree creation follow-up (v0.3.1)
 
 The simplified creation flow has a starting point, an existing/new branch choice,
 and a name only for new branches. Local and remote branches are refreshed

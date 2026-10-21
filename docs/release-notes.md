@@ -1,9 +1,18 @@
-# Unreleased: Starting-point worktree creation
+# Tree Rail v0.3.1 — Starting-point worktree creation
 
 - Start from the selected worktree's branch or commit, or fuzzy-search local and remote branches.
 - Choose an existing branch for review, or name a new branch from that starting point.
 - Fetch automatically and use the configured checkout location; remote, directory and Fetch controls are removed from the form.
 - Review checkouts establish upstream tracking and fast-forward only; checked-out branches, diverged commits and conflicting upstreams are protected.
+
+Windows downloads include the standalone executable and a ZIP with the usage guide
+and example configuration. SHA-256 checksums are included. Git must be on PATH;
+no Rust or separate Node.js installation is required.
+
+Validation: 52 Rust tests, four packaging tests, formatting and strict Clippy passed.
+The Copilot CLI AHP integration remains experimental; real model responses, tool
+approvals and interactive VS Code handoff remain manual checks. Linux/macOS
+downloads are not included in this release.
 
 ---
 
